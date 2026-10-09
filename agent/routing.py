@@ -60,14 +60,25 @@ def route_after_review(
     *,
     max_iterations: int = 3,
 ) -> Route:
-    """Decide what happens after the quality-review gate. First match wins:
+    """Decide what happens after the quality-review gate.
 
-    1. ``finalize`` – answer approved (or failed), or no budget for another round
-    2. ``research`` – review asked for more evidence and budget remains
+    Every status is handled explicitly:
+
+    - ``APPROVED``            -> ``finalize`` (answer is good enough)
+    - ``FAILED``              -> ``finalize`` (do not retry a failed review)
+    - ``NEEDS_MORE_RESEARCH`` -> ``research`` while budget remains,
+                                 else ``finalize``
+    - anything else (``PENDING``, missing, or unexpected) -> ``finalize``
+
+    Fail-safe rule: an unrecognised status must NEVER silently restart
+    research — an unknown state is a bug to surface, not a reason to
+    spend more iterations.
     """
     status = state.get("review_status")
     if status in (ReviewStatus.APPROVED, ReviewStatus.FAILED):
         return ROUTE_FINALIZE
-    if not research_budget_exhausted(state, max_iterations=max_iterations):
-        return ROUTE_RESEARCH
+    if status == ReviewStatus.NEEDS_MORE_RESEARCH:
+        if not research_budget_exhausted(state, max_iterations=max_iterations):
+            return ROUTE_RESEARCH
+        return ROUTE_FINALIZE
     return ROUTE_FINALIZE

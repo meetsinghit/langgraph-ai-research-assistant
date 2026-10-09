@@ -1,10 +1,14 @@
-"""Structured (JSON-lines) logging with secret redaction.
+"""Structured (JSON-lines) logging with best-effort secret redaction.
 
-Security guarantee: API keys and other credentials are never written to
-logs. ``RedactingJsonFormatter`` scrubs the fully formatted message, so
-secrets are caught even if they arrive via ``%s`` arguments or an
-exception traceback. This is a defensive layer on top of the rule that
-secrets are only ever read through ``Settings``.
+Redaction is a defense-in-depth layer, NOT a guarantee. The primary
+control is simpler and stronger: credential-bearing payloads are never
+logged in the first place — secrets are read only through ``Settings``
+and must never be passed to a log call. As a secondary measure, the
+formatter below scrubs common ``key=value`` / ``"key": "value"`` /
+``Authorization: Bearer ...`` patterns from the fully formatted message
+(so secrets arriving via ``%s`` arguments or tracebacks are usually
+masked too). It cannot catch every possible encoding — e.g. a secret
+split across words — so treat all log output as potentially sensitive.
 """
 from __future__ import annotations
 
@@ -15,10 +19,13 @@ from typing import Any
 
 from agent.config import Settings
 
-# Matches patterns like  api_key=xyz  or  "token": "abc"  (case-insensitive).
+# Matches patterns like  api_key=xyz , "token": "abc" or
+# Authorization: Bearer xyz  (case-insensitive). Best-effort: values
+# containing spaces may only be partially masked.
 _SECRET_PATTERN = re.compile(
-    r"(?i)((?:api[_-]?key|apikey|token|secret|password|passwd|credential)s?)"
-    r"\s*[:=]\s*[^\s,\"'}]+"
+    r"(?i)((?:api[_-]?key|apikey|token|secret|password|passwd|credential"
+    r"|authorization)s?)"
+    r"[\"']?\s*[:=]\s*[\"']?\s*(?:[^\s,\"'}]+(?:\s+[^\s,\"'}]+)?)"
 )
 
 
@@ -28,7 +35,7 @@ def redact(message: str) -> str:
 
 
 class RedactingJsonFormatter(logging.Formatter):
-    """JSON-lines formatter that redacts secrets from the final output."""
+    """JSON-lines formatter with best-effort secret redaction."""
 
     def format(self, record: logging.LogRecord) -> str:
         payload: dict[str, Any] = {

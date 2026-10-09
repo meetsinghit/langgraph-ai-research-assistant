@@ -11,7 +11,7 @@ import logging
 from functools import lru_cache
 from typing import Any, Literal
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderName = Literal["gemini", "openrouter", "openai", "ollama"]
@@ -39,11 +39,12 @@ class Settings(BaseSettings):
     openrouter_api_key: str | None = None
     openai_api_key: str | None = None
 
-    # --- Agent behaviour ---
-    request_timeout_seconds: float = 30.0
-    max_research_iterations: int = 3
-    search_results_per_query: int = 5
-    min_findings: int = 3
+    # --- Agent behaviour (validated: a zero/negative loop budget or
+    # timeout would either never run or spin without progress) ---
+    request_timeout_seconds: float = Field(default=30.0, gt=0)
+    max_research_iterations: int = Field(default=3, ge=1)
+    search_results_per_query: int = Field(default=5, ge=1)
+    min_findings: int = Field(default=3, ge=1)
 
     # --- Observability ---
     log_level: str = "INFO"
@@ -64,6 +65,17 @@ class Settings(BaseSettings):
             if data.get(field):
                 data[field] = "***redacted***"
         return data
+
+    def __repr__(self) -> str:
+        """Redacted representation — safe for logs, tracebacks and REPLs.
+
+        ``model_dump()`` still returns real secrets for internal use by
+        the LLM factory; never pass its output to a log call or print.
+        """
+        return f"Settings({self.redacted()!r})"
+
+    def __str__(self) -> str:
+        return self.__repr__()
 
 
 @lru_cache(maxsize=1)

@@ -34,3 +34,17 @@ def test_setup_logging_writes_json_lines_and_redacts_secrets(tmp_path):
     assert entry["logger"] == "agent"
     assert "leaked-secret-value" not in lines[0]
     assert "***redacted***" in lines[0]
+
+
+def test_redact_masks_json_style_credentials():
+    message = 'connecting with "api_key": "super-secret-json" ok'
+    redacted = redact(message)
+    assert "super-secret-json" not in redacted
+    assert "***redacted***" in redacted
+
+
+def test_redact_masks_bearer_authorization_header():
+    message = "request sent with Authorization: Bearer eyJhbGciOiJIUzI1NiJ9"
+    redacted = redact(message)
+    assert "eyJhbGciOiJIUzI1NiJ9" not in redacted
+    assert "***redacted***" in redacted

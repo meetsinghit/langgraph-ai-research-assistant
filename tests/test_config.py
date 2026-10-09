@@ -41,6 +41,31 @@ def test_invalid_log_level_is_rejected():
         Settings(_env_file=None, log_level="VERBOSE")
 
 
+def test_zero_max_research_iterations_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_research_iterations=0)
+
+
+def test_negative_max_research_iterations_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, max_research_iterations=-1)
+
+
+def test_zero_timeout_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, request_timeout_seconds=0)
+
+
+def test_negative_timeout_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, request_timeout_seconds=-5.0)
+
+
+def test_zero_min_findings_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, min_findings=0)
+
+
 def test_redacted_masks_all_secrets():
     s = Settings(
         _env_file=None,
@@ -54,3 +79,15 @@ def test_redacted_masks_all_secrets():
     assert data["openai_api_key"] == "***redacted***"
     for secret in ("gem-secret-1", "or-secret-2", "oa-secret-3"):
         assert secret not in str(data)
+
+
+def test_str_and_repr_never_expose_secrets():
+    s = Settings(
+        _env_file=None,
+        gemini_api_key="gem-secret-1",
+        openrouter_api_key="or-secret-2",
+    )
+    for rendered in (str(s), repr(s)):
+        assert "gem-secret-1" not in rendered
+        assert "or-secret-2" not in rendered
+        assert "***redacted***" in rendered

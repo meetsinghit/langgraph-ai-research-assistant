@@ -54,6 +54,38 @@ def test_two_nodes_appending_to_one_field_are_merged():
     assert [f["text"] for f in result["findings"]] == ["from A", "from B"]
 
 
+def test_parallel_branches_merge_into_shared_state():
+    """Genuine fan-out: two branches run in parallel, then converge.
+
+    Both branches append to the same reducer-backed field; the
+    convergence node must see the MERGED state.
+    """
+
+    def node_a(state: GraphState) -> dict:
+        return {"findings": [{"text": "from A", "source_url": None}]}
+
+    def node_b(state: GraphState) -> dict:
+        return {"findings": [{"text": "from B", "source_url": None}]}
+
+    def converge(state: GraphState) -> dict:
+        return {"iteration": len(state.get("findings") or [])}
+
+    builder = StateGraph(GraphState)
+    builder.add_node("a", node_a)
+    builder.add_node("b", node_b)
+    builder.add_node("converge", converge)
+    builder.add_edge(START, "a")
+    builder.add_edge(START, "b")
+    builder.add_edge("a", "converge")
+    builder.add_edge("b", "converge")
+    builder.add_edge("converge", END)
+
+    result = builder.compile().invoke({})
+    # Parallel execution order is nondeterministic, so compare as sets.
+    assert sorted(f["text"] for f in result["findings"]) == ["from A", "from B"]
+    assert result["iteration"] == 2  # convergence node saw BOTH updates
+
+
 def test_plain_fields_are_last_write_wins():
     def node_a(state: GraphState) -> dict:
         return {"iteration": 1}

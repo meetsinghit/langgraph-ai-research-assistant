@@ -52,6 +52,26 @@ def test_review_asking_for_more_evidence_loops_back():
     assert route_after_review(state, max_iterations=3) == "research"
 
 
+def test_failed_review_terminates():
+    state: GraphState = {"review_status": ReviewStatus.FAILED, "iteration": 1}
+    assert route_after_review(state, max_iterations=3) == "finalize"
+
+
+def test_pending_status_never_restarts_research():
+    state: GraphState = {"review_status": ReviewStatus.PENDING, "iteration": 1}
+    assert route_after_review(state, max_iterations=3) == "finalize"
+
+
+def test_unexpected_status_never_restarts_research():
+    state: GraphState = {"review_status": "garbage-status", "iteration": 1}  # type: ignore[typeddict-item]
+    assert route_after_review(state, max_iterations=3) == "finalize"
+
+
+def test_missing_status_never_restarts_research():
+    state: GraphState = {"iteration": 1}
+    assert route_after_review(state, max_iterations=3) == "finalize"
+
+
 def test_review_loop_is_bounded_by_budget():
     state: GraphState = {"review_status": ReviewStatus.NEEDS_MORE_RESEARCH, "iteration": 3}
     assert route_after_review(state, max_iterations=3) == "finalize"
