@@ -58,3 +58,6 @@ class GraphState(TypedDict, total=False):
     errors: Annotated[list[str], append_items]
     review_status: ReviewStatus
     final_answer: str
+    tokens_in: int
+    tokens_out: int
+    estimated_cost_usd: float

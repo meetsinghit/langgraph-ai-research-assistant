@@ -43,8 +43,16 @@ class Settings(BaseSettings):
     # timeout would either never run or spin without progress) ---
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     max_research_iterations: int = Field(default=3, ge=1)
+    max_tool_calls_per_research: int = Field(default=4, ge=1)
+    max_execution_seconds: float = Field(default=120.0, gt=0)
+    max_redirects: int = Field(default=5, ge=1)
+    max_page_bytes: int = Field(default=1_000_000, ge=1)
+    max_plan_queries: int = Field(default=4, ge=1)
     search_results_per_query: int = Field(default=5, ge=1)
     min_findings: int = Field(default=3, ge=1)
+
+    # Paid providers (OpenAI) are disabled unless explicitly enabled.
+    allow_paid_providers: bool = False
 
     # --- Observability ---
     log_level: str = "INFO"
