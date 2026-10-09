@@ -1,0 +1,24 @@
+# ---- Secrets: NEVER commit these ----
+.env
+.env.*
+!.env.example
+
+# ---- Virtual environment ----
+ai_poc/
+.venv/
+venv/
+
+# ---- Python build artifacts ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- Testing & logs ----
+.pytest_cache/
+*.log
+
+# ---- OS junk ----
+.DS_Store
+Thumbs.db
