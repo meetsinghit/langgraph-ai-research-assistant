@@ -8,7 +8,7 @@ from agent.config import Settings
 def test_safe_defaults():
     s = Settings(_env_file=None)
     assert s.llm_provider == "gemini"
-    assert s.llm_model == "gemini-2.5-flash"
+    assert s.llm_model == "gemini-3.8-flash"
     assert s.request_timeout_seconds == 30.0
     assert s.max_research_iterations == 3
     assert s.min_findings == 3

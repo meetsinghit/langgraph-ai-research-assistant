@@ -31,7 +31,7 @@ class Settings(BaseSettings):
 
     # --- LLM backend (wired up in Phase 3) ---
     llm_provider: ProviderName = "gemini"
-    llm_model: str = "gemini-2.5-flash"
+    llm_model: str = "gemini-3.8-flash"
     llm_base_url: str | None = None
 
     # API keys: read from env/.env only, never logged (see redacted()).
@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     # --- Agent behaviour (validated: a zero/negative loop budget or
     # timeout would either never run or spin without progress) ---
     request_timeout_seconds: float = Field(default=30.0, gt=0)
+    connection_verify_seconds: float = Field(default=30.0, gt=0)
+    connection_verify_max_output_tokens: int = Field(default=64, ge=1)
     max_research_iterations: int = Field(default=3, ge=1)
     max_tool_calls_per_research: int = Field(default=4, ge=1)
     max_execution_seconds: float = Field(default=120.0, gt=0)
