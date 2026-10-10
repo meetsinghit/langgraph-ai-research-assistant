@@ -21,12 +21,21 @@ retries on top of our own retry policy can extend a stuck request to
 minutes (the observed verification hang). Retries are controlled in
 exactly one place: the graph's ``_invoke_with_retry`` (one retry after
 a rate-limit error).
+
+Thinking policy: thinking configuration is MODEL-AWARE. Gemini 3
+models (e.g. gemini-3.8-flash) support ``thinking_level`` values
+low|medium|high — "minimal" is NOT supported and the API rejects it
+with 400 INVALID_ARGUMENT. Gemini 2.5 models use ``thinking_budget``
+(an integer token count; 0 disables thinking). Older models have no
+thinking controls. Normal research runs default to "medium" reasoning
+(Gemini 3) unless configured otherwise; connectivity verification
+always uses "low".
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Literal
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -52,6 +61,35 @@ _FREE_TIER_MODELS = {
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
+# Gemini model families and the thinking controls they support.
+_GEMINI_3_PREFIX = "gemini-3"
+_GEMINI_2_5_PREFIX = "gemini-2.5"
+
+ThinkingLevel = Literal["low", "medium", "high"]
+
+
+def _thinking_kwargs(
+    model: str, *, level: ThinkingLevel
+) -> dict[str, Any]:
+    """Model-aware thinking configuration.
+
+    Maps the requested reasoning depth to the control the model
+    actually supports, so we never send an enum value the API
+    rejects (e.g. "minimal" is invalid for gemini-3.8-flash).
+    Unknown models get no thinking configuration — the provider
+    default applies.
+    """
+    model_name = model.removeprefix("models/")
+    if model_name.startswith(_GEMINI_3_PREFIX):
+        # Gemini 3: thinking_level low|medium|high
+        return {"thinking_level": level}
+    if model_name.startswith(_GEMINI_2_5_PREFIX):
+        # Gemini 2.5: thinking_budget in tokens. "low" maps to
+        # "disabled" (0) for fast verification; any other depth
+        # keeps the model's default budget.
+        return {"thinking_budget": 0} if level == "low" else {}
+    return {}
+
 
 def build_chat_model(
     settings: Settings,
@@ -60,10 +98,14 @@ def build_chat_model(
 ) -> BaseChatModel:
     """Construct the chat model selected by ``settings.llm_provider``.
 
+    Normal research runs use "medium" reasoning depth (Gemini 3
+    models) unless ``settings.llm_thinking_level`` overrides it.
+
     ``verification=True`` builds a connection-check configuration:
-    thinking minimized and output tokens capped, so a smoke test
-    cannot burn its token budget on reasoning tokens (Gemini 3
-    models think by default).
+    the lowest SUPPORTED thinking level ("low") and a modest
+    output-token cap, so a smoke test cannot burn its token
+    budget on reasoning tokens (thinking tokens count toward
+    ``max_output_tokens``).
     """
     provider = settings.llm_provider
 
@@ -81,8 +123,21 @@ def build_chat_model(
             "timeout": settings.request_timeout_seconds,
             "max_retries": 1,  # disables SDK retries (see module docstring)
         }
+        # Default research depth: medium reasoning (Gemini 3),
+        # unless configured otherwise.
+        thinking_level: ThinkingLevel = (
+            settings.llm_thinking_level or "medium"
+        )
+        kwargs.update(
+            _thinking_kwargs(settings.llm_model, level=thinking_level)
+        )
         if verification:
-            kwargs["thinking_level"] = "minimal"  # lowest reasoning depth
+            # Connectivity check: lowest supported thinking level
+            # and a modest output budget — thinking tokens count
+            # toward max_output_tokens, so 64 was too tight.
+            kwargs.update(
+                _thinking_kwargs(settings.llm_model, level="low")
+            )
             kwargs["max_output_tokens"] = (
                 settings.connection_verify_max_output_tokens
             )
@@ -159,8 +214,9 @@ def verify_connection(
       (``asyncio.wait_for`` around the async client path — a
       timeout cancels the in-flight HTTP request)
     - SDK retries are disabled (``max_retries=1``)
-    - thinking is minimized and output tokens are capped, so the
-      small budget cannot be consumed by reasoning tokens
+    - thinking is minimized to the lowest SUPPORTED level and
+      output tokens are capped, so the budget cannot be
+      consumed by reasoning tokens
 
     ``deadline`` overrides ``settings.connection_verify_seconds``
     (used by tests to keep verification fast).

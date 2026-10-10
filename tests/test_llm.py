@@ -44,19 +44,51 @@ def test_gemini_uses_native_integration():
     assert model.temperature == 0.2
     assert model.timeout == 30.0
     assert model.max_retries == 1  # SDK retries disabled
+    assert model.thinking_level == "medium"  # default research depth
 
 
-def test_gemini_verification_model_minimizes_thinking():
+def test_gemini_verification_model_uses_low_thinking():
+    """Verification uses "low" — "minimal" is rejected by
+    gemini-3.8-flash with 400 INVALID_ARGUMENT."""
     model = build_chat_model(_settings(), verification=True)
     assert isinstance(model, ChatGoogleGenerativeAI)
-    assert model.thinking_level == "minimal"
-    assert model.max_output_tokens == 64
+    assert model.thinking_level == "low"
+    # Thinking tokens count toward max_output_tokens, so the
+    # verification budget must leave room for the reply.
+    assert model.max_output_tokens == 256
 
 
-def test_gemini_default_model_keeps_provider_thinking_defaults():
-    model = build_chat_model(_settings())
+def test_configured_thinking_level_is_respected():
+    model = build_chat_model(_settings(llm_thinking_level="high"))
+    assert model.thinking_level == "high"
+
+
+def test_gemini_2_5_models_use_thinking_budget():
+    """Gemini 2.5 models use thinking_budget (token count),
+    not thinking_level."""
+    model = build_chat_model(_settings(llm_model="gemini-2.5-flash"))
     assert model.thinking_level is None
-    assert model.max_output_tokens is None
+    assert model.thinking_budget is None  # default budget for research
+
+    verification = build_chat_model(
+        _settings(llm_model="gemini-2.5-flash"), verification=True
+    )
+    assert verification.thinking_level is None
+    assert verification.thinking_budget == 0  # disabled for verification
+
+
+def test_older_gemini_models_get_no_thinking_config():
+    """Models without thinking controls get no thinking config."""
+    model = build_chat_model(_settings(llm_model="gemini-2.0-flash"))
+    assert model.thinking_level is None
+    assert model.thinking_budget is None
+
+    verification = build_chat_model(
+        _settings(llm_model="gemini-2.0-flash"), verification=True
+    )
+    assert verification.thinking_level is None
+    assert verification.thinking_budget is None
+    assert verification.max_output_tokens == 256
 
 
 def test_gemini_requires_api_key():
@@ -160,10 +192,10 @@ def test_native_gemini_client_receives_timeout_retry_and_thinking_config(
     config = captured["config"]
     assert config.http_options.timeout == 5000  # seconds -> milliseconds
     assert config.http_options.retry_options.attempts == 1
-    assert (
-        config.thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
+    assert config.thinking_config.thinking_level == (
+        types.ThinkingLevel.LOW
     )
-    assert config.max_output_tokens == 64
+    assert config.max_output_tokens == 256
 
 
 def test_native_gemini_async_client_receives_same_config(
@@ -188,10 +220,34 @@ def test_native_gemini_async_client_receives_same_config(
     config = captured["config"]
     assert config.http_options.timeout == 5000
     assert config.http_options.retry_options.attempts == 1
-    assert (
-        config.thinking_config.thinking_level == types.ThinkingLevel.MINIMAL
+    assert config.thinking_config.thinking_level == (
+        types.ThinkingLevel.LOW
     )
-    assert config.max_output_tokens == 64
+    assert config.max_output_tokens == 256
+
+
+def test_native_gemini_client_default_research_uses_medium_thinking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    def fake_generate_content(
+        self: Any, **request: Any
+    ) -> types.GenerateContentResponse:
+        captured.update(request)
+        return _mock_response("ok")
+
+    monkeypatch.setattr(
+        genai.models.Models, "generate_content", fake_generate_content
+    )
+
+    model = build_chat_model(_settings(request_timeout_seconds=5.0))
+    model.invoke("Say ok")
+
+    config = captured["config"]
+    assert config.thinking_config.thinking_level == (
+        types.ThinkingLevel.MEDIUM
+    )
 
 
 # ---------- connection verification ----------

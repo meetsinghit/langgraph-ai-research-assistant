@@ -13,19 +13,22 @@ def test_safe_defaults():
     assert s.max_research_iterations == 3
     assert s.min_findings == 3
     assert s.log_level == "INFO"
+    assert s.connection_verify_seconds == 30.0
+    assert s.connection_verify_max_output_tokens == 256
+    assert s.llm_thinking_level is None
     assert s.gemini_api_key is None  # no secret baked into defaults
 
 
 def test_env_vars_override_defaults(monkeypatch):
-    monkeypatch.setenv("LLM_PROVIDER", "ollama")
-    monkeypatch.setenv("LLM_MODEL", "llama3.2")
+    monkeypatch.setenv("LLM_PROVIDER", "openrouter")
+    monkeypatch.setenv("LLM_MODEL", "openai/gpt-4o-mini")
     monkeypatch.setenv("REQUEST_TIMEOUT_SECONDS", "45.5")
     monkeypatch.setenv("MAX_RESEARCH_ITERATIONS", "5")
     monkeypatch.setenv("LOG_LEVEL", "debug")
 
     s = Settings(_env_file=None)
-    assert s.llm_provider == "ollama"
-    assert s.llm_model == "llama3.2"
+    assert s.llm_provider == "openrouter"
+    assert s.llm_model == "openai/gpt-4o-mini"
     assert s.request_timeout_seconds == 45.5
     assert s.max_research_iterations == 5
     assert s.log_level == "DEBUG"

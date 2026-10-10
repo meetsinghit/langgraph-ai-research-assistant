@@ -19,7 +19,7 @@ python main.py "What is LangGraph?"
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `LLM_PROVIDER` | `gemini` \| `openrouter` \| `openai` | `gemini` |
-| `LLM_MODEL` | model name | `gemini-2.5-flash` |
+| `LLM_MODEL` | model name | `gemini-3.8-flash` |
 | `GEMINI_API_KEY` | free-tier key from aistudio.google.com/apikey | – |
 | `OPENROUTER_API_KEY` | key from openrouter.ai/keys (free models exist) | – |
 | `OPENAI_API_KEY` | paid key — only used with `ALLOW_PAID_PROVIDERS=true` | – |

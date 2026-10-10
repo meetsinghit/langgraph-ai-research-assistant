@@ -14,7 +14,8 @@ from typing import Any, Literal
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-ProviderName = Literal["gemini", "openrouter", "openai", "ollama"]
+ProviderName = Literal["gemini", "openrouter", "openai"]
+ThinkingLevel = Literal["low", "medium", "high"]
 
 _SECRET_FIELDS = ("gemini_api_key", "openrouter_api_key", "openai_api_key")
 
@@ -34,6 +35,11 @@ class Settings(BaseSettings):
     llm_model: str = "gemini-3.8-flash"
     llm_base_url: str | None = None
 
+    # Optional reasoning-depth override for normal research runs
+    # (Gemini 3 models; unset = "medium"). Verification always
+    # uses "low".
+    llm_thinking_level: ThinkingLevel | None = None
+
     # API keys: read from env/.env only, never logged (see redacted()).
     gemini_api_key: str | None = None
     openrouter_api_key: str | None = None
@@ -43,7 +49,7 @@ class Settings(BaseSettings):
     # timeout would either never run or spin without progress) ---
     request_timeout_seconds: float = Field(default=30.0, gt=0)
     connection_verify_seconds: float = Field(default=30.0, gt=0)
-    connection_verify_max_output_tokens: int = Field(default=64, ge=1)
+    connection_verify_max_output_tokens: int = Field(default=256, ge=1)
     max_research_iterations: int = Field(default=3, ge=1)
     max_tool_calls_per_research: int = Field(default=4, ge=1)
     max_execution_seconds: float = Field(default=120.0, gt=0)
