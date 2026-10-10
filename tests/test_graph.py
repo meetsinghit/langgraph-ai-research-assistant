@@ -792,7 +792,7 @@ def test_official_source_is_verified_first_when_requested():
         responses=[
             _tool_call_response("c1"),
             AIMessage(content="done"),
-            AIMessage(content="Answer citing the docs."),
+            AIMessage(content=f"Answer citing {official}."),
         ],
         structured_outputs=[
             ResearchPlan(queries=["q"]),
@@ -801,11 +801,133 @@ def test_official_source_is_verified_first_when_requested():
     )
 
     graph = build_research_graph(settings, model, fake_tools)
-    graph.invoke({"question": question})
+    result = graph.invoke({"question": question})
 
     # the deterministic verification step fetched the first-party
     # page first, even though the third-party one was discovered first
     assert fake_tools.fetch_calls == [official]
+
+    # synthesis was explicitly told to prioritize the retrieved
+    # official source, and an answer citing it passes the citation
+    # gate without being marked
+    human_contents = [
+        str(message.content)
+        for invocation in model.seen_messages
+        for message in invocation
+    ]
+    assert any("Official/first-party sources gathered" in c for c in human_contents)
+    assert result["review_status"] == ReviewStatus.APPROVED
+    assert "CITATION QUALITY" not in result["final_answer"]
+
+
+def test_official_docs_citing_only_third_party_snippets_is_marked_and_sent_back():
+    """Live-run regression: the official page was retrieved, but the
+    answer cited only a snippet-based third-party URL. The
+    citation-quality check fails deterministically, the answer is
+    marked, and even an LLM 'approved' verdict is overridden.
+    (URL provenance only — this is not a factual-correctness claim.)"""
+    question = "LangGraph official documentation"
+    third_party = "https://blog.example.com/langgraph-tutorial"
+    official = "https://langchain-ai.github.io/langgraph/docs/"
+    settings = _settings(max_tool_calls_per_research=4, max_research_iterations=1)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("Tutorial", third_party),
+            _search_result("Official docs", official),
+        ],
+        page_text="Official docs text.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content=f"Use this tutorial instead: {third_party}"),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="looks fine"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": question})
+
+    # the official page was still force-retrieved by the budgeted step
+    assert fake_tools.fetch_calls == [official]
+    # the answer is clearly marked as insufficiently verified...
+    assert "CITATION QUALITY" in result["final_answer"]
+    assert third_party in result["final_answer"]
+    # ...and the deterministic gate overrode the scripted approval;
+    # with the iteration budget spent, routing finalizes instead of
+    # restarting research (budgeting unchanged)
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+
+
+def test_unknown_cited_url_fails_citation_quality_and_marks_answer():
+    """A URL the research never gathered must not pass as a citation."""
+    settings = _settings(max_tool_calls_per_research=4, max_research_iterations=1)
+    fake_tools = FakeTools(
+        search_results=[_search_result("Page", "https://example.com/a")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(
+                content="See https://not-gathered.example/page for the answer."
+            ),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="looks fine"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert fake_tools.fetch_calls == ["https://example.com/a"]
+    assert "CITATION QUALITY" in result["final_answer"]
+    # unknown citations are not silently waved through
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+
+
+def test_review_prompt_carries_citation_report_and_semantic_disclaimer():
+    """The reviewer receives the deterministic citation report AND is
+    told it only proves provenance, so semantic support checking
+    stays the reviewer's job."""
+    settings = _settings(max_tool_calls_per_research=2)
+    fake_tools = FakeTools(
+        search_results=[_search_result("Page", "https://example.com/a")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="See https://example.com/a."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    graph.invoke({"question": "question"})
+
+    contents = [
+        str(message.content)
+        for invocation in model.seen_structured_messages
+        for message in invocation
+    ]
+    review_prompts = [c for c in contents if "Draft answer:" in c]
+    assert review_prompts, "review node was never invoked"
+    assert "Citation validation" in review_prompts[-1]
+    assert "does NOT verify" in review_prompts[-1]
+    # system prompt: reviewer must judge semantic support itself
+    assert any(
+        "assess that support semantically yourself" in c for c in contents
+    )
 
 
 def test_source_urls_are_deduplicated_across_searches():

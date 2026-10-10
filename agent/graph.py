@@ -43,10 +43,8 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from typing import Any, Callable, Literal
-from urllib.parse import urlparse
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import (
@@ -60,6 +58,13 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel
 
+from agent.citations import (
+    citation_note,
+    format_citation_report,
+    is_first_party,
+    requests_official_sources,
+    validate_citations,
+)
 from agent.config import Settings
 from agent.llm import content_to_text, estimate_cost
 from agent.routing import (
@@ -120,11 +125,16 @@ _SYNTHESIZE_SYSTEM = (
 _REVIEW_SYSTEM = (
     "You are a quality reviewer. Decide whether the collected "
     "findings are sufficient to answer the user's question, "
-    "considering the verification status provided with the "
-    "draft: an answer honestly labeled UNVERIFIED is acceptable "
-    "when page verification genuinely could not complete within "
-    "the budget. Reply approved or needs_more_research with a "
-    "short reason."
+    "considering the verification status and citation validation "
+    "provided with the draft: an answer honestly labeled UNVERIFIED "
+    "is acceptable when page verification genuinely could not "
+    "complete within the budget. The citation validation is "
+    "deterministic URL/provenance matching only — it does NOT prove "
+    "that the cited sources factually support the claims; assess "
+    "that support semantically yourself, claim by claim. For "
+    "questions asking for official documentation, check that the "
+    "official source is cited and actually supports the answer. "
+    "Reply approved or needs_more_research with a short reason."
 )
 
 
@@ -154,85 +164,6 @@ def _findings_block(findings: list[Finding]) -> str:
 
 # --- evidence provenance & verification ---------------------------
 
-_OFFICIAL_REQUEST_RE = re.compile(r"\b(official|first[- ]party)\b", re.IGNORECASE)
-
-#: Curated list of first-party documentation domains (heuristic —
-#: a domain on this list, or any of its subdomains, is treated as
-#: an official source when the question asks for official docs).
-_FIRST_PARTY_DOC_DOMAINS = frozenset(
-    {
-        "langchain-ai.github.io",
-        "ai.google.dev",
-        "developers.google.com",
-        "cloud.google.com",
-        "openai.com",
-        "platform.openai.com",
-        "python.org",
-        "docs.python.org",
-        "learn.microsoft.com",
-        "developer.mozilla.org",
-        "docs.aws.amazon.com",
-        "huggingface.co",
-        "pytorch.org",
-        "react.dev",
-        "kubernetes.io",
-        "docs.github.com",
-        "fastapi.tiangolo.com",
-        "pandas.pydata.org",
-        "numpy.org",
-    }
-)
-
-_GENERIC_TOKENS = frozenset(
-    {
-        "about", "after", "again", "also", "and", "any", "api", "are",
-        "based", "best", "between", "does", "doc", "docs", "documentation",
-        "for", "from", "guide", "guides", "have", "help", "how", "into",
-        "its", "latest", "official", "party", "reference", "references",
-        "should", "site", "some", "source", "sources", "than", "that",
-        "their", "there", "these", "they", "this", "those", "using",
-        "want", "was", "were", "what", "when", "where", "which", "with",
-        "would", "your", "website",
-    }
-)
-
-
-def _requests_official_sources(question: str) -> bool:
-    """True when the user explicitly asks for official/first-party sources."""
-    return bool(_OFFICIAL_REQUEST_RE.search(question))
-
-
-def _product_tokens(question: str) -> list[str]:
-    """Likely product/vendor names in the question (heuristic)."""
-    return [
-        token
-        for token in re.findall(r"[a-z0-9]+", question.lower())
-        if len(token) >= 4 and token not in _GENERIC_TOKENS
-    ]
-
-
-def _is_first_party(url: str, question: str) -> bool:
-    """Heuristic first-party check for a source URL.
-
-    A URL is first-party when its hostname is a curated official
-    documentation domain, or when a product token from the question
-    appears in the hostname (e.g. ``fastapi`` in
-    ``fastapi.tiangolo.com``).
-    """
-    try:
-        host = (urlparse(url).hostname or "").lower()
-    except ValueError:
-        return False
-    if not host:
-        return False
-    if host.startswith("www."):
-        host = host[4:]
-    for domain in _FIRST_PARTY_DOC_DOMAINS:
-        if host == domain or host.endswith("." + domain):
-            return True
-    return any(token in host for token in _product_tokens(question))
-
-
 def _retrieved_urls(findings: list[Finding]) -> set[str]:
     """Unique source URLs whose pages were actually fetched/inspected."""
     return {
@@ -258,9 +189,9 @@ def _candidate_urls(
         if url and url not in retrieved and url not in seen:
             seen.add(url)
             candidates.append(url)
-    if _requests_official_sources(question):
+    if requests_official_sources(question):
         candidates.sort(
-            key=lambda url: 0 if _is_first_party(url, question) else 1
+            key=lambda url: 0 if is_first_party(url, question) else 1
         )
     return candidates
 
@@ -270,6 +201,37 @@ def _verification(findings: list[Finding], min_retrieved: int) -> tuple[bool, in
     count = len(_retrieved_urls(findings))
     verified = min_retrieved == 0 or count >= min_retrieved
     return verified, count
+
+
+def _official_sources_block(findings: list[Finding], question: str) -> str | None:
+    """Prompt block listing first-party sources, strongest evidence first.
+
+    Returned only when the question explicitly asks for official
+    documentation and first-party sources were gathered — synthesis
+    is then told to cite the retrieved official source(s) directly
+    rather than third-party snippet URLs.
+    """
+    if not requests_official_sources(question):
+        return None
+    rank = {"snippet": 1, "retrieved": 2}
+    best: dict[str, str] = {}
+    for finding in findings:
+        url = finding.get("source_url")
+        if not url or not is_first_party(url, question):
+            continue
+        evidence = str(finding.get("evidence", "snippet"))
+        if url not in best or rank.get(evidence, 0) > rank.get(best[url], 0):
+            best[url] = evidence
+    if not best:
+        return None
+    lines = ["Official/first-party sources gathered:"]
+    lines.extend(f"- {url} [{evidence}]" for url, evidence in best.items())
+    lines.append(
+        "The question asks for official documentation: the answer must "
+        "cite the official [retrieved] source URL(s) above directly — "
+        "do not substitute third-party snippet URLs."
+    )
+    return "\n".join(lines)
 
 
 def _verification_line(findings: list[Finding], min_retrieved: int) -> str:
@@ -307,7 +269,7 @@ def _phase_hint(allowed: list[str], candidates: list[str], question: str) -> str
         note = (
             " Prefer first-party/official sources: the question "
             "explicitly asks for official documentation."
-            if _requests_official_sources(question)
+            if requests_official_sources(question)
             else ""
         )
         return (
@@ -743,15 +705,17 @@ def make_synthesize_node(
         verified, retrieved_count = _verification(
             findings, settings.min_retrieved_sources
         )
+        prompt_parts = [
+            f"Question: {state['question']}",
+            _verification_line(findings, settings.min_retrieved_sources),
+        ]
+        official_block = _official_sources_block(findings, state["question"])
+        if official_block:
+            prompt_parts.append(official_block)
+        prompt_parts.append(f"Findings:\n{_findings_block(findings)}")
         messages = [
             SystemMessage(content=_SYNTHESIZE_SYSTEM),
-            HumanMessage(
-                content=(
-                    f"Question: {state['question']}\n\n"
-                    f"{_verification_line(findings, settings.min_retrieved_sources)}\n\n"
-                    f"Findings:\n{_findings_block(findings)}"
-                ),
-            ),
+            HumanMessage(content="\n\n".join(prompt_parts)),
         ]
         try:
             response = _invoke_with_retry(model, messages, rate_limit_retry_delay)
@@ -784,6 +748,17 @@ def make_synthesize_node(
                 f"finding(s) collected; the quality threshold is "
                 f"{settings.min_findings}.]"
             )
+        # Deterministic citation-provenance check on the drafted
+        # answer: URLs it cites must correspond to recorded sources.
+        # Failure marks the answer as insufficiently verified (the
+        # review node applies the same check as a gate).
+        citation_report = validate_citations(answer, findings, state["question"])
+        if not citation_report.ok:
+            logger.warning(
+                "drafted answer failed citation validation: %s",
+                "; ".join(citation_report.reasons),
+            )
+            answer = f"{citation_note(citation_report)}\n\n{answer}"
         update: dict[str, Any] = {"final_answer": answer}
         delta_in, delta_out = _usage_delta(response)
         update["tokens_in"] = state.get("tokens_in", 0) + delta_in
@@ -802,20 +777,33 @@ def make_synthesize_node(
 
 
 def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
-    """LLM quality gate: is the evidence sufficient?"""
+    """LLM quality gate: is the evidence sufficient?
+
+    The draft's citations are validated deterministically first
+    (URL provenance — see ``agent/citations.py``); the report is
+    handed to the reviewer, which makes the semantic
+    does-the-source-support-the-claim judgement. A citation check
+    failure cannot be waved through by a lenient reviewer: an
+    ``approved`` verdict is downgraded to ``needs_more_research``
+    (bounded by the existing iteration budget; if the budget is
+    spent, routing finalizes the already-labeled answer).
+    """
     verifier = model.with_structured_output(ReviewVerdict)
 
     def review_node(state: GraphState) -> dict[str, Any]:
         findings = state.get("findings") or []
+        answer = state.get("final_answer", "")
+        report = validate_citations(answer, findings, state["question"])
         messages = [
             SystemMessage(content=_REVIEW_SYSTEM),
             HumanMessage(
                 content=(
                     f"Question: {state['question']}\n\n"
                     f"{_verification_line(findings, settings.min_retrieved_sources)}\n\n"
+                    f"{format_citation_report(report)}\n\n"
                     f"Findings:\n"
                     f"{_findings_block(findings)}\n\n"
-                    f"Draft answer: {state.get('final_answer', '')}"
+                    f"Draft answer: {answer}"
                 )
             ),
         ]
@@ -827,6 +815,13 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
                 else ReviewStatus.NEEDS_MORE_RESEARCH
             )
             logger.info("review: %s (%s)", status.value, verdict.reason)
+            if status == ReviewStatus.APPROVED and not report.ok:
+                logger.warning(
+                    "citation gate: overriding approved -> "
+                    "needs_more_research (%s)",
+                    "; ".join(report.reasons),
+                )
+                status = ReviewStatus.NEEDS_MORE_RESEARCH
             return {"review_status": status}
         except Exception as exc:
             # Fail-safe: a failed review must never silently restart research.

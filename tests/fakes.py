@@ -29,10 +29,15 @@ class ScriptedChatModel(BaseChatModel):
     raise_on_call: dict[int, Exception] = Field(default_factory=dict)
     call_index: int = 0
     structured_index: int = 0
-    #: messages observed on each ``invoke`` — lets tests assert
+    #: messages observed on each plain ``invoke`` — lets tests assert
     #: prompt content (grounding, provenance) and that internal
     #: model messages retain their structured content blocks.
     seen_messages: list[list[Any]] = Field(default_factory=list)
+    #: messages observed on each ``with_structured_output`` invoke
+    #: (plan and review prompts) — kept separate from
+    #: ``seen_messages`` so the positional indices of plain
+    #: invocations used by existing tests stay stable.
+    seen_structured_messages: list[list[Any]] = Field(default_factory=list)
     #: tool names passed to each ``bind_tools`` call — lets tests
     #: assert the deterministic search/fetch tool partitioning
     #: (which tools the graph made available in each round).
@@ -69,7 +74,12 @@ class ScriptedChatModel(BaseChatModel):
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
         outputs = self.structured_outputs
 
-        def _invoke(_messages: Any) -> Any:
+        def _invoke(messages: Any) -> Any:
+            # recorded separately from seen_messages so tests can
+            # assert structured-node prompts (plan, review) without
+            # shifting plain-invoke positional indices
+            if isinstance(messages, list):
+                self.seen_structured_messages.append(list(messages))
             if not outputs:
                 raise RuntimeError("no scripted structured output available")
             index = min(self.structured_index, len(outputs) - 1)
