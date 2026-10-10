@@ -106,6 +106,7 @@ class FakeTools:
         page_text: str = "Fetched page content.",
         fail_queries: set[str] | None = None,
         fail_fetch: bool = False,
+        fail_fetch_urls: set[str] | None = None,
     ):
         self.search_results = search_results or []
         self.page_text = page_text
@@ -116,6 +117,10 @@ class FakeTools:
         #: when True every fetch_page call raises, so a test can
         #: exercise the unverified-answer path.
         self.fail_fetch = fail_fetch
+        #: specific URLs whose fetch fails (e.g. the official page
+        #: failing TLS verification) while other fetches succeed —
+        #: reproduces the live-run mixed-outcome pass.
+        self.fail_fetch_urls = fail_fetch_urls or set()
         self.search_calls: list[str] = []
         self.fetch_calls: list[str] = []
 
@@ -127,8 +132,13 @@ class FakeTools:
 
     def fetch_page(self, url: str) -> str:
         self.fetch_calls.append(url)
-        if self.fail_fetch:
-            raise ToolError(f"fetch_page request failed for {url}")
+        if self.fail_fetch or url in self.fail_fetch_urls:
+            raise ToolError(
+                f"fetch_page request failed for {url}: ConnectError: "
+                "self-signed certificate in certificate chain. TLS "
+                "certificate verification failed; verification is "
+                "never disabled."
+            )
         return self.page_text
 
     def tool_functions(self) -> dict[str, Any]:

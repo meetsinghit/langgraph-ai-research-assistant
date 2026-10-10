@@ -1158,3 +1158,151 @@ def test_source_urls_are_deduplicated_across_searches():
     result = graph.invoke({"question": "question"})
 
     assert result["sources"] == ["https://example.com/a", "https://example.com/b"]
+
+
+# --- official-source retrieval gate & disclaimer coverage (live runs) ---
+
+
+def test_official_fetch_tls_failure_blocks_unqualified_approval():
+    """Live run: the official docs.langchain.com page failed TLS
+    verification ('self-signed certificate in certificate chain'),
+    a third-party page fetched fine, and NO official page was
+    retrieved. Even with a scripted 'approved' verdict the run must
+    not end unqualified: it carries the official-source marker and
+    is downgraded (bounded by the iteration budget)."""
+    question = (
+        "Explain LangGraph state management using official documentation."
+    )
+    official = "https://docs.langchain.com/oss/python/langgraph/overview"
+    third = "https://deepwiki.example.com/langgraph-guide"
+    settings = _settings(
+        max_tool_calls_per_research=4, max_research_iterations=1
+    )
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("Official overview", official),
+            _search_result("DeepWiki", third),
+        ],
+        page_text="Third-party overview.",
+        fail_fetch_urls={official},
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(
+                content="LangGraph state management flows through "
+                "checkpointer pages like [S2]."
+            ),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="looks complete"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": question})
+
+    # the official URL is attempted FIRST (first-party priority) and
+    # fails; the third-party page is then fetched successfully
+    assert fake_tools.fetch_calls == [official, third]
+    # honest incomplete label, never an unqualified result
+    assert "OFFICIAL SOURCES: NOT RETRIEVED" in result["final_answer"]
+    # citation + coverage gates pass, yet the official gate holds
+    assert "CITATION QUALITY" not in result["final_answer"]
+    assert "TOPIC COVERAGE" not in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+    # the reviewer was shown the deterministic official status
+    review_prompt = str(model.seen_structured_messages[-1])
+    assert "Official-source status: OFFICIAL_DISCOVERED_ONLY" in (
+        review_prompt
+    )
+
+
+def test_no_official_source_downgrades_and_steers_to_current_domains():
+    """Official question where only third-party sources exist: no
+    unqualified APPROVED, an honest marker, and plan/research
+    prompts steering queries to the CURRENT documentation domains."""
+    question = "LangGraph official documentation for state management"
+    settings = _settings(
+        max_tool_calls_per_research=4, max_research_iterations=1
+    )
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result(
+                "Blog", "https://blog.example.com/langgraph-state"
+            )
+        ],
+        page_text="Blog text.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(
+                content="LangGraph state management uses checkpointers, "
+                "per [S1]."
+            ),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="complete"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": question})
+
+    assert "OFFICIAL SOURCES: NOT RETRIEVED" in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+    review_prompt = str(model.seen_structured_messages[-1])
+    assert "Official-source status: NO_OFFICIAL_SOURCE" in review_prompt
+    # Task 4: the planner is steered to current domains
+    plan_prompt = str(model.seen_structured_messages[0])
+    assert "docs.langchain.com" in plan_prompt
+    assert "reference.langchain.com" in plan_prompt
+    # ... and so is every research round (legacy domains named only
+    # as the thing to avoid)
+    research_prompt = str(model.seen_messages[0])
+    assert "Official-source guidance" in research_prompt
+    assert "docs.langchain.com" in research_prompt
+    assert "reference.langchain.com" in research_prompt
+    assert "langchain-ai.github.io" in research_prompt
+
+
+def test_not_present_disclaimer_is_marked_and_bounded():
+    """Live phrase: conditional routing only mentioned via '...
+    were not present in the retrieved text excerpts.' must be
+    flagged as missing coverage; the bounded retry ends with the
+    marker rather than an approved answer."""
+    question = "Explain LangGraph conditional routing syntax"
+    settings = _settings(
+        max_tool_calls_per_research=4, max_research_iterations=1
+    )
+    fake_tools = FakeTools(
+        search_results=[_search_result("Docs", "https://example.com/a")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(
+                content="Specific details regarding conditional routing "
+                "syntax were not present in the retrieved text "
+                "excerpts. LangGraph syntax uses nodes and edges, "
+                "per [S1]."
+            ),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="complete"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": question})
+
+    assert result["missing_topics"] == ["conditional", "routing"]
+    assert "TOPIC COVERAGE" in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH

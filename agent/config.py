@@ -69,6 +69,14 @@ class Settings(BaseSettings):
     # partitioning and no unverified-answer label.
     min_retrieved_sources: int = Field(default=1, ge=0)
 
+    # Optional path to a CA bundle (PEM) used to VERIFY server
+    # certificates when fetching pages — e.g. an enterprise
+    # TLS-inspection root that is not in certifi's store. When set,
+    # it is the verification store; when unset, the OS trust store
+    # (truststore) or certifi applies. Certificate verification is
+    # never disabled either way; verify=False does not exist here.
+    ssl_ca_bundle: str | None = None
+
     # Paid providers (OpenAI) are disabled unless explicitly enabled.
     allow_paid_providers: bool = False
 

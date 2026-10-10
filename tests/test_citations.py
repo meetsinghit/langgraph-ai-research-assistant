@@ -6,17 +6,21 @@ source's provenance is. They deliberately assert the module's own
 disclaimer too — a URL match never proves a claim factually supported.
 """
 from agent.citations import (
+    OfficialSourceStatus,
     assign_source_ids,
     citation_note,
     extract_cited_urls,
     format_citation_report,
     format_source_refs,
     is_first_party,
+    official_source_status,
     requests_official_sources,
     validate_citations,
 )
 
 OFFICIAL = "https://langchain-ai.github.io/langgraph/docs/"
+DOCS_CURRENT = "https://docs.langchain.com/oss/python/langgraph/overview"
+REFERENCE_CURRENT = "https://reference.langchain.com/langgraph/"
 THIRD_PARTY = "https://blog.example.com/langgraph-tutorial"
 
 
@@ -403,3 +407,62 @@ def test_official_source_cited_by_identifier_satisfies_the_gate():
     )
     assert report.official_cited == (OFFICIAL,)
     assert report.ok
+
+
+# --- official-source quality status ---------------------------------
+
+
+def test_official_status_not_required_for_regular_questions():
+    findings = [_finding(THIRD_PARTY, "snippet")]
+    assert (
+        official_source_status(findings, "What is LangGraph?")
+        is OfficialSourceStatus.NOT_REQUIRED
+    )
+
+
+def test_official_status_verified_when_first_party_page_retrieved():
+    findings = [
+        _finding(THIRD_PARTY, "snippet"),
+        _finding(DOCS_CURRENT, "retrieved"),
+    ]
+    assert (
+        official_source_status(findings, "LangGraph official documentation")
+        is OfficialSourceStatus.VERIFIED_OFFICIAL
+    )
+
+
+def test_official_status_discovered_only_when_fetch_failed():
+    """Live-run case: the official URL was discovered, but its fetch
+    failed (TLS) while a third-party page was retrieved."""
+    findings = [
+        _finding(DOCS_CURRENT, "snippet"),
+        _finding(THIRD_PARTY, "retrieved"),
+    ]
+    assert (
+        official_source_status(findings, "LangGraph official documentation")
+        is OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY
+    )
+
+
+def test_official_status_none_when_no_first_party_source_found():
+    findings = [_finding(THIRD_PARTY, "retrieved")]
+    assert (
+        official_source_status(findings, "LangGraph official documentation")
+        is OfficialSourceStatus.NO_OFFICIAL_SOURCE
+    )
+
+
+def test_official_status_snippet_only_official_is_not_verified():
+    """A snippet never satisfies the official-source requirement —
+    only a fetched page does."""
+    findings = [_finding(OFFICIAL, "snippet")]
+    assert (
+        official_source_status(findings, "LangGraph official documentation")
+        is OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY
+    )
+
+
+def test_current_official_and_reference_domains_are_first_party():
+    question = "LangGraph official documentation"
+    assert is_first_party(DOCS_CURRENT, question)
+    assert is_first_party(REFERENCE_CURRENT, question)

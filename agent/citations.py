@@ -17,14 +17,17 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 from urllib.parse import urlparse
 
 from agent.state import Finding
 
 __all__ = [
+    "CURRENT_OFFICIAL_DOC_DOMAINS",
     "Citation",
     "CitationReport",
+    "OfficialSourceStatus",
     "SourceRef",
     "assign_source_ids",
     "extract_cited_urls",
@@ -32,6 +35,7 @@ __all__ = [
     "format_citation_report",
     "format_source_refs",
     "is_first_party",
+    "official_source_status",
     "requests_official_sources",
     "source_key",
     "validate_citations",
@@ -41,6 +45,15 @@ __all__ = [
 
 _OFFICIAL_REQUEST_RE = re.compile(r"\b(official|first[- ]party)\b", re.IGNORECASE)
 
+#: Domains of the CURRENT official documentation (legacy LangChain/
+#: LangGraph content moved off langchain-ai.github.io). Research
+#: prompts steer official-documentation queries here instead of the
+#: legacy domains.
+CURRENT_OFFICIAL_DOC_DOMAINS = (
+    "docs.langchain.com",
+    "reference.langchain.com",
+)
+
 #: Curated list of first-party documentation domains (heuristic —
 #: a domain on this list, or any of its subdomains, is treated as
 #: an official source when the question asks for official docs).
@@ -48,6 +61,7 @@ _FIRST_PARTY_DOC_DOMAINS = frozenset(
     {
         "langchain-ai.github.io",
         "docs.langchain.com",
+        "reference.langchain.com",
         "ai.google.dev",
         "developers.google.com",
         "cloud.google.com",
@@ -122,6 +136,55 @@ def is_first_party(url: str, question: str) -> bool:
             return True
     labels = host.split(".")
     return any(token in labels for token in _product_tokens(question))
+
+
+class OfficialSourceStatus(str, Enum):
+    """Research-quality state of the official-source requirement.
+
+    Provenance only: was a first-party page actually FETCHED for a
+    question that explicitly asks for official documentation? It says
+    nothing about whether the retrieved page is semantically adequate
+    — that stays the reviewer's judgement.
+    """
+
+    #: The question does not ask for official documentation.
+    NOT_REQUIRED = "not_required"
+    #: A first-party page was fetched and inspected (evidence=retrieved).
+    VERIFIED_OFFICIAL = "verified_official"
+    #: First-party URL(s) were discovered, but no official page could
+    #: be fetched (e.g. TLS failure) — only snippets exist.
+    OFFICIAL_DISCOVERED_ONLY = "official_discovered_only"
+    #: The question asks for official documentation and no first-party
+    #: source was even discovered.
+    NO_OFFICIAL_SOURCE = "no_official_source"
+
+
+def official_source_status(
+    findings: list[Finding], question: str
+) -> OfficialSourceStatus:
+    """Deterministic official-source quality for the given question.
+
+    - ``NOT_REQUIRED`` — question does not request official docs.
+    - ``VERIFIED_OFFICIAL`` — a first-party page was retrieved.
+    - ``OFFICIAL_DISCOVERED_ONLY`` — first-party URL found, fetch failed.
+    - ``NO_OFFICIAL_SOURCE`` — nothing first-party was found at all.
+
+    An explicitly official question can therefore never reach an
+    unqualified ``APPROVED`` verdict unless it is ``VERIFIED_OFFICIAL``.
+    """
+    if not requests_official_sources(question):
+        return OfficialSourceStatus.NOT_REQUIRED
+    first_party = [
+        finding
+        for finding in findings
+        if finding.get("source_url")
+        and is_first_party(finding["source_url"], question)
+    ]
+    if not first_party:
+        return OfficialSourceStatus.NO_OFFICIAL_SOURCE
+    if any(finding.get("evidence") == "retrieved" for finding in first_party):
+        return OfficialSourceStatus.VERIFIED_OFFICIAL
+    return OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY
 
 
 # --- URL extraction & normalization -------------------------------

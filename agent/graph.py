@@ -69,12 +69,15 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel
 
 from agent.citations import (
+    CURRENT_OFFICIAL_DOC_DOMAINS,
+    OfficialSourceStatus,
     SourceRef,
     assign_source_ids,
     citation_note,
     format_citation_report,
     format_source_refs,
     is_first_party,
+    official_source_status,
     requests_official_sources,
     source_key,
     validate_citations,
@@ -108,7 +111,11 @@ _PLAN_SYSTEM = (
     "needed to answer it. When the question asks for official or "
     "first-party documentation, include queries that target the "
     "official source directly (for example by adding "
-    "'documentation' or the vendor's name)."
+    "'documentation' or the vendor's name), prefer CURRENT official "
+    "documentation domains over legacy ones (e.g. docs.langchain.com "
+    "and reference.langchain.com for LangChain/LangGraph — legacy "
+    "langchain-ai.github.io content has moved there), and only use "
+    "site: filters that target current domains."
 )
 _RESEARCH_SYSTEM = (
     "You are a research assistant gathering evidence. You have "
@@ -259,9 +266,12 @@ def _official_sources_block(findings: list[Finding], question: str) -> str | Non
     """Prompt block listing first-party sources by identifier.
 
     Returned only when the question explicitly asks for official
-    documentation and first-party sources were gathered — synthesis
-    is then told to cite the official source identifier(s) directly
-    rather than third-party snippet URLs.
+    documentation and first-party sources were gathered. When a
+    first-party page was actually retrieved, synthesis is told to
+    cite its [S#] identifier directly rather than third-party
+    snippet URLs. When first-party URLs were only discovered (every
+    fetch failed), synthesis is told NOT to present them — or any
+    third-party page — as verified official documentation.
     """
     if not requests_official_sources(question):
         return None
@@ -271,14 +281,24 @@ def _official_sources_block(findings: list[Finding], question: str) -> str | Non
     )
     if not refs:
         return None
+    retrieved = tuple(ref for ref in refs if ref.evidence == "retrieved")
     lines = ["Official/first-party sources gathered:"]
     lines.extend(f"- [{ref.sid}] {ref.url}" for ref in refs)
-    lines.append(
-        "The question asks for official documentation: the answer must "
-        "cite the official [S#] identifier(s) of the retrieved "
-        "first-party sources above — do not substitute third-party "
-        "snippet URLs."
-    )
+    if retrieved:
+        lines.append(
+            "The question asks for official documentation: the answer must "
+            "cite the official [S#] identifier(s) of the retrieved "
+            "first-party sources above — do not substitute third-party "
+            "snippet URLs."
+        )
+    else:
+        lines.append(
+            "WARNING: the official page(s) above could NOT be fetched — "
+            "they are search snippets only. Do NOT present them, or any "
+            "third-party source, as verified official documentation; say "
+            "instead that the official documentation could not be "
+            "retrieved and cite third-party sources as third-party."
+        )
     return "\n".join(lines)
 
 
@@ -317,6 +337,56 @@ def _incomplete_topics_note(missing: list[str]) -> str:
         "requested these topics, but the draft does not address them: "
         + ", ".join(missing)
         + "."
+    )
+
+
+def _official_incomplete_note(status: OfficialSourceStatus) -> str:
+    """Deterministic label when no official page was retrieved.
+
+    For questions that explicitly ask for official documentation, a
+    fetched official page is a requirement — if retrieval failed (or
+    nothing first-party was even discovered), the answer must read as
+    incomplete/unverified against official sources rather than as a
+    fully-verified result.
+    """
+    if status is OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY:
+        detail = (
+            "official page URL(s) were discovered, but every fetch "
+            "attempt failed — only search snippets exist"
+        )
+    else:
+        detail = "no official/first-party source was discovered at all"
+    return (
+        "> ⚠️ **OFFICIAL SOURCES: NOT RETRIEVED** — the question "
+        "explicitly asked for official documentation, but " + detail + ". "
+        "The statements below were NOT verified against an official "
+        "source and may not reflect the official documentation."
+    )
+
+
+def _official_status_line(status: OfficialSourceStatus) -> str:
+    """Human-readable official-source status for the review prompt."""
+    if status is OfficialSourceStatus.NOT_REQUIRED:
+        return (
+            "NOT_REQUIRED — the question does not explicitly ask for "
+            "official documentation."
+        )
+    if status is OfficialSourceStatus.VERIFIED_OFFICIAL:
+        return (
+            "VERIFIED_OFFICIAL — a first-party page was fetched and "
+            "inspected (provenance only; still verify its content "
+            "supports each claim)."
+        )
+    if status is OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY:
+        return (
+            "OFFICIAL_DISCOVERED_ONLY — first-party URL(s) were "
+            "discovered, but NO official page could be fetched. The "
+            "official-source requirement is unmet; snippets do not "
+            "satisfy it."
+        )
+    return (
+        "NO_OFFICIAL_SOURCE — no first-party source was even "
+        "discovered. The official-source requirement is unmet."
     )
 
 
@@ -394,6 +464,21 @@ def _out_of_phase_message(name: str, allowed: frozenset[str]) -> str:
 
 def _research_prompt(state: GraphState) -> str:
     parts = [f"Question: {state['question']}"]
+    if requests_official_sources(state["question"]):
+        # Deterministic steering: repeated searches restricted to
+        # legacy documentation domains waste the search budget on
+        # pages that have moved. Point the model at the current
+        # domains instead (tool budgets and SSRF rules unchanged).
+        parts.append(
+            "Official-source guidance: the answer must rest on a "
+            "FETCHED official page. The current official "
+            "documentation domains are "
+            + ", ".join(CURRENT_OFFICIAL_DOC_DOMAINS)
+            + " — run web_search queries targeting those domains "
+            "(e.g. site:docs.langchain.com …) instead of legacy "
+            "documentation domains such as langchain-ai.github.io, "
+            "and drop site: filters if a query returns nothing."
+        )
     missing = [t for t in (state.get("missing_topics") or []) if t]
     if missing:
         # Targeted follow-up: a draft that skipped an explicitly
@@ -860,6 +945,22 @@ def make_synthesize_node(
                 "; ".join(citation_report.reasons),
             )
             notes.append(citation_note(citation_report))
+        official_status = official_source_status(
+            findings, state["question"]
+        )
+        if official_status in (
+            OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY,
+            OfficialSourceStatus.NO_OFFICIAL_SOURCE,
+        ):
+            # Deterministic honesty: the question explicitly demands
+            # official documentation but no official page was fetched —
+            # the answer is labeled so it can never read as an
+            # unqualified, fully-verified result.
+            logger.warning(
+                "official documentation requested but not retrieved: %s",
+                official_status.value,
+            )
+            notes.append(_official_incomplete_note(official_status))
         if notes:
             answer = "\n\n".join(notes) + "\n\n" + answer
         if len(findings) < settings.min_findings:
@@ -892,15 +993,18 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
     """LLM quality gate: is the evidence sufficient?
 
     The draft body (deterministic marker notes stripped) is checked
-    deterministically first — citation provenance (``agent/citations``)
-    and topic coverage (``agent/completeness``); both reports are
-    handed to the reviewer, which makes the semantic
+    deterministically first — citation provenance (``agent/citations``),
+    topic coverage (``agent/completeness``) and, for questions that
+    explicitly ask for official documentation, whether an official
+    page was actually retrieved (``official_source_status``). All
+    reports are handed to the reviewer, which makes the semantic
     does-the-source-support-the-claim judgement. A failed check
     cannot be waved through by a lenient reviewer: an ``approved``
     verdict is downgraded to ``needs_more_research`` (bounded by the
     existing iteration budget; if the budget is spent, routing
-    finalizes the already-labeled answer). Neither check proves
-    factual correctness — they only verify provenance and coverage.
+    finalizes the already-labeled answer). None of these checks
+    proves factual correctness — they only verify provenance,
+    coverage and official-source retrieval.
     """
     verifier = model.with_structured_output(ReviewVerdict)
 
@@ -912,12 +1016,16 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
         answer = strip_marked_notes(state.get("final_answer", ""))
         report = validate_citations(answer, findings, state["question"])
         completeness = check_completeness(state["question"], answer)
+        official_status = official_source_status(
+            findings, state["question"]
+        )
         messages = [
             SystemMessage(content=_REVIEW_SYSTEM),
             HumanMessage(
                 content=(
                     f"Question: {state['question']}\n\n"
                     f"{_verification_line(findings, settings.min_retrieved_sources)}\n\n"
+                    f"Official-source status: {_official_status_line(official_status)}\n\n"
                     f"{format_citation_report(report)}\n\n"
                     f"{format_completeness_report(completeness)}\n\n"
                     f"Findings:\n{_evidence_blocks(findings)}\n\n"
@@ -938,6 +1046,14 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
                 failed_checks.append("citation validation")
             if not completeness.ok:
                 failed_checks.append("topic coverage")
+            if official_status in (
+                OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY,
+                OfficialSourceStatus.NO_OFFICIAL_SOURCE,
+            ):
+                # An explicitly official-documentation question must
+                # not pass as an unqualified APPROVED when no official
+                # page was retrieved — regardless of the reviewer.
+                failed_checks.append("official-source retrieval")
             if status == ReviewStatus.APPROVED and failed_checks:
                 logger.warning(
                     "quality gate: overriding approved -> "

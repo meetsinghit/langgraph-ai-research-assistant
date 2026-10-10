@@ -55,20 +55,23 @@ _QUESTION_STOPWORDS = frozenset(
 #: Phrasings that disclaim rather than explain. A requested term
 #: that appears only in sentences containing one of these does not
 #: count as covered — "conditional routing details were not
-#: available" is not an explanation of conditional routing. The
+#: available" or "… were not present in the retrieved text
+#: excerpts" are not explanations of conditional routing. The
 #: list is deterministic and conservative: a sentence that both
 #: explains and disclaims is treated as a disclaimer (a false
 #: "missing" only costs one more bounded research pass).
 _DISCLAIMER_RE = re.compile(
     r"(?:"
-    # negated availability/provision: "was not available",
-    # "details were not included", "not covered", "n't provided"
+    # negated availability/provision/presence: "was not available",
+    # "were not present", "details were not included", "not covered",
+    # "not contained", "not listed", "n't provided"
     r"\b(?:not|n't|never)\s+(?:be\s+)?(?:"
-    r"available|provide[ds]?|cover(?:ed|s)?|include[ds]?|found|shown"
+    r"available|provide[ds]?|present|contain(?:ed|s)?|cover(?:ed|s)?"
+    r"|include[ds]?|listed|found|shown"
     r"|verified|documented|mentioned|discussed|explained?"
     r")\b"
     # explicit unavailability adjectives
-    r"|\bunavailable\b|\bunverified\b"
+    r"|\bunavailable\b|\bunverified\b|\babsent\b"
     # "no details / no information ..."
     r"|\bno\s+(?:details|information|further|such)\b"
     # retrieval/knowledge failures

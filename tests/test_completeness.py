@@ -65,6 +65,25 @@ def test_alternative_disclaimer_phrasings_are_not_coverage():
         assert "routing" in report.missing, answer
 
 
+def test_not_present_disclaimer_is_not_coverage():
+    """Live regression: the exact phrasing observed — 'Specific
+    details regarding conditional routing syntax were not present
+    in the retrieved text excerpts.' — is an unavailability
+    disclaimer, not an explanation of conditional routing."""
+    report = check_completeness(
+        "Explain LangGraph conditional routing syntax",
+        "Specific details regarding conditional routing syntax were "
+        "not present in the retrieved text excerpts. LangGraph syntax "
+        "uses nodes and edges.",
+    )
+    assert not report.ok
+    assert "conditional" in report.missing
+    assert "routing" in report.missing
+    # the unrelated substantive sentence still counts as coverage
+    assert "langgraph" not in report.missing
+    assert "syntax" not in report.missing
+
+
 def test_covered_topic_passes_case_insensitively():
     report = check_completeness(
         "Explain LangGraph conditional routing",

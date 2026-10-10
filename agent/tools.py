@@ -24,6 +24,7 @@ import json
 import logging
 import re
 import socket
+import ssl
 from typing import Any, Callable, TypedDict
 from urllib.parse import urljoin, urlparse
 
@@ -35,6 +36,14 @@ from agent.config import Settings
 from agent.state import Finding
 
 logger = logging.getLogger("agent")
+
+try:  # optional: OS trust store (Windows cert store / macOS keychain)
+    import truststore  # type: ignore[import-not-found]
+
+    _TRUSTSTORE_AVAILABLE = True
+except ImportError:  # pragma: no cover - truststore is a pinned dependency
+    truststore = None  # type: ignore[assignment]
+    _TRUSTSTORE_AVAILABLE = False
 
 
 class ToolError(RuntimeError):
@@ -61,6 +70,52 @@ class ToolResult(TypedDict):
     data: Any
     error: str | None
     args: dict[str, Any]
+
+
+#: Actionable guidance appended to TLS failures. It never suggests
+#: disabling verification — the fetch is refused, full stop.
+_TLS_FAILURE_HINT = (
+    "TLS certificate verification failed: the server's certificate "
+    "chain could not be trusted with the configured CA store. "
+    "Verification is never disabled. On networks that inspect TLS "
+    "with an enterprise CA, set SSL_CA_BUNDLE to that CA bundle (or "
+    "rely on the OS trust store via truststore) and retry; "
+    "otherwise treat this page as unretrievable and use other "
+    "sources."
+)
+
+
+def build_ssl_context(ca_bundle: str | None = None) -> ssl.SSLContext | None:
+    """TLS context for page fetches — verification is ALWAYS enabled.
+
+    Trust-store priority (the live-run failure was a corporate
+    TLS-inspection CA absent from certifi's bundled store):
+
+    1. ``ca_bundle``: an explicit CA bundle path (enterprise CA) is
+       used as the verification store;
+    2. ``truststore`` (pinned dependency): the OS trust store —
+       on Windows the certificate store where enterprise root CAs
+       are installed — merged into a strictly-verifying context;
+    3. ``None``: httpx's default (certifi), still verifying.
+
+    There is no ``verify=False`` path and no insecure fallback.
+    """
+    if ca_bundle:
+        return ssl.create_default_context(cafile=ca_bundle)
+    if _TRUSTSTORE_AVAILABLE:
+        # PROTOCOL_TLS_CLIENT defaults to CERT_REQUIRED + hostname
+        # checking; truststore injects the platform trust roots.
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    return None
+
+
+def _describe_http_failure(url: str, exc: Exception) -> str:
+    """ToolError text for a failed fetch, TLS-aware and honest."""
+    base = f"fetch_page request failed for {url}: {type(exc).__name__}: {exc}"
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(marker in text for marker in ("certificate", "ssl", "tls")):
+        return f"{base}. {_TLS_FAILURE_HINT}"
+    return base
 
 
 def web_search(
@@ -136,28 +191,35 @@ def fetch_page(
     timeout: float = 30.0,
     max_bytes: int = 1_000_000,
     max_redirects: int = 5,
+    ca_bundle: str | None = None,
 ) -> str:
     """Retrieve a public webpage's text, enforcing SSRF and size limits.
 
     ``client`` is injectable for tests; when omitted, a client is
-    created with the requested timeout and no automatic redirects
-    (every hop is validated manually).
+    created with the requested timeout, no automatic redirects
+    (every hop is validated manually) and a TLS context from
+    :func:`build_ssl_context` — certificate verification is always
+    on; ``ca_bundle`` selects an explicit CA bundle when given.
     """
     own_client = client is None
     if own_client:
-        client = httpx.Client(
-            timeout=httpx.Timeout(timeout), follow_redirects=False
-        )
+        kwargs: dict[str, Any] = {
+            "timeout": httpx.Timeout(timeout),
+            "follow_redirects": False,
+        }
+        ssl_context = build_ssl_context(ca_bundle)
+        if ssl_context is not None:
+            kwargs["verify"] = ssl_context
+        # When no context is built, httpx's default (certifi) applies —
+        # verification stays enabled either way; never verify=False.
+        client = httpx.Client(**kwargs)
     try:
         try:
             return _fetch_with_client(
                 client, url, max_bytes=max_bytes, max_redirects=max_redirects
             )
         except httpx.HTTPError as exc:
-            raise ToolError(
-                f"fetch_page request failed for {url}: "
-                f"{type(exc).__name__}: {exc}"
-            ) from exc
+            raise ToolError(_describe_http_failure(url, exc)) from exc
     finally:
         if own_client:
             client.close()
@@ -321,6 +383,7 @@ class ResearchTools:
             timeout=self._settings.request_timeout_seconds,
             max_bytes=self._settings.max_page_bytes,
             max_redirects=self._settings.max_redirects,
+            ca_bundle=self._settings.ssl_ca_bundle,
         )
 
     def tool_functions(self) -> dict[str, Callable[..., Any]]:

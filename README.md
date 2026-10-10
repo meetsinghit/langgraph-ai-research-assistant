@@ -25,6 +25,7 @@ python main.py "What is LangGraph?"
 | `OPENAI_API_KEY` | paid key — only used with `ALLOW_PAID_PROVIDERS=true` | – |
 | `ALLOW_PAID_PROVIDERS` | explicit opt-in for paid providers | `false` |
 | `REQUEST_TIMEOUT_SECONDS` | per-request timeout | `30` |
+| `SSL_CA_BUNDLE` | optional PEM CA bundle used to **verify** page-fetch certificates (e.g. enterprise TLS-inspection root); unset = OS trust store via `truststore`, then certifi — verification is never disabled | – |
 | `MAX_RESEARCH_ITERATIONS` | research passes (graph-level budget) | `3` |
 | `MIN_FINDINGS` | findings required to synthesize | `3` |
 | `MIN_RETRIEVED_SOURCES` | source **pages** that must be fetched/inspected before an answer counts as verified (snippets never satisfy it; `0` disables verification) | `1` |
@@ -74,9 +75,10 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
   for official documentation), `synthesize` (LLM answer from
   findings only; answers below the `MIN_RETRIEVED_SOURCES`
   threshold are labeled UNVERIFIED/INCOMPLETE), `review` (LLM
-  quality gate plus two deterministic gates — citation provenance
-  and topic coverage; a failed gate downgrades an `approved`
-  verdict to `needs_more_research`), `finalize`, `handle_error`.
+  quality gate plus three deterministic gates — citation
+  provenance, topic coverage and official-source retrieval; a
+  failed gate downgrades an `approved` verdict to
+  `needs_more_research`), `finalize`, `handle_error`.
 - **Evidence provenance**: findings are tagged `retrieved` (page
   fetched and inspected) or `snippet` (discovered URL, content
   unverified); `sources` in state is deduplicated, and the CLI
@@ -89,6 +91,19 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
   (`https://… [snippet]`), unknown URLs and fabricated `[S#]`
   identifiers fail the deterministic citation gate and mark the
   answer as insufficiently verified.
+- **Official-source quality**: for questions that explicitly ask
+  for official documentation, a deterministic status is computed —
+  `VERIFIED_OFFICIAL` (a first-party page was fetched),
+  `OFFICIAL_DISCOVERED_ONLY` (first-party URL found but every
+  fetch failed) or `NO_OFFICIAL_SOURCE` (nothing first-party
+  found). Anything but `VERIFIED_OFFICIAL` marks the answer
+  (`OFFICIAL SOURCES: NOT RETRIEVED`) and blocks an unqualified
+  `APPROVED` verdict regardless of the reviewer; if retrieval stays
+  impossible, the bounded retries end with the honest labeled
+  result. Research prompts steer queries to the current domains
+  (`docs.langchain.com`, `reference.langchain.com`) instead of
+  legacy ones. This is provenance only — citation validation stays
+  separate and neither check proves semantic accuracy.
 - **Topic completeness**: a deterministic lexical check verifies
   that explicitly requested question terms appear in the draft
   outside known unavailability disclaimers (a mention that details
@@ -111,6 +126,11 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
   (redaction is defense-in-depth, not a guarantee).
 - Page retrieval blocks localhost/private/reserved destinations,
   validates every redirect hop, and caps response size.
+- Page-fetch TLS verification is always on: the OS trust store
+  (`truststore`) or an explicit `SSL_CA_BUNDLE` CA bundle is used
+  when the default certifi store cannot verify a chain (e.g.
+  enterprise TLS inspection). There is no `verify=False` path —
+  failed verifications refuse the fetch and are reported.
 
 ## Project layout
 

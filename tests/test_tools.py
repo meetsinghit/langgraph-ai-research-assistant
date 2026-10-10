@@ -1,5 +1,7 @@
 """Tests for research tools: search, retrieval, SSRF protection."""
 import socket
+import ssl
+import types
 from typing import Any
 
 import httpx
@@ -343,6 +345,117 @@ def test_fetch_page_enforces_size_limit(monkeypatch):
     )
     assert "content truncated" in text
     assert len(text) < 2_000
+
+
+# ---------- TLS configuration ----------
+
+
+def test_build_ssl_context_uses_os_trust_store_when_available(monkeypatch):
+    """With truststore (pinned dependency) available, the OS trust
+    store — on Windows the certificate store where enterprise root
+    CAs are installed — is used, strictly verifying."""
+    sentinel = ssl.create_default_context()
+    monkeypatch.setattr(tools, "_TRUSTSTORE_AVAILABLE", True)
+    monkeypatch.setattr(
+        tools,
+        "truststore",
+        types.SimpleNamespace(SSLContext=lambda protocol: sentinel),
+    )
+    ctx = tools.build_ssl_context(None)
+    assert ctx is sentinel
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_build_ssl_context_explicit_ca_bundle_is_the_verification_store(
+    monkeypatch,
+):
+    """SSL_CA_BUNDLE selects an explicit CA bundle (enterprise CA)
+    as the verification store — verification stays enabled."""
+    captured: dict[str, Any] = {}
+    real_create = ssl.create_default_context
+
+    def fake_create_default_context(*, cafile=None, **kwargs):
+        captured["cafile"] = cafile
+        return real_create(**kwargs)
+
+    monkeypatch.setattr(
+        ssl, "create_default_context", fake_create_default_context
+    )
+    ctx = tools.build_ssl_context("C:/certs/enterprise-ca.pem")
+    assert captured["cafile"] == "C:/certs/enterprise-ca.pem"
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_build_ssl_context_without_truststore_keeps_httpx_default(monkeypatch):
+    """No truststore and no CA bundle -> httpx's default (certifi)
+    client, which verifies. Nothing here can turn verification off."""
+    monkeypatch.setattr(tools, "_TRUSTSTORE_AVAILABLE", False)
+    ctx = tools.build_ssl_context(None)
+    assert ctx is None  # httpx default (certifi) — still verifying
+    assert ctx is not False
+
+
+def test_fetch_page_client_receives_verifying_ssl_context(monkeypatch):
+    """fetch_page's own client is built with the configured TLS
+    context as ``verify`` — never verify=False."""
+    _public_dns(monkeypatch)
+    sentinel = ssl.create_default_context()
+    monkeypatch.setattr(tools, "_TRUSTSTORE_AVAILABLE", True)
+    monkeypatch.setattr(
+        tools,
+        "truststore",
+        types.SimpleNamespace(SSLContext=lambda protocol: sentinel),
+    )
+    captured: dict[str, Any] = {}
+    real_client = httpx.Client
+
+    def capturing_client(**kwargs: Any) -> httpx.Client:
+        captured.update(kwargs)
+        kwargs["transport"] = httpx.MockTransport(
+            lambda request: httpx.Response(200, text="ok")
+        )
+        return real_client(**kwargs)
+
+    monkeypatch.setattr(tools.httpx, "Client", capturing_client)
+    assert fetch_page("https://example.com/page") == "ok"
+    assert captured["verify"] is sentinel
+    assert captured["verify"] is not False
+
+
+def test_certificate_verification_failure_is_refused_with_actionable_error():
+    """The live-run failure (self-signed certificate in the chain)
+    surfaces as a ToolError that explains the refusal and NEVER
+    suggests disabling verification."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            "self-signed certificate in certificate chain",
+            request=request,
+        )
+
+    with pytest.raises(ToolError) as exc_info:
+        fetch_page(
+            "https://docs.langchain.com/oss/python/langgraph/overview",
+            client=_client(handler),
+        )
+    message = str(exc_info.value)
+    assert "self-signed certificate in certificate chain" in message
+    assert "Verification is never disabled" in message
+    assert "verify=False" not in message
+    # the page is refused, not fetched
+    assert "fetch_page request failed" in message
+
+
+def test_non_tls_failure_message_omits_tls_hint():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with pytest.raises(ToolError) as exc_info:
+        fetch_page("https://example.com/page", client=_client(handler))
+    message = str(exc_info.value)
+    assert "request failed" in message
+    assert "Verification is never disabled" not in message
 
 
 # ---------- ToolExecutor ----------
