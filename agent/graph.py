@@ -18,9 +18,15 @@ Node responsibilities:
                     and a pass that would end on snippets alone
                     force-fetches the best candidates
 - ``synthesize``:   LLM drafts an answer using ONLY the collected
-                    findings; answers whose verification threshold
-                    was not met are labeled UNVERIFIED
-- ``review``:       LLM quality gate (structured-output verdict)
+                    findings; drafts are deterministically checked
+                    (citation provenance, requested-topic coverage)
+                    and labeled when they fail — UNVERIFIED below
+                    the retrieval threshold, TOPIC COVERAGE when a
+                    requested topic is missing, CITATION QUALITY
+                    for malformed/unknown citations
+- ``review``:       LLM quality gate (structured-output verdict);
+                    a failed deterministic check downgrades an
+                    approved verdict to needs_more_research
 - ``finalize``:     terminal pass-through
 - ``handle_error``: controlled failure with a readable message
 
@@ -34,7 +40,11 @@ Separate, enforced limits:
                      the budget can never be spent entirely on
                      searches while sources are available
 - ``max_research_iterations``:     research passes (routing layer)
-- ``max_execution_seconds``:       wall-clock budget per pass
+- ``max_execution_seconds``:       wall-clock budget PER RESEARCH
+                     PASS — every pass gets its own budget. The
+                     full run is bounded by passes x this budget,
+                     plus the plan/synthesize/review LLM calls,
+                     which this limit does NOT cover
 - ``min_retrieved_sources``:       pages that must be fetched and
                      inspected before an answer counts as
                      verified; snippets never satisfy it
@@ -59,11 +69,19 @@ from langgraph.graph.state import CompiledStateGraph
 from pydantic import BaseModel
 
 from agent.citations import (
+    SourceRef,
+    assign_source_ids,
     citation_note,
     format_citation_report,
+    format_source_refs,
     is_first_party,
     requests_official_sources,
+    source_key,
     validate_citations,
+)
+from agent.completeness import (
+    check_completeness,
+    format_completeness_report,
 )
 from agent.config import Settings
 from agent.llm import content_to_text, estimate_cost
@@ -112,29 +130,35 @@ _RESEARCH_SYSTEM = (
 _SYNTHESIZE_SYSTEM = (
     "You are a research writer. Answer the user's question using "
     "ONLY the provided findings; every claim must trace to a "
-    "finding and cite its source URL. Findings marked [retrieved] "
-    "come from pages that were fetched and inspected; [snippet] "
-    "findings are search-result excerpts that were NOT verified "
-    "against their pages. Prefer [retrieved] evidence, and mark "
-    "claims that rest only on [snippet] findings as unverified. "
-    "Never claim a source was verified or accurately cited "
-    "unless its finding is [retrieved]. If the findings are "
-    "insufficient, say so explicitly. Never fabricate sources or "
-    "facts."
+    "finding and cite its source by identifier, e.g. [S1] (a plain "
+    "URL is also acceptable). Never append provenance labels such "
+    "as [snippet] or [retrieved] inside a citation — the "
+    "application renders provenance separately. Sources marked "
+    "[retrieved] come from pages that were fetched and inspected; "
+    "[snippet] sources are search-result excerpts that were NOT "
+    "verified against their pages. Prefer [retrieved] evidence, and "
+    "mark claims that rest only on [snippet] sources as unverified. "
+    "Never claim a source was verified or accurately cited unless "
+    "its finding is [retrieved]. If the findings are insufficient, "
+    "say so explicitly. Never fabricate sources or facts."
 )
 _REVIEW_SYSTEM = (
     "You are a quality reviewer. Decide whether the collected "
     "findings are sufficient to answer the user's question, "
-    "considering the verification status and citation validation "
-    "provided with the draft: an answer honestly labeled UNVERIFIED "
-    "is acceptable when page verification genuinely could not "
-    "complete within the budget. The citation validation is "
-    "deterministic URL/provenance matching only — it does NOT prove "
-    "that the cited sources factually support the claims; assess "
-    "that support semantically yourself, claim by claim. For "
-    "questions asking for official documentation, check that the "
-    "official source is cited and actually supports the answer. "
-    "Reply approved or needs_more_research with a short reason."
+    "considering the verification status, citation validation and "
+    "topic-coverage check provided with the draft: an answer "
+    "honestly labeled UNVERIFIED is acceptable when page "
+    "verification genuinely could not complete within the budget. "
+    "The citation validation is deterministic URL/provenance "
+    "matching only — it does NOT prove that the cited sources "
+    "factually support the claims; assess that support semantically "
+    "yourself, claim by claim. The topic-coverage check only "
+    "verifies that requested terms appear; coverage is not "
+    "correctness — verify what the draft says about each covered "
+    "topic. For questions asking for official documentation, check "
+    "that the official source is cited and actually supports the "
+    "answer. Reply approved or needs_more_research with a short "
+    "reason."
 )
 
 
@@ -152,14 +176,41 @@ class ReviewVerdict(BaseModel):
 
 
 def _findings_block(findings: list[Finding]) -> str:
+    """Findings rendered with canonical ``[S#]`` source identifiers.
+
+    The identifier (not the URL) sits next to each finding, and the
+    provenance labels live in the separately rendered sources table
+    — the model never sees "URL + label glued together" as the
+    citation pattern to imitate.
+    """
     if not findings:
         return "(no findings yet)"
-    return "\n".join(
-        f"- {finding['text']}\n"
-        f"  source: {finding['source_url'] or 'unknown'}"
-        f" [{finding.get('evidence', 'snippet')}]"
-        for finding in findings
+    refs = {source_key(ref.url): ref for ref in assign_source_ids(findings)}
+    lines: list[str] = []
+    for finding in findings:
+        url = finding.get("source_url")
+        ref = refs.get(source_key(url)) if url else None
+        label = f"[{ref.sid}] " if ref else ""
+        lines.append(f"- {label}{finding['text']}")
+    return "\n".join(lines)
+
+
+def _sources_block(findings: list[Finding]) -> str:
+    """Application-rendered source table with citation identifiers."""
+    refs: tuple[SourceRef, ...] = assign_source_ids(findings)
+    if not refs:
+        return "Sources: (none)"
+    return (
+        "Sources (cite findings by their identifier, e.g. [S1]; never "
+        "write provenance labels such as [snippet] or [retrieved] "
+        "inside a URL):\n" + format_source_refs(refs)
     )
+
+
+def _evidence_blocks(findings: list[Finding]) -> str:
+    """Findings + sources blocks, kept together so identifiers are
+    always resolvable in the same prompt."""
+    return f"{_findings_block(findings)}\n\n{_sources_block(findings)}"
 
 
 # --- evidence provenance & verification ---------------------------
@@ -204,32 +255,28 @@ def _verification(findings: list[Finding], min_retrieved: int) -> tuple[bool, in
 
 
 def _official_sources_block(findings: list[Finding], question: str) -> str | None:
-    """Prompt block listing first-party sources, strongest evidence first.
+    """Prompt block listing first-party sources by identifier.
 
     Returned only when the question explicitly asks for official
     documentation and first-party sources were gathered — synthesis
-    is then told to cite the retrieved official source(s) directly
+    is then told to cite the official source identifier(s) directly
     rather than third-party snippet URLs.
     """
     if not requests_official_sources(question):
         return None
-    rank = {"snippet": 1, "retrieved": 2}
-    best: dict[str, str] = {}
-    for finding in findings:
-        url = finding.get("source_url")
-        if not url or not is_first_party(url, question):
-            continue
-        evidence = str(finding.get("evidence", "snippet"))
-        if url not in best or rank.get(evidence, 0) > rank.get(best[url], 0):
-            best[url] = evidence
-    if not best:
+    refs = tuple(
+        ref for ref in assign_source_ids(findings)
+        if is_first_party(ref.url, question)
+    )
+    if not refs:
         return None
     lines = ["Official/first-party sources gathered:"]
-    lines.extend(f"- {url} [{evidence}]" for url, evidence in best.items())
+    lines.extend(f"- [{ref.sid}] {ref.url}" for ref in refs)
     lines.append(
         "The question asks for official documentation: the answer must "
-        "cite the official [retrieved] source URL(s) above directly — "
-        "do not substitute third-party snippet URLs."
+        "cite the official [S#] identifier(s) of the retrieved "
+        "first-party sources above — do not substitute third-party "
+        "snippet URLs."
     )
     return "\n".join(lines)
 
@@ -260,6 +307,42 @@ def _unverified_banner(count: int, min_retrieved: int) -> str:
         "search-result snippets and were not checked against the "
         "source pages."
     )
+
+
+def _incomplete_topics_note(missing: list[str]) -> str:
+    """Deterministic label for drafts that skip requested topics."""
+    return (
+        "> ⚠️ **TOPIC COVERAGE: INCOMPLETE** — the question explicitly "
+        "requested these topics, but the draft does not address them: "
+        + ", ".join(missing)
+        + "."
+    )
+
+
+def strip_marked_notes(answer: str) -> str:
+    """Remove the deterministic ``> ⚠️ **…**`` notes this graph prepends.
+
+    Review-time re-validation runs on the model's draft body, so the
+    application's own annotations — which necessarily mention the
+    missing topic terms — can never make a failing completeness
+    check pass. Only the leading marker blockquotes are stripped;
+    any other content is preserved verbatim.
+    """
+    lines = (answer or "").splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].startswith("> ⚠️ "):
+            j = i
+            while j < len(lines) and lines[j].startswith(">"):
+                j += 1
+            if j < len(lines) and not lines[j].strip():
+                j += 1  # blank separator before the next note/body
+            i = j
+        elif not lines[i].strip():
+            i += 1  # leading blank (paranoia)
+        else:
+            break
+    return "\n".join(lines[i:])
 
 
 def _phase_hint(allowed: list[str], candidates: list[str], question: str) -> str:
@@ -310,6 +393,18 @@ def _out_of_phase_message(name: str, allowed: frozenset[str]) -> str:
 
 def _research_prompt(state: GraphState) -> str:
     parts = [f"Question: {state['question']}"]
+    missing = [t for t in (state.get("missing_topics") or []) if t]
+    if missing:
+        # Targeted follow-up: a draft that skipped an explicitly
+        # requested topic sends the next pass back with that gap
+        # spelled out, instead of re-running generic research.
+        parts.append(
+            "Follow-up focus: the previous draft did not address "
+            "explicitly requested topic(s): "
+            + ", ".join(missing)
+            + ". Run targeted web_search queries for them and verify "
+            "pages that actually cover them."
+        )
     plan = state.get("research_plan") or []
     if plan:
         parts.append(
@@ -317,7 +412,7 @@ def _research_prompt(state: GraphState) -> str:
             + "\n".join(f"- {query}" for query in plan)
         )
     findings = state.get("findings") or []
-    parts.append(f"Findings so far:\n{_findings_block(findings)}")
+    parts.append(f"Findings so far:\n{_evidence_blocks(findings)}")
     candidates = _candidate_urls(
         state["question"], findings, _retrieved_urls(findings)
     )
@@ -712,7 +807,7 @@ def make_synthesize_node(
         official_block = _official_sources_block(findings, state["question"])
         if official_block:
             prompt_parts.append(official_block)
-        prompt_parts.append(f"Findings:\n{_findings_block(findings)}")
+        prompt_parts.append(f"Findings:\n{_evidence_blocks(findings)}")
         messages = [
             SystemMessage(content=_SYNTHESIZE_SYSTEM),
             HumanMessage(content="\n\n".join(prompt_parts)),
@@ -728,6 +823,12 @@ def make_synthesize_node(
             }
 
         answer = content_to_text(response.content)
+        # Deterministic quality checks on the RAW draft — before any
+        # deterministic notes are prepended, so the checks never see
+        # the application's own annotations.
+        completeness = check_completeness(state["question"], answer)
+        citation_report = validate_citations(answer, findings, state["question"])
+        notes: list[str] = []
         if not verified:
             # Deterministic honesty: verification did not complete,
             # so the answer is labeled — it must never read as
@@ -738,28 +839,38 @@ def make_synthesize_node(
                 retrieved_count,
                 settings.min_retrieved_sources,
             )
-            answer = (
-                f"{_unverified_banner(retrieved_count, settings.min_retrieved_sources)}\n\n"
-                f"{answer}"
+            notes.append(
+                _unverified_banner(
+                    retrieved_count, settings.min_retrieved_sources
+                )
             )
+        if not completeness.ok:
+            # Deterministic completeness: the question explicitly
+            # requested topics the draft never addresses — labeled,
+            # and the review gate sends research back for them.
+            logger.warning(
+                "drafted answer does not address requested topic(s): %s",
+                ", ".join(completeness.missing),
+            )
+            notes.append(_incomplete_topics_note(list(completeness.missing)))
+        if not citation_report.ok:
+            logger.warning(
+                "drafted answer failed citation validation: %s",
+                "; ".join(citation_report.reasons),
+            )
+            notes.append(citation_note(citation_report))
+        if notes:
+            answer = "\n\n".join(notes) + "\n\n" + answer
         if len(findings) < settings.min_findings:
             answer = (
                 f"{answer}\n\n[Partial evidence: only {len(findings)} "
                 f"finding(s) collected; the quality threshold is "
                 f"{settings.min_findings}.]"
             )
-        # Deterministic citation-provenance check on the drafted
-        # answer: URLs it cites must correspond to recorded sources.
-        # Failure marks the answer as insufficiently verified (the
-        # review node applies the same check as a gate).
-        citation_report = validate_citations(answer, findings, state["question"])
-        if not citation_report.ok:
-            logger.warning(
-                "drafted answer failed citation validation: %s",
-                "; ".join(citation_report.reasons),
-            )
-            answer = f"{citation_note(citation_report)}\n\n{answer}"
-        update: dict[str, Any] = {"final_answer": answer}
+        update: dict[str, Any] = {
+            "final_answer": answer,
+            "missing_topics": list(completeness.missing),
+        }
         delta_in, delta_out = _usage_delta(response)
         update["tokens_in"] = state.get("tokens_in", 0) + delta_in
         update["tokens_out"] = state.get("tokens_out", 0) + delta_out
@@ -779,21 +890,27 @@ def make_synthesize_node(
 def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
     """LLM quality gate: is the evidence sufficient?
 
-    The draft's citations are validated deterministically first
-    (URL provenance — see ``agent/citations.py``); the report is
+    The draft body (deterministic marker notes stripped) is checked
+    deterministically first — citation provenance (``agent/citations``)
+    and topic coverage (``agent/completeness``); both reports are
     handed to the reviewer, which makes the semantic
-    does-the-source-support-the-claim judgement. A citation check
-    failure cannot be waved through by a lenient reviewer: an
-    ``approved`` verdict is downgraded to ``needs_more_research``
-    (bounded by the existing iteration budget; if the budget is
-    spent, routing finalizes the already-labeled answer).
+    does-the-source-support-the-claim judgement. A failed check
+    cannot be waved through by a lenient reviewer: an ``approved``
+    verdict is downgraded to ``needs_more_research`` (bounded by the
+    existing iteration budget; if the budget is spent, routing
+    finalizes the already-labeled answer). Neither check proves
+    factual correctness — they only verify provenance and coverage.
     """
     verifier = model.with_structured_output(ReviewVerdict)
 
     def review_node(state: GraphState) -> dict[str, Any]:
         findings = state.get("findings") or []
-        answer = state.get("final_answer", "")
+        # Validate the model's draft body, not the answer with our
+        # own deterministic notes prepended (those mention the
+        # missing topics and would mask a failing coverage check).
+        answer = strip_marked_notes(state.get("final_answer", ""))
         report = validate_citations(answer, findings, state["question"])
+        completeness = check_completeness(state["question"], answer)
         messages = [
             SystemMessage(content=_REVIEW_SYSTEM),
             HumanMessage(
@@ -801,8 +918,8 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
                     f"Question: {state['question']}\n\n"
                     f"{_verification_line(findings, settings.min_retrieved_sources)}\n\n"
                     f"{format_citation_report(report)}\n\n"
-                    f"Findings:\n"
-                    f"{_findings_block(findings)}\n\n"
+                    f"{format_completeness_report(completeness)}\n\n"
+                    f"Findings:\n{_evidence_blocks(findings)}\n\n"
                     f"Draft answer: {answer}"
                 )
             ),
@@ -815,11 +932,16 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
                 else ReviewStatus.NEEDS_MORE_RESEARCH
             )
             logger.info("review: %s (%s)", status.value, verdict.reason)
-            if status == ReviewStatus.APPROVED and not report.ok:
+            failed_checks: list[str] = []
+            if not report.ok:
+                failed_checks.append("citation validation")
+            if not completeness.ok:
+                failed_checks.append("topic coverage")
+            if status == ReviewStatus.APPROVED and failed_checks:
                 logger.warning(
-                    "citation gate: overriding approved -> "
-                    "needs_more_research (%s)",
-                    "; ".join(report.reasons),
+                    "quality gate: overriding approved -> "
+                    "needs_more_research (failed: %s)",
+                    ", ".join(failed_checks),
                 )
                 status = ReviewStatus.NEEDS_MORE_RESEARCH
             return {"review_status": status}

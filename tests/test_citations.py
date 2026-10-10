@@ -6,9 +6,11 @@ source's provenance is. They deliberately assert the module's own
 disclaimer too — a URL match never proves a claim factually supported.
 """
 from agent.citations import (
+    assign_source_ids,
     citation_note,
     extract_cited_urls,
     format_citation_report,
+    format_source_refs,
     is_first_party,
     requests_official_sources,
     validate_citations,
@@ -273,3 +275,106 @@ def test_is_first_party_heuristic():
     assert is_first_party("https://ai.google.dev/gemini-api/docs", question)
     assert not is_first_party(THIRD_PARTY, question)
     assert not is_first_party("", question)
+
+
+# --- canonical source identifiers & malformed citations -----------
+
+
+def test_source_ids_are_deterministic_and_use_strongest_evidence():
+    """Conflicting snippet/retrieved labels for the same URL resolve
+    to ONE identifier at its strongest recorded evidence — the
+    attribution inconsistency the live run showed (answer said
+    [snippet], source list said [retrieved]) cannot happen."""
+    findings = [
+        _finding("https://example.com/a", "snippet"),
+        _finding("https://example.com/b", "snippet"),
+        _finding("https://example.com/a", "retrieved"),  # conflict
+    ]
+    refs = assign_source_ids(findings)
+    assert [(r.sid, r.url, r.evidence) for r in refs] == [
+        ("S1", "https://example.com/a", "retrieved"),
+        ("S2", "https://example.com/b", "snippet"),
+    ]
+
+
+def test_source_refs_render_labels_separately_from_citations():
+    """Provenance labels are application-rendered — identifier first,
+    URL, then the label in its own bracket."""
+    findings = [
+        _finding("https://example.com/a", "retrieved"),
+        _finding("https://example.com/b", "snippet"),
+    ]
+    rendered = format_source_refs(assign_source_ids(findings))
+    assert rendered == (
+        "- [S1] https://example.com/a [retrieved]\n"
+        "- [S2] https://example.com/b [snippet]"
+    )
+    assert format_source_refs(()) == "(no sources)"
+
+
+def test_sid_citations_resolve_to_recorded_sources():
+    findings = [_finding("https://example.com/a", "retrieved")]
+    report = validate_citations("See [S1] for details.", findings, "question")
+    assert report.ok
+    assert report.retrieved == ["[S1]"]
+    assert report.citations[0].url == "https://example.com/a"
+
+
+def test_unknown_sid_is_not_silently_accepted():
+    findings = [_finding("https://example.com/a", "retrieved")]
+    report = validate_citations("See [S9].", findings, "question")
+    assert not report.ok
+    assert report.unknown == ["[S9]"]
+
+
+def test_malformed_citation_flagged_and_uses_recorded_evidence():
+    """Live regression: the model pasted '[snippet]' inside the URL
+    even though the source was recorded [retrieved]. The recorded
+    evidence wins; the malformed rendering fails the check."""
+    findings = [_finding("https://docs.example.com/overview", "retrieved")]
+    answer = "See [https://docs.example.com/overview [snippet]]."
+    report = validate_citations(answer, findings, "question")
+    assert report.malformed == ("https://docs.example.com/overview",)
+    assert report.retrieved == ["https://docs.example.com/overview"]
+    assert not report.ok
+    assert any("malformed" in r for r in report.reasons)
+    assert "malformed" in format_citation_report(report)
+    assert "malformed" in citation_note(report)
+
+
+def test_live_wrapped_malformed_citation_repairs_and_maps():
+    official = "https://docs.langchain.com/oss/python/langgraph/overview"
+    findings = [_finding(official, "retrieved")]
+    answer = f"See [{official} [snippet]] for details."
+    report = validate_citations(answer, findings, "question")
+    assert report.malformed == (official,)
+    assert report.retrieved == [official]  # recorded evidence, not the label
+    assert not report.ok
+
+
+def test_clean_citations_are_never_flagged_malformed():
+    findings = [
+        _finding("https://example.com/a", "retrieved"),
+        _finding("https://example.com/b", "snippet"),
+    ]
+    answer = (
+        "As [S1] shows, and per https://example.com/b "
+        "(unverified), see also [1] for context."
+    )
+    report = validate_citations(answer, findings, "question")
+    assert report.malformed == ()
+    assert report.ok
+
+
+def test_official_source_cited_by_identifier_satisfies_the_gate():
+    findings = [
+        _finding(THIRD_PARTY, "snippet"),
+        _finding(OFFICIAL, "retrieved"),
+    ]
+    report = validate_citations(
+        "See [S2] for LangGraph details.",
+        findings,
+        question="LangGraph official documentation",
+    )
+    assert report.official_cited == (OFFICIAL,)
+    assert report.ok

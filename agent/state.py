@@ -78,6 +78,10 @@ class GraphState(TypedDict, total=False):
     errors: Annotated[list[str], append_items]
     review_status: ReviewStatus
     final_answer: str
+    #: explicitly requested topic terms the last draft did not
+    #: address (deterministic completeness check) — the next
+    #: research pass is told to target them
+    missing_topics: list[str]
     tokens_in: int
     tokens_out: int
     estimated_cost_usd: float

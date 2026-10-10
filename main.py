@@ -10,6 +10,7 @@ import argparse
 import sys
 from typing import Any
 
+from agent.citations import assign_source_ids
 from agent.config import get_settings
 from agent.graph import build_research_graph
 from agent.llm import build_chat_model, verify_connection
@@ -71,16 +72,19 @@ def main(argv: list[str] | None = None) -> int:
     print(state.get("final_answer", "(no answer produced)"))
     print()
     print("=== SOURCES ===")
-    # [retrieved] = page fetched and inspected; [discovered] =
-    # URL found via search, content never verified.
-    retrieved = {
-        finding.get("source_url")
-        for finding in (state.get("findings") or [])
-        if finding.get("evidence") == "retrieved"
-    }
-    for url in dict.fromkeys(state.get("sources") or []):
-        tag = "retrieved" if url in retrieved else "discovered"
-        print(f"- {url} [{tag}]")
+    # [S#] identifiers match the citations in the answer; provenance
+    # labels are rendered here by application code, never by the
+    # model inside citations. [retrieved] = page fetched and
+    # inspected; [discovered] = URL found via search, content never
+    # verified.
+    refs = assign_source_ids(state.get("findings") or [])
+    if refs:
+        for ref in refs:
+            tag = "retrieved" if ref.evidence == "retrieved" else "discovered"
+            print(f"- [{ref.sid}] {ref.url} [{tag}]")
+    else:
+        for url in dict.fromkeys(state.get("sources") or []):
+            print(f"- {url} [discovered]")
     print()
     print(f"iterations: {state.get('iteration', 0)}")
     print(

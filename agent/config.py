@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     connection_verify_max_output_tokens: int = Field(default=256, ge=1)
     max_research_iterations: int = Field(default=3, ge=1)
     max_tool_calls_per_research: int = Field(default=4, ge=1)
+    # Wall-clock budget PER RESEARCH PASS: every pass gets its own
+    # budget. The full run is bounded by max_research_iterations x
+    # this value, plus plan/synthesize/review LLM calls, which this
+    # limit does NOT cover.
     max_execution_seconds: float = Field(default=120.0, gt=0)
     max_redirects: int = Field(default=5, ge=1)
     max_page_bytes: int = Field(default=1_000_000, ge=1)

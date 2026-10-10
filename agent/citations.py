@@ -25,11 +25,15 @@ from agent.state import Finding
 __all__ = [
     "Citation",
     "CitationReport",
+    "SourceRef",
+    "assign_source_ids",
     "extract_cited_urls",
     "citation_note",
     "format_citation_report",
+    "format_source_refs",
     "is_first_party",
     "requests_official_sources",
+    "source_key",
     "validate_citations",
 ]
 
@@ -123,6 +127,18 @@ def is_first_party(url: str, question: str) -> bool:
 _URL_RE = re.compile(r"https?://[^\s<>\"'\)\]\}]+", re.IGNORECASE)
 _TRAILING_PUNCT_RE = re.compile(r"[.,;:!?]+$")
 
+#: Canonical citation identifier, e.g. ``[S1]``. The application
+#: assigns these deterministically; the model is instructed to cite
+#: by identifier so provenance labels never end up inside URLs.
+_SID_TOKEN_RE = re.compile(r"\[\s*(S\d+)\s*\]")
+
+#: A provenance label glued directly after a URL (the live-run
+#: defect: ``https://... [snippet]``) — a malformed citation the
+#: model copied from the findings display format.
+_PROVENANCE_LABEL_RE = re.compile(
+    r"\s*\[(?:snippet|retrieved|discovered)\]", re.IGNORECASE
+)
+
 
 def extract_cited_urls(text: str) -> list[str]:
     """URLs cited in ``text``, deduplicated, order-preserving."""
@@ -159,18 +175,98 @@ def _normalize_url(url: str) -> str:
     return f"{host}{port}{path}"
 
 
+def source_key(url: str) -> str:
+    """Public citation-identity key (see ``_normalize_url``)."""
+    return _normalize_url(url)
+
+
+# --- canonical source identifiers ---------------------------------
+
+#: Evidence strength for "strongest recorded class wins" merging.
+_EVIDENCE_RANK = {"snippet": 1, "retrieved": 2}
+
+
+@dataclass(frozen=True)
+class SourceRef:
+    """A gathered source with its canonical citation identifier.
+
+    ``sid`` is assigned deterministically in first-appearance order;
+    ``evidence`` is the strongest class recorded for the URL across
+    findings, so conflicting snippet/retrieved labels for the same
+    source always render at their strongest.
+    """
+
+    sid: str
+    url: str
+    evidence: str  # "retrieved" | "snippet"
+
+
+def assign_source_ids(findings: list[Finding]) -> tuple[SourceRef, ...]:
+    """Deterministic ``[S#]`` identifiers for the gathered sources.
+
+    One identifier per distinct source URL (matched by normalized
+    key). The application renders provenance labels from these refs —
+    the model only ever cites the identifier.
+    """
+    refs: list[SourceRef] = []
+    by_key: dict[str, SourceRef] = {}
+    for finding in findings:
+        url = finding.get("source_url")
+        if not url:
+            continue
+        key = _normalize_url(url)
+        evidence = str(finding.get("evidence", "snippet"))
+        existing = by_key.get(key)
+        if existing is None:
+            ref = SourceRef(sid=f"S{len(refs) + 1}", url=url, evidence=evidence)
+            by_key[key] = ref
+            refs.append(ref)
+        elif _EVIDENCE_RANK.get(evidence, 0) > _EVIDENCE_RANK.get(
+            existing.evidence, 0
+        ):
+            # strongest evidence wins; sid and first-seen URL stay stable
+            upgraded = SourceRef(
+                sid=existing.sid, url=existing.url, evidence=evidence
+            )
+            by_key[key] = upgraded
+            refs[refs.index(existing)] = upgraded
+    return tuple(refs)
+
+
+def format_source_refs(refs: tuple[SourceRef, ...]) -> str:
+    """Application-rendered source table: identifier + URL + label.
+
+    Provenance labels live HERE (rendered by application code), never
+    inside the model's citations.
+    """
+    if not refs:
+        return "(no sources)"
+    return "\n".join(
+        f"- [{ref.sid}] {ref.url} [{ref.evidence}]" for ref in refs
+    )
+
+
 # --- validation ---------------------------------------------------
 
-_EVIDENCE_RANK = {"snippet": 1, "retrieved": 2}
 EvidenceStatus = Literal["retrieved", "snippet", "unknown"]
 
 
 @dataclass(frozen=True)
 class Citation:
-    """One URL cited in the answer and its provenance status."""
+    """One citation as written in the answer, with its provenance.
 
-    url: str
+    ``token`` is what the answer literally contains (``[S1]`` or a
+    URL); ``url`` is the resolved source URL when known. ``malformed``
+    marks citations that glued a provenance label inside the URL
+    (``https://... [snippet]``) — their evidence still comes from the
+    recorded source, never from the pasted label.
+    """
+
+    token: str
     status: EvidenceStatus
+    url: str | None = None
+    sid: str | None = None
+    malformed: bool = False
 
 
 @dataclass(frozen=True)
@@ -181,6 +277,7 @@ class CitationReport:
     official_required: bool
     official_retrieved_available: tuple[str, ...]
     official_cited: tuple[str, ...]
+    malformed: tuple[str, ...]
     reasons: tuple[str, ...]
 
     @property
@@ -193,15 +290,15 @@ class CitationReport:
 
     @property
     def retrieved(self) -> list[str]:
-        return [c.url for c in self.citations if c.status == "retrieved"]
+        return [c.token for c in self.citations if c.status == "retrieved"]
 
     @property
     def snippet_only(self) -> list[str]:
-        return [c.url for c in self.citations if c.status == "snippet"]
+        return [c.token for c in self.citations if c.status == "snippet"]
 
     @property
     def unknown(self) -> list[str]:
-        return [c.url for c in self.citations if c.status == "unknown"]
+        return [c.token for c in self.citations if c.status == "unknown"]
 
 
 def _source_index(findings: list[Finding]) -> dict[str, str]:
@@ -224,15 +321,21 @@ def _source_index(findings: list[Finding]) -> dict[str, str]:
 def validate_citations(
     answer: str, findings: list[Finding], question: str
 ) -> CitationReport:
-    """Compare the URLs cited in ``answer`` with recorded sources.
+    """Compare the citations in ``answer`` with recorded sources.
 
     Deterministic rules (see module docstring: this is provenance
     matching, NOT factual verification):
 
-    - a cited URL not matching any recorded source is ``unknown``
-      and fails the check (the agent must never cite sources it did
-      not gather)
-    - a cited URL matching only a ``snippet`` finding is flagged
+    - a ``[S#]`` identifier resolves to its source; an identifier the
+      application never assigned is ``unknown`` and fails (fabricated
+      citations are never silently accepted)
+    - a cited URL not matching any recorded source is ``unknown`` and
+      fails (the agent must never cite sources it did not gather)
+    - a URL glued to a provenance label (``https://... [snippet]``)
+      is recorded as ``malformed`` and fails; its evidence still
+      comes from the recorded source (strongest class), never from
+      the label the model pasted
+    - a citation matching only a ``snippet`` source is flagged
       ``snippet`` — unverified, not automatically verified
     - when the question asks for official documentation and a
       retrieved first-party source was gathered, the check fails
@@ -240,12 +343,44 @@ def validate_citations(
       official sources
     """
     index = _source_index(findings)
-    citations_list: list[Citation] = []
-    for url in extract_cited_urls(answer):
-        evidence = index.get(_normalize_url(url))
-        status: EvidenceStatus = "unknown" if evidence is None else _as_status(evidence)
-        citations_list.append(Citation(url=url, status=status))
-    citations = tuple(citations_list)
+    refs = {ref.sid: ref for ref in assign_source_ids(findings)}
+    citations: list[Citation] = []
+    seen: set[tuple[str, bool]] = set()
+
+    for match in _URL_RE.finditer(answer or ""):
+        token = _TRAILING_PUNCT_RE.sub("", match.group(0))
+        malformed = bool(
+            _PROVENANCE_LABEL_RE.match(answer[match.end():])
+        )
+        if (token, malformed) in seen:
+            continue
+        seen.add((token, malformed))
+        evidence = index.get(_normalize_url(token))
+        status: EvidenceStatus = (
+            "unknown" if evidence is None else _as_status(evidence)
+        )
+        citations.append(
+            Citation(
+                token=token, status=status, url=token, malformed=malformed
+            )
+        )
+
+    for match in _SID_TOKEN_RE.finditer(answer or ""):
+        sid = match.group(1)
+        token = f"[{sid}]"
+        if (token, False) in seen:
+            continue
+        seen.add((token, False))
+        ref = refs.get(sid)
+        if ref is None:
+            citations.append(Citation(token=token, status="unknown", sid=sid))
+        else:
+            citations.append(
+                Citation(
+                    token=token, status=_as_status(ref.evidence),
+                    url=ref.url, sid=sid,
+                )
+            )
 
     official_required = requests_official_sources(question)
     official_retrieved_available = tuple(
@@ -263,6 +398,7 @@ def validate_citations(
         citation.url
         for citation in citations
         if citation.status == "retrieved"
+        and citation.url
         and is_first_party(citation.url, question)
     ) if official_required else ()
 
@@ -272,16 +408,23 @@ def validate_citations(
         reasons.append(
             f"{unknown_count} cited URL(s) are not among the recorded sources"
         )
+    malformed_tokens = tuple(c.token for c in citations if c.malformed)
+    if malformed_tokens:
+        reasons.append(
+            f"{len(malformed_tokens)} malformed citation(s) append a "
+            "provenance label inside the URL"
+        )
     if official_required and official_retrieved_available and not official_cited:
         reasons.append(
             "the question asks for official documentation and retrieved "
             "official source(s) exist, but the answer cites none of them"
         )
     return CitationReport(
-        citations=citations,
+        citations=tuple(citations),
         official_required=official_required,
         official_retrieved_available=official_retrieved_available,
         official_cited=official_cited,
+        malformed=malformed_tokens,
         reasons=tuple(reasons),
     )
 
@@ -316,6 +459,10 @@ def format_citation_report(report: CitationReport) -> str:
             f"- retrieved citations: {_listing(report.retrieved)}",
             f"- snippet-only (unverified) citations: {_listing(report.snippet_only)}",
             f"- unknown citations (not among recorded sources): {_listing(report.unknown)}",
+            (
+                f"- malformed citations (provenance label glued inside "
+                f"the URL): {_listing(report.malformed)}"
+            ),
             (
                 f"- official documentation asked for: "
                 f"{'yes' if report.official_required else 'no'}; retrieved "

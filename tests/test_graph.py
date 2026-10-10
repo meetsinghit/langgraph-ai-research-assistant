@@ -930,6 +930,143 @@ def test_review_prompt_carries_citation_report_and_semantic_disclaimer():
     )
 
 
+# ---------- canonical citations & topic completeness ----------
+
+
+def test_synthesis_prompt_uses_source_identifiers_not_labelled_urls():
+    """Root-cause regression: the findings display used to be
+    'url [evidence]', which the model imitated inside citations
+    ('https://... [snippet]'). Findings now carry [S#] identifiers
+    and provenance labels live in a separately rendered table."""
+    settings = _settings(min_findings=1)
+    fake_tools = FakeTools(
+        search_results=[_search_result("Fact", "https://example.com/a")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    graph.invoke({"question": "question"})
+
+    synthesis_prompt = model.seen_messages[2][-1].content
+    assert "- [S1] " in synthesis_prompt
+    assert "Fact" in synthesis_prompt
+    assert "Sources (cite findings by their identifier" in synthesis_prompt
+    assert "- [S1] https://example.com/a [retrieved]" in synthesis_prompt
+    # the system prompt forbids model-side provenance labels
+    system_prompt = str(model.seen_messages[2][0].content)
+    assert "Never append provenance labels" in system_prompt
+
+
+def test_malformed_citation_answer_is_marked_and_sent_back():
+    """A citation with a provenance label glued into the URL fails
+    the deterministic gate even when the LLM reviewer approves."""
+    settings = _settings(max_tool_calls_per_research=4, max_research_iterations=1)
+    fake_tools = FakeTools(
+        search_results=[_search_result("Page", "https://example.com/a")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="Details at https://example.com/a [snippet]."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert "CITATION QUALITY" in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+
+
+def test_missing_requested_topic_is_marked_and_drives_followup_research():
+    """Live regression: the question explicitly asked for conditional
+    routing, the draft never mentioned it, and the reviewer approved
+    it anyway. The deterministic coverage check marks the answer and
+    the next research pass is told to target the missing topics."""
+    settings = _settings(max_tool_calls_per_research=2, max_research_iterations=2)
+    fake_tools = FakeTools(
+        search_results=[_search_result("LangGraph", "https://example.com/graphs")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="LangGraph builds graphs from nodes."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "Explain LangGraph conditional routing"})
+
+    # deterministic marker + state carries the missing topics
+    assert "TOPIC COVERAGE" in result["final_answer"]
+    assert result["missing_topics"] == ["conditional", "routing"]
+    # the follow-up research pass was told to target them
+    followup_prompts = [
+        str(batch[-1].content)
+        for batch in model.seen_messages
+        if batch and "Follow-up focus" in str(batch[-1].content)
+    ]
+    assert followup_prompts, "follow-up research prompt never sent"
+    assert "conditional" in followup_prompts[0]
+    assert "routing" in followup_prompts[0]
+    # coverage failure overrode the scripted approval
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+
+
+def test_official_source_cited_by_identifier_is_approved_unmarked():
+    question = "LangGraph official documentation"
+    third_party = "https://blog.example.com/langgraph-tutorial"
+    official = "https://langchain-ai.github.io/langgraph/docs/"
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("Tutorial", third_party),
+            _search_result("Official docs", official),
+        ],
+        page_text="Official docs text.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="See [S2] for LangGraph details."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": question})
+
+    # [S1]=tutorial snippet, [S2]=official page (upgraded to
+    # retrieved by the deterministic fetch)
+    assert result["review_status"] == ReviewStatus.APPROVED
+    assert "CITATION QUALITY" not in result["final_answer"]
+    assert "TOPIC COVERAGE" not in result["final_answer"]
+
+
 def test_source_urls_are_deduplicated_across_searches():
     """The same URL surfaced by several results/searches is listed
     once in state['sources']."""
