@@ -68,6 +68,46 @@ _GEMINI_2_5_PREFIX = "gemini-2.5"
 ThinkingLevel = Literal["low", "medium", "high"]
 
 
+def content_to_text(content: Any) -> str:
+    """Normalize LLM content into clean, renderable text.
+
+    Gemini 3+ models return content as structured blocks::
+
+        [{"type": "text", "text": "..."},
+         {"type": "thinking", "thinking": "...",
+          "signature": "..."},
+         {"type": "text", "text": "...",
+          "extras": {"signature": "..."}}]
+
+    Only ``text`` blocks (and plain strings) are rendered;
+    thinking blocks and other non-text parts are skipped so
+    internal reasoning and signature metadata never leak
+    into displayed answers.
+
+    This is a RENDERING helper. Internal model messages
+    must keep their raw content blocks: Gemini
+    function-calling models REQUIRE thought signatures to
+    be preserved across tool-calling round trips.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                parts.append(block["text"])
+        return "".join(parts)
+    return str(content)
+
+
 def _thinking_kwargs(
     model: str, *, level: ThinkingLevel
 ) -> dict[str, Any]:
@@ -239,7 +279,7 @@ def verify_connection(
             "ok": True,
             "provider": settings.llm_provider,
             "model": settings.llm_model,
-            "content": (response.content or "")[:50],
+            "content": content_to_text(response.content)[:50],
             "input_tokens": usage.get("input_tokens", 0),
             "output_tokens": usage.get("output_tokens", 0),
         }

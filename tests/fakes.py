@@ -9,6 +9,8 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import RunnableLambda
 from pydantic import ConfigDict, Field
 
+from agent.tools import ToolError
+
 
 class ScriptedChatModel(BaseChatModel):
     """Plays back scripted AIMessages and structured outputs.
@@ -27,6 +29,10 @@ class ScriptedChatModel(BaseChatModel):
     raise_on_call: dict[int, Exception] = Field(default_factory=dict)
     call_index: int = 0
     structured_index: int = 0
+    #: messages observed on each ``invoke`` — lets tests assert
+    #: prompt content (grounding, provenance) and that internal
+    #: model messages retain their structured content blocks.
+    seen_messages: list[list[Any]] = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -39,6 +45,7 @@ class ScriptedChatModel(BaseChatModel):
         run_manager: Any = None,
         **kwargs: Any,
     ) -> ChatResult:
+        self.seen_messages.append(list(messages))
         index = self.call_index
         self.call_index += 1
         if index in self.raise_on_call:
@@ -72,14 +79,21 @@ class FakeTools:
         self,
         search_results: list[dict[str, str]] | None = None,
         page_text: str = "",
+        fail_queries: set[str] | None = None,
     ):
         self.search_results = search_results or []
         self.page_text = page_text
+        #: queries that should raise (e.g. empty result set) so a
+        #: test can exercise the agent's recovery from a bad
+        #: query.
+        self.fail_queries = fail_queries or set()
         self.search_calls: list[str] = []
         self.fetch_calls: list[str] = []
 
     def web_search(self, query: str) -> list[dict[str, str]]:
         self.search_calls.append(query)
+        if query in self.fail_queries:
+            raise ToolError(f"web_search returned no results for query {query!r}")
         return list(self.search_results)
 
     def fetch_page(self, url: str) -> str:

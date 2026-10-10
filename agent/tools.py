@@ -84,6 +84,20 @@ def web_search(
     try:
         with factory(timeout=timeout) as ddgs:
             raw = ddgs.text(query, max_results=max_results)
+            if not raw:
+                broader = _without_site_filter(query)
+                if broader != query:
+                    # Site-restricted queries fail when the
+                    # index lacks that site: fall back once to
+                    # the unrestricted query instead of
+                    # returning nothing.
+                    logger.info(
+                        "web_search: no results for site-restricted "
+                        "query %r; retrying as %r",
+                        query,
+                        broader,
+                    )
+                    raw = ddgs.text(broader, max_results=max_results)
     except ToolError:
         raise
     except Exception as exc:
@@ -108,7 +122,9 @@ def web_search(
         )
     if not results:
         raise ToolError(
-            f"web_search returned no results for query {query!r}"
+            f"web_search returned no results for query {query!r}. "
+            "Broaden the query: remove site: filters and overly "
+            "specific terms, or try different keywords."
         )
     return results
 
@@ -230,6 +246,12 @@ def _validate_url(url: str) -> None:
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+_SITE_FILTER_RE = re.compile(r"\bsite:\S+", re.IGNORECASE)
+
+
+def _without_site_filter(query: str) -> str:
+    """Remove ``site:`` operators (empty-result fallback)."""
+    return " ".join(_SITE_FILTER_RE.sub("", query).split())
 
 
 def _html_to_text(markup: str) -> str:
@@ -339,11 +361,18 @@ def to_findings(result: ToolResult) -> list[Finding]:
             Finding(
                 text=f"{item['title']} — {item['snippet']}".strip(" —"),
                 source_url=item["url"],
+                evidence="snippet",  # discovered, not inspected
             )
             for item in result["data"]
         ]
     if result["tool"] == "fetch_page":
         url = str(result["args"].get("url", ""))
         excerpt = str(result["data"])[:500]
-        return [Finding(text=excerpt, source_url=url)]
+        return [
+            Finding(
+                text=excerpt,
+                source_url=url,
+                evidence="retrieved",  # full page inspected
+            )
+        ]
     return []

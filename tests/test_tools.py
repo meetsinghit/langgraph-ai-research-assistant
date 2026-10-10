@@ -124,6 +124,97 @@ def test_web_search_rejects_empty_query():
         web_search("   ", timeout=5.0)
 
 
+def test_web_search_falls_back_when_site_filter_yields_nothing(monkeypatch):
+    """A site-restricted query that returns nothing retries once
+    without the site: filter."""
+    seen_queries: list[str] = []
+
+    class FakeDDGS:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeDDGS":
+            return self
+
+        def __exit__(self, *args: Any) -> bool:
+            return False
+
+        def text(self, query: str, max_results: int = 5) -> list[dict]:
+            seen_queries.append(query)
+            if "site:" in query:
+                return []  # restricted query yields nothing
+            return [{"title": "T", "body": "B", "href": "https://example.com/1"}]
+
+    monkeypatch.setattr(tools, "DDGS", FakeDDGS)
+    results = web_search("langgraph site:example.com", timeout=5.0)
+
+    assert seen_queries == ["langgraph site:example.com", "langgraph"]
+    assert results[0]["url"] == "https://example.com/1"
+
+
+def test_web_search_no_fallback_for_plain_query(monkeypatch):
+    """A query with no site: filter does not retry — it raises
+    the actionable empty-result error."""
+    seen_queries: list[str] = []
+
+    class FakeDDGS:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "FakeDDGS":
+            return self
+
+        def __exit__(self, *args: Any) -> bool:
+            return False
+
+        def text(self, query: str, max_results: int = 5) -> list[dict]:
+            seen_queries.append(query)
+            return []
+
+    monkeypatch.setattr(tools, "DDGS", FakeDDGS)
+    with pytest.raises(ToolError, match="Broaden the query"):
+        web_search("an utterly obscure term", timeout=5.0)
+
+    assert seen_queries == ["an utterly obscure term"]  # single attempt
+
+
+def test_search_results_are_tagged_as_snippet_evidence(monkeypatch):
+    """Web-search results are discovered snippets — tagged so the
+    graph can distinguish them from fetched/inspected pages."""
+    monkeypatch.setattr(
+        tools,
+        "DDGS",
+        make_fake_ddgs(
+            [{"title": "T", "body": "B", "href": "https://example.com/1"}]
+        ),
+    )
+    findings = to_findings(
+        {
+            "tool": "web_search",
+            "ok": True,
+            "data": web_search("query", timeout=5.0),
+            "error": None,
+            "args": {"query": "query"},
+        }
+    )
+    assert findings[0]["evidence"] == "snippet"
+
+
+def test_fetched_page_is_tagged_as_retrieved_evidence():
+    """fetch_page output is inspected content — tagged as
+    'retrieved', distinct from a mere discovered URL."""
+    findings = to_findings(
+        {
+            "tool": "fetch_page",
+            "ok": True,
+            "data": "inspected page text",
+            "error": None,
+            "args": {"url": "https://example.com/page"},
+        }
+    )
+    assert findings[0]["evidence"] == "retrieved"
+
+
 # ---------- URL validation (SSRF protection) ----------
 
 

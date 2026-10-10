@@ -23,6 +23,7 @@ from agent.config import Settings
 from agent.llm import (
     ConfigurationError,
     build_chat_model,
+    content_to_text,
     estimate_cost,
     verify_connection,
 )
@@ -321,3 +322,43 @@ def test_verify_connection_provider_failure(
 def test_verify_connection_configuration_error_propagates() -> None:
     with pytest.raises(ConfigurationError):
         verify_connection(_settings(gemini_api_key=None), deadline=5.0)
+
+
+# ---------- content rendering ----------
+
+
+def test_content_to_text_renders_gemini_blocks_as_clean_markdown():
+    """A Gemini 3 answer arrives as a list of blocks; only the
+    visible text is rendered, joined as clean Markdown."""
+    content = [
+        {"type": "text", "text": "# Finding\n"},
+        {"type": "text", "text": "A second paragraph."},
+        {
+            "type": "thinking",
+            "thinking": "internal reasoning",
+            "signature": "SECRET_SIG",
+        },
+    ]
+    assert content_to_text(content) == "# Finding\nA second paragraph."
+
+
+def test_content_to_text_passes_plain_strings_through():
+    assert content_to_text("already text") == "already text"
+    assert content_to_text(None) == ""
+
+
+def test_content_to_text_drops_thought_signature_metadata():
+    """Signature/thinking blocks must never surface as answer
+    prose — they are model-internal metadata."""
+    content = [
+        {
+            "type": "thinking",
+            "thinking": "chain of thought",
+            "signature": "SECRET_SIG",
+        },
+        {"type": "text", "text": "visible"},
+    ]
+    rendered = content_to_text(content)
+    assert rendered == "visible"
+    assert "SECRET_SIG" not in rendered
+    assert "chain of thought" not in rendered

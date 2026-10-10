@@ -25,11 +25,15 @@ class Finding(TypedDict):
     """A single research finding with its provenance.
 
     ``source_url`` must come from a real tool result — the agent never
-    invents citations.
+    invents citations. ``evidence`` distinguishes the strength of the
+    provenance: ``retrieved`` (a full page was fetched and inspected)
+    vs ``snippet`` (a search-result excerpt — a discovered URL whose
+    content was not verified).
     """
 
     text: str
     source_url: str | None
+    evidence: str  # "retrieved" | "snippet"
 
 
 def append_items(current: list[Any] | None, new: list[Any]) -> list[Any]:

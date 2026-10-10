@@ -341,3 +341,209 @@ def test_failed_review_finalizes_without_restarting():
     assert result["review_status"] == ReviewStatus.FAILED
     assert any("review failed" in error for error in result["errors"])
     assert result["iteration"] == 1  # no silent restart
+
+
+def _block_answer(text: str, signature: str = "sig") -> AIMessage:
+    """A Gemini-style answer carrying structured content blocks:
+    visible text plus a thought-signature block that must be
+    preserved on internal messages but never rendered as prose."""
+    return AIMessage(
+        content=[
+            {"type": "text", "text": text},
+            {"type": "thought_signature", "thought_signature": signature},
+        ]
+    )
+
+
+def test_answer_renders_gemini_content_blocks_as_clean_text():
+    """Structured content blocks (Gemini 3) render as clean,
+    human-readable Markdown — no thought-signature metadata in
+    the final answer."""
+    settings = _settings()
+    fake_tools = FakeTools(
+        search_results=[_search_result("r", "https://example.com/r")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            _block_answer("**Answer** in Markdown."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    answer = result["final_answer"]
+    assert answer == "**Answer** in Markdown."
+    assert "sig" not in answer          # signature stripped
+    assert "thought_signature" not in answer
+
+
+def test_internal_messages_preserve_thought_signature_metadata():
+    """The research loop must NOT strip Gemini's structured
+    content blocks / thought signatures from messages it feeds
+    back to the model — those are required model-side metadata."""
+    settings = _settings()
+    fake_tools = FakeTools(
+        search_results=[_search_result("r", "https://example.com/r")]
+    )
+    signed = _block_answer("thinking out loud", signature="must-survive")
+    # a real tool-calling turn that ALSO carries signed content —
+    # only this gets echoed back to the model on the next step
+    signed.tool_calls = [
+        {"name": "web_search", "args": {"query": "q"}, "id": "c1", "type": "tool_call"}
+    ]
+    model = ScriptedChatModel(
+        responses=[
+            signed,
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    graph.invoke({"question": "question"})
+
+    # the assistant turn echoed back to the model on the second
+    # research step retains its original structured content
+    assistant_turns = [
+        m
+        for batch in model.seen_messages
+        for m in batch
+        if getattr(m, "type", "") == "ai" and m is signed
+    ]
+    assert assistant_turns, "signed assistant message never re-fed to model"
+    for m in assistant_turns:
+        assert m.content == signed.content
+
+
+def test_fetch_page_retrieves_and_inspects_primary_source():
+    """The workflow can retrieve a primary-source page with
+    fetch_page and turn its text into a retrieved finding."""
+    settings = _settings()
+    fake_tools = FakeTools(page_text="Primary source full text.")
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", name="fetch_page", args={"url": "https://docs.example.com/"}),
+            AIMessage(content="done"),
+            AIMessage(content="Answer grounded in the fetched page."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert fake_tools.fetch_calls == ["https://docs.example.com/"]
+    assert len(result["findings"]) == 1
+    assert result["findings"][0]["source_url"] == "https://docs.example.com/"
+    # fetch_page evidence is inspected content, not a discovered snippet
+    assert result["findings"][0].get("evidence") == "retrieved"
+    assert result["sources"] == ["https://docs.example.com/"]
+
+
+def test_search_evidence_is_distinguished_from_retrieved_content():
+    """Findings carry provenance so a snippet (discovered URL) is
+    never conflated with a retrieved/inspected page."""
+    settings = _settings()
+    fake_tools = FakeTools(
+        search_results=[_search_result("snippet", "https://example.com/s")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert result["findings"][0].get("evidence") == "snippet"
+
+
+def test_failed_search_query_recovers_via_requery():
+    """A query that yields no results surfaces as a meaningful
+    tool error; the workflow recovers by issuing a different
+    query rather than crashing."""
+    settings = _settings()
+    fake_tools = FakeTools(
+        search_results=[_search_result("ok", "https://example.com/ok")],
+        fail_queries={"bad site:example.com over-specific"},
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "bad site:example.com over-specific"}),
+            _tool_call_response("c2", args={"query": "broad query"}),
+            AIMessage(content="done"),
+            AIMessage(content="Recovered answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert fake_tools.search_calls == [
+        "bad site:example.com over-specific",
+        "broad query",
+    ]
+    # the failed query yielded no findings; the retry did
+    assert result["findings"][0]["source_url"] == "https://example.com/ok"
+    assert result["review_status"] == ReviewStatus.APPROVED
+    assert not result.get("errors")
+
+
+def test_synthesis_prompt_carries_every_finding_with_its_source():
+    """Claim-to-source consistency: the synthesis prompt lists
+    every finding text next to its source URL, so the drafted
+    answer can only be grounded in cited evidence."""
+    settings = _settings(min_findings=1)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("Fact One", "https://example.com/one"),
+            _search_result("Fact Two", "https://example.com/two"),
+        ]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    graph.invoke({"question": "question"})
+
+    # the synthesis node is the third model call; its prompt is
+    # the last message
+    synthesis_prompt = model.seen_messages[2][-1].content
+    for url in ("https://example.com/one", "https://example.com/two"):
+        assert url in synthesis_prompt
+    assert "Fact One" in synthesis_prompt
+    assert "Fact Two" in synthesis_prompt
