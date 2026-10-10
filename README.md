@@ -89,12 +89,14 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
   (`https://… [snippet]`), unknown URLs and fabricated `[S#]`
   identifiers fail the deterministic citation gate and mark the
   answer as insufficiently verified.
-- **Topic completeness**: a deterministic keyword check verifies
-  that explicitly requested question terms appear in the draft;
-  missing topics are marked (`TOPIC COVERAGE: INCOMPLETE`), sent
-  back through the review gate, and the next research pass is
-  given a targeted follow-up focus. Coverage is not correctness —
-  the LLM reviewer still judges whether sources support claims.
+- **Topic completeness**: a deterministic lexical check verifies
+  that explicitly requested question terms appear in the draft
+  outside known unavailability disclaimers (a mention that details
+  "were not available" is not coverage); missing topics are marked
+  (`TOPIC COVERAGE: INCOMPLETE`), sent back through the review
+  gate, and the next research pass is given a targeted follow-up
+  focus. Coverage is not adequacy — the LLM reviewer still judges
+  whether explanations are substantive and sources support claims.
 - **Limits are separate**: tool calls per pass (partitioned
   search/fetch), research passes, retrieved-source threshold, and
   wall-clock time — plus one retry for rate limits and controlled

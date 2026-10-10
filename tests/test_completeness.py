@@ -27,6 +27,44 @@ def test_missing_requested_topic_is_reported():
     assert not report.ok
 
 
+def test_disclaimer_only_mention_is_not_coverage():
+    """Live regression: the draft said conditional routing details
+    'were not available' — an unavailability disclaimer, not an
+    explanation. Pure keyword presence counted it as covered."""
+    report = check_completeness(
+        "Explain LangGraph conditional routing",
+        "LangGraph state flows through checkpointers. Conditional "
+        "routing details were not available in the retrieved sources.",
+    )
+    assert report.missing == ("conditional", "routing")
+    assert not report.ok
+
+
+def test_topic_explained_in_one_sentence_survives_a_disclaimer_elsewhere():
+    """A disclaimer elsewhere must not erase a real explanation of
+    the topic in another sentence."""
+    report = check_completeness(
+        "Explain LangGraph conditional routing",
+        "LangGraph conditional routing means edges with predicates. "
+        "Retry backoff details were not available in the sources.",
+    )
+    assert report.ok
+
+
+def test_alternative_disclaimer_phrasings_are_not_coverage():
+    for answer in (
+        "LangGraph conditional routing was unavailable in the sources.",
+        "LangGraph conditional routing could not be found in the pages.",
+        "No details on conditional routing were provided.",
+        "LangGraph conditional routing is not covered by the findings.",
+    ):
+        report = check_completeness(
+            "Explain LangGraph conditional routing", answer
+        )
+        assert not report.ok, answer
+        assert "routing" in report.missing, answer
+
+
 def test_covered_topic_passes_case_insensitively():
     report = check_completeness(
         "Explain LangGraph conditional routing",
@@ -54,7 +92,8 @@ def test_report_disclaims_correctness():
         "Explain conditional routing", "Nothing relevant here."
     )
     text = format_completeness_report(report)
-    assert "does NOT verify correctness" in text
+    assert "LEXICAL" in text
+    assert "does NOT verify" in text
     assert "FAIL" in text
     assert "conditional, routing" in text
     passing = format_completeness_report(

@@ -277,6 +277,31 @@ def test_is_first_party_heuristic():
     assert not is_first_party("", question)
 
 
+def test_current_official_docs_domain_is_first_party():
+    """Live-run regression: docs.langchain.com hosts the current
+    official LangGraph overview. If it is not classified first-party,
+    ``official_retrieved_available`` is empty and the
+    retrieved-official-source rule silently disables itself."""
+    question = (
+        "Explain LangGraph state management and conditional routing "
+        "using official documentation."
+    )
+    assert is_first_party(
+        "https://docs.langchain.com/oss/python/langgraph/overview", question
+    )
+
+
+def test_product_token_match_requires_a_whole_domain_label():
+    """Question product tokens must match a whole host label:
+    'fastapi' matches fastapi.tiangolo.com, but 'state' must not
+    make statecharts.example.com first-party (substring matching
+    over-classifies third-party hosts)."""
+    assert is_first_party("https://fastapi.tiangolo.com/tutorial/", "fastapi tutorial")
+    assert not is_first_party(
+        "https://statecharts.example.com/x", "Explain state management"
+    )
+
+
 # --- canonical source identifiers & malformed citations -----------
 
 

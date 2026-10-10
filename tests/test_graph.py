@@ -1067,6 +1067,69 @@ def test_official_source_cited_by_identifier_is_approved_unmarked():
     assert "TOPIC COVERAGE" not in result["final_answer"]
 
 
+def test_live_repro_official_not_cited_and_disclaimer_only_topics_fail():
+    """Exact live-run reproduction (both failures, final iteration):
+
+    1. Question asks for official documentation; S2 is the current
+       official docs.langchain.com overview and was fetched
+       [retrieved], yet the draft cites only [S1]/[S3]/[S4]
+       (discovered). The deterministic official-citation rule must
+       fail the check and override the scripted approval — even at
+       the final allowed research iteration.
+    2. The draft "explains" conditional routing only by disclaiming
+       it ("details were not available") — that must not count as
+       coverage."""
+    question = (
+        "Explain LangGraph state management and conditional routing "
+        "using official documentation."
+    )
+    s1 = "https://blog.example.com/langgraph-state"
+    s2 = "https://docs.langchain.com/oss/python/langgraph/overview"
+    s3 = "https://dev.example.org/graphs-checkpoints"
+    s4 = "https://notes.example.net/langgraph-notes"
+    settings = _settings(max_tool_calls_per_research=4, max_research_iterations=1)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("State blog", s1),
+            _search_result("Official overview", s2),
+            _search_result("Checkpoints", s3),
+            _search_result("Notes", s4),
+        ],
+        page_text="Official docs text.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(
+                content=(
+                    "LangGraph state management uses a checkpointer [S1]. "
+                    "More state management background is in [S3] and [S4]. "
+                    "Conditional routing details were not available in the "
+                    "retrieved sources."
+                )
+            ),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="looks complete"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": question})
+
+    # the official overview was force-fetched first (priority works)
+    assert fake_tools.fetch_calls == [s2]
+    # citation gate: retrieved official source never cited -> the
+    # scripted approval is overridden even at the final iteration
+    assert "CITATION QUALITY" in result["final_answer"]
+    # completeness gate: disclaimer-only mention is not coverage
+    assert "TOPIC COVERAGE" in result["final_answer"]
+    assert result["missing_topics"] == ["conditional", "routing"]
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+
+
 def test_source_urls_are_deduplicated_across_searches():
     """The same URL surfaced by several results/searches is listed
     once in state['sources']."""

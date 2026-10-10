@@ -47,6 +47,7 @@ _OFFICIAL_REQUEST_RE = re.compile(r"\b(official|first[- ]party)\b", re.IGNORECAS
 _FIRST_PARTY_DOC_DOMAINS = frozenset(
     {
         "langchain-ai.github.io",
+        "docs.langchain.com",
         "ai.google.dev",
         "developers.google.com",
         "cloud.google.com",
@@ -100,9 +101,13 @@ def is_first_party(url: str, question: str) -> bool:
     """Heuristic first-party check for a source URL.
 
     A URL is first-party when its hostname is a curated official
-    documentation domain, or when a product token from the question
-    appears in the hostname (e.g. ``fastapi`` in
-    ``fastapi.tiangolo.com``).
+    documentation domain (kept current — e.g. ``docs.langchain.com``,
+    the present home of the official LangGraph docs), or when a
+    product token from the question is one WHOLE hostname label
+    (e.g. ``fastapi`` in ``fastapi.tiangolo.com``). Whole-label
+    matching only: a substring match would let generic question
+    terms like ``state`` misclassify third-party hosts such as
+    ``statecharts.example.com``.
     """
     try:
         host = (urlparse(url).hostname or "").lower()
@@ -115,7 +120,8 @@ def is_first_party(url: str, question: str) -> bool:
     for domain in _FIRST_PARTY_DOC_DOMAINS:
         if host == domain or host.endswith("." + domain):
             return True
-    return any(token in host for token in _product_tokens(question))
+    labels = host.split(".")
+    return any(token in labels for token in _product_tokens(question))
 
 
 # --- URL extraction & normalization -------------------------------
