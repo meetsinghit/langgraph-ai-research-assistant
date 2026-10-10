@@ -21,7 +21,10 @@ Node responsibilities:
 
 Separate, enforced limits:
 
-- ``max_tool_calls_per_research``: tool calls per research pass
+- ``max_tool_calls_per_research``: executed tool invocations per
+                     research pass — counts EVERY invocation,
+                     including multiple calls requested in a
+                     single LLM response
 - ``max_research_iterations``:     research passes (routing layer)
 - ``max_execution_seconds``:       wall-clock budget per pass
 """
@@ -212,8 +215,10 @@ def make_research_node(
         tokens_in = state.get("tokens_in", 0)
         tokens_out = state.get("tokens_out", 0)
         provider_error: str | None = None
+        max_calls = settings.max_tool_calls_per_research
+        executed_calls = 0
 
-        for _step in range(settings.max_tool_calls_per_research):
+        while executed_calls < max_calls:
             if time.monotonic() - started_at > settings.max_execution_seconds:
                 message = (
                     f"execution time budget of "
@@ -243,7 +248,23 @@ def make_research_node(
                 )
                 break
 
-            for tool_call in tool_calls:
+            # A single LLM response can request MULTIPLE tool calls
+            # (e.g. Gemini batching parallel web_search calls). The
+            # budget limits EXECUTED invocations, so the batch is
+            # truncated to the remaining budget — otherwise one
+            # response alone could exceed the limit (observed:
+            # 6 executed calls with a limit of 4).
+            remaining = max_calls - executed_calls
+            batch = tool_calls[:remaining]
+            if len(batch) < len(tool_calls):
+                logger.warning(
+                    "tool-call budget: executing %d of %d requested "
+                    "call(s) (limit %d per research pass)",
+                    len(batch),
+                    len(tool_calls),
+                    max_calls,
+                )
+            for tool_call in batch:
                 result = executor.execute(tool_call)
                 messages.append(
                     ToolMessage(
@@ -264,6 +285,7 @@ def make_research_node(
                     "ok" if result["ok"] else f"error: {result['error']}",
                     len(new_findings),
                 )
+                executed_calls += 1
 
         update["findings"] = findings
         update["sources"] = sources

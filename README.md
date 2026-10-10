@@ -27,7 +27,7 @@ python main.py "What is LangGraph?"
 | `REQUEST_TIMEOUT_SECONDS` | per-request timeout | `30` |
 | `MAX_RESEARCH_ITERATIONS` | research passes (graph-level budget) | `3` |
 | `MIN_FINDINGS` | findings required to synthesize | `3` |
-| `MAX_TOOL_CALLS_PER_RESEARCH` | tool calls per research pass | `4` |
+| `MAX_TOOL_CALLS_PER_RESEARCH` | executed tool invocations per research pass (counts batches in one LLM response) | `4` |
 | `MAX_EXECUTION_SECONDS` | wall-clock budget per pass | `120` |
 | `MAX_REDIRECTS` / `MAX_PAGE_BYTES` | fetch safety limits | `5` / `1000000` |
 
@@ -57,7 +57,9 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
 - **LLM layer** (`agent/llm.py`): provider factory — Gemini (native
   `langchain-google-genai` integration, free tier), OpenRouter
   (OpenAI-compatible client), OpenAI (paid, disabled by default).
-- **Tools** (`agent/tools.py`): `web_search` (DuckDuckGo, free) and
+- **Tools** (`agent/tools.py`): `web_search` (DuckDuckGo via
+  the maintained `ddgs` package, free; an empty result set is
+  a meaningful error, not silent success) and
   `fetch_page` (SSRF-hardened: http/https only, localhost/private-IP
   blocking including DNS-resolution checks, per-hop redirect
   validation, timeouts, size caps).

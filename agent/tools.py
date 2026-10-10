@@ -28,7 +28,7 @@ from typing import Any, Callable, TypedDict
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 from langchain_core.tools import BaseTool, StructuredTool
 
 from agent.config import Settings
@@ -70,7 +70,14 @@ def web_search(
     timeout: float = 30.0,
     ddgs_factory: Callable[..., Any] | None = None,
 ) -> list[SearchResult]:
-    """Search the web via DuckDuckGo (free, no API key)."""
+    """Search the web via DuckDuckGo (free, no API key).
+
+    Uses the maintained ``ddgs`` package. An empty result set is
+    a FAILURE to gather evidence, not evidence itself: it raises
+    ``ToolError`` so the caller (LLM) gets a meaningful message
+    and can retry with a different query, instead of silently
+    receiving a "successful" response with no data.
+    """
     if not query.strip():
         raise ToolError("web_search: query must not be empty")
     factory = ddgs_factory or DDGS
@@ -80,6 +87,8 @@ def web_search(
     except ToolError:
         raise
     except Exception as exc:
+        # Provider errors and timeouts surface with their type
+        # and message so the LLM can react meaningfully.
         raise ToolError(
             f"web_search failed for query {query!r}: {type(exc).__name__}: {exc}"
         ) from exc
@@ -88,6 +97,7 @@ def web_search(
     for item in raw or []:
         url = str(item.get("href") or item.get("url") or "").strip()
         if not url:
+            # A result without a URL has no verifiable provenance.
             continue
         results.append(
             {
@@ -95,6 +105,10 @@ def web_search(
                 "snippet": str(item.get("body") or item.get("snippet") or "").strip(),
                 "url": url,
             }
+        )
+    if not results:
+        raise ToolError(
+            f"web_search returned no results for query {query!r}"
         )
     return results
 

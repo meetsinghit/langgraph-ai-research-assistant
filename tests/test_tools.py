@@ -57,9 +57,60 @@ def test_web_search_maps_results(monkeypatch):
     ]
 
 
-def test_web_search_empty_results(monkeypatch):
+def test_web_search_maps_legacy_result_keys(monkeypatch):
+    """The ddgs package returns title/href/body; the parser
+    also accepts the older url/snippet keys."""
+    monkeypatch.setattr(
+        tools,
+        "DDGS",
+        make_fake_ddgs(
+            [{"title": "T", "snippet": "S", "url": "https://example.com/x"}]
+        ),
+    )
+    results = web_search("query", max_results=5, timeout=5.0)
+    assert results == [
+        {"title": "T", "snippet": "S", "url": "https://example.com/x"}
+    ]
+
+
+def test_web_search_empty_results_raise_tool_error(monkeypatch):
+    """An empty result set is a FAILURE to gather evidence, not
+    evidence — it must surface as a meaningful error, never as
+    a silent "success" with no data."""
     monkeypatch.setattr(tools, "DDGS", make_fake_ddgs([]))
-    assert web_search("query", timeout=5.0) == []
+    with pytest.raises(ToolError, match="no results"):
+        web_search("query", timeout=5.0)
+
+
+def test_web_search_skips_results_without_urls(monkeypatch):
+    """Results without a URL have no verifiable provenance and
+    are not usable evidence."""
+    monkeypatch.setattr(
+        tools, "DDGS", make_fake_ddgs([{"title": "T", "body": "B"}])
+    )
+    with pytest.raises(ToolError, match="no results"):
+        web_search("query", timeout=5.0)
+
+
+def test_web_search_timeout_raises_tool_error(monkeypatch):
+    """Backend timeouts surface with their type and message."""
+
+    class TimeoutDDGS:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def __enter__(self) -> "TimeoutDDGS":
+            return self
+
+        def __exit__(self, *args: Any) -> bool:
+            return False
+
+        def text(self, query: str, max_results: int = 5) -> list[dict]:
+            raise TimeoutError("search timed out")
+
+    monkeypatch.setattr(tools, "DDGS", TimeoutDDGS)
+    with pytest.raises(ToolError, match="timed out"):
+        web_search("query", timeout=5.0)
 
 
 def test_web_search_backend_failure_raises_tool_error(monkeypatch):
@@ -252,6 +303,82 @@ def test_executor_converts_bad_arguments_to_errors():
     assert "invalid arguments" in result["error"]
 
 
+# ---------- search -> executor -> findings pipeline ----------
+
+
+def _executor_with_real_search(monkeypatch) -> tools.ToolExecutor:
+    """ToolExecutor wired to the real web_search (with a
+        faked ddgs backend — no network)."""
+    monkeypatch.setattr(
+        tools,
+        "DDGS",
+        make_fake_ddgs(
+            [
+                {
+                    "title": "LangGraph docs",
+                    "body": "build stateful agents",
+                    "href": "https://langchain-ai.github.io/langgraph/",
+                }
+            ]
+        ),
+    )
+    return tools.ToolExecutor(
+        {
+            "web_search": lambda query: web_search(query, timeout=5.0)
+        }
+    )
+
+
+def test_search_results_flow_through_executor_to_findings(monkeypatch):
+    """Search results become ToolExecutor outputs, then
+    LangGraph findings with verifiable source URLs."""
+    executor = _executor_with_real_search(monkeypatch)
+    result = executor.execute(
+        {"name": "web_search", "args": {"query": "langgraph"}, "id": "1"}
+    )
+    assert result["ok"] is True
+    assert result["tool"] == "web_search"
+
+    findings = to_findings(result)
+    assert len(findings) == 1
+    assert findings[0]["source_url"] == (
+        "https://langchain-ai.github.io/langgraph/"
+    )
+    assert "LangGraph docs" in findings[0]["text"]
+
+
+def test_empty_search_becomes_meaningful_tool_result(monkeypatch):
+    """Empty results produce a controlled error result the LLM
+    can react to — not a silent success with empty data."""
+    monkeypatch.setattr(tools, "DDGS", make_fake_ddgs([]))
+    executor = tools.ToolExecutor(
+        {
+            "web_search": lambda query: web_search(query, timeout=5.0)
+        }
+    )
+    result = executor.execute(
+        {"name": "web_search", "args": {"query": "q"}, "id": "1"}
+    )
+    assert result["ok"] is False
+    assert "no results" in result["error"]
+    assert to_findings(result) == []  # empty is never evidence
+
+
+def test_failed_search_becomes_meaningful_tool_result(monkeypatch):
+    monkeypatch.setattr(tools, "DDGS", make_fake_ddgs(fail=True))
+    executor = tools.ToolExecutor(
+        {
+            "web_search": lambda query: web_search(query, timeout=5.0)
+        }
+    )
+    result = executor.execute(
+        {"name": "web_search", "args": {"query": "q"}, "id": "1"}
+    )
+    assert result["ok"] is False
+    assert "web_search failed" in result["error"]
+    assert to_findings(result) == []
+
+
 # ---------- findings extraction ----------
 
 
@@ -289,6 +416,19 @@ def test_to_findings_ignores_failed_results():
         "data": None,
         "error": "boom",
         "args": {},
+    }
+    assert to_findings(result) == []
+
+
+def test_to_findings_from_empty_search_data():
+    """Empty search data yields no findings — defensive: an
+    empty result must never count as meaningful evidence."""
+    result = {
+        "tool": "web_search",
+        "ok": True,
+        "data": [],
+        "error": None,
+        "args": {"query": "q"},
     }
     assert to_findings(result) == []
 

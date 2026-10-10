@@ -133,6 +133,98 @@ def test_tool_call_budget_and_iteration_budget():
     assert "Partial evidence" in result["final_answer"]
 
 
+def _multi_tool_call_response(
+    calls: list[tuple[str, str]],
+) -> AIMessage:
+    """One LLM response requesting SEVERAL tool calls at once
+    (Gemini frequently batches parallel web_search calls)."""
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "web_search", "args": {"query": query}, "id": call_id}
+            for call_id, query in calls
+        ],
+    )
+
+
+def test_tool_call_budget_limits_batched_calls_in_one_response():
+    """One response requested 6 calls with a budget of 4:
+    exactly 4 invocations are executed, never 6."""
+    settings = _settings(
+        min_findings=10,
+        max_research_iterations=2,
+        max_tool_calls_per_research=4,
+    )
+    fake_tools = FakeTools(
+        search_results=[_search_result("r", "https://example.com/r")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _multi_tool_call_response(
+                [
+                    ("c1", "q1"),
+                    ("c2", "q2"),
+                    ("c3", "q3"),
+                    ("c4", "q4"),
+                    ("c5", "q5"),
+                    ("c6", "q6"),
+                ]
+            ),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert len(fake_tools.search_calls) == 4  # not 6
+    assert len(result["findings"]) == 4
+    assert result["iteration"] == 2
+    assert result["review_status"] == ReviewStatus.APPROVED
+    assert result["final_answer"].startswith("Draft answer.")
+    # only 4 of the 10 required findings -> partial-evidence flag
+    assert "Partial evidence" in result["final_answer"]
+
+
+def test_tool_call_budget_limits_batches_across_responses():
+    """Batches of 2 calls across responses: the budget counts
+    executed invocations, so a third batch is never reached."""
+    settings = _settings(
+        min_findings=10,
+        max_research_iterations=1,
+        max_tool_calls_per_research=4,
+    )
+    fake_tools = FakeTools(
+        search_results=[_search_result("r", "https://example.com/r")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _multi_tool_call_response([("c1", "q1"), ("c2", "q2")]),
+            _multi_tool_call_response([("c3", "q3"), ("c4", "q4")]),
+            _multi_tool_call_response([("c5", "q5"), ("c6", "q6")]),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert len(fake_tools.search_calls) == 4  # 2 + 2; batch 3 never runs
+    assert model.call_index == 3  # 2 research invokes + 1 synthesis
+    assert len(result["findings"]) == 4
+    assert result["iteration"] == 1
+    assert result["review_status"] == ReviewStatus.APPROVED
+
+
 def test_unknown_tool_call_is_handled_gracefully():
     settings = _settings(min_findings=3, max_research_iterations=2)
     fake_tools = FakeTools()
