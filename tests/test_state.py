@@ -6,6 +6,7 @@ from agent.state import (
     GraphState,
     ReviewStatus,
     append_items,
+    append_unique,
 )
 
 
@@ -27,6 +28,29 @@ def test_append_items_never_mutates_its_inputs():
     assert len(current) == 1
     assert len(new) == 1
     assert len(merged) == 2
+
+
+def test_append_unique_removes_duplicates():
+    assert append_unique(["a"], ["b", "a", "b"]) == ["a", "b"]
+
+
+def test_append_unique_dedupes_within_the_new_batch():
+    assert append_unique(None, ["x", "y", "x"]) == ["x", "y"]
+
+
+def test_append_unique_does_not_mutate_inputs():
+    current = ["a"]
+    new = ["a", "b"]
+    merged = append_unique(current, new)
+    assert merged == ["a", "b"]
+    assert current == ["a"]
+    assert new == ["a", "b"]
+
+
+def test_append_unique_is_idempotent():
+    once = append_unique(None, ["a", "b"])
+    twice = append_unique(once, ["a", "b"])
+    assert once == twice == ["a", "b"]
 
 
 def test_review_status_enum_values():

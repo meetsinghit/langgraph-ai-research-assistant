@@ -86,7 +86,8 @@ def test_happy_path_plan_research_synthesize_review_finalize():
 
     assert result["research_plan"] == ["query one", "query two"]
     assert result["iteration"] == 1
-    assert len(result["findings"]) == 1
+    # 1 snippet + 1 deterministic verification fetch of the same URL
+    assert len(result["findings"]) == 2
     assert (
         result["findings"][0]["source_url"]
         == "https://langchain-ai.github.io/langgraph/"
@@ -122,14 +123,25 @@ def test_tool_call_budget_and_iteration_budget():
     fake_tools = FakeTools(
         search_results=[_search_result("r", "https://example.com/r")]
     )
-    model = ScriptedChatModel(responses=[_tool_call_response("call")])
+    # each pass spends its 2-call budget as 1 search + 1 fetch
+    # (the budget is partitioned between discovery and verification)
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            _tool_call_response("c2", name="fetch_page", args={"url": "https://example.com/r"}),
+            _tool_call_response("c3"),
+            _tool_call_response("c4", name="fetch_page", args={"url": "https://example.com/r"}),
+            AIMessage(content="Draft answer."),
+        ]
+    )
 
     graph = build_research_graph(settings, model, fake_tools)
     result = graph.invoke({"question": "question"})
 
     assert result["iteration"] == 2  # iteration budget hit
     assert len(result["findings"]) == 4  # 2 tool calls x 2 passes
-    assert len(fake_tools.search_calls) == 4
+    assert len(fake_tools.search_calls) == 2  # 1 search per pass
+    assert len(fake_tools.fetch_calls) == 2  # 1 fetch per pass
     assert "Partial evidence" in result["final_answer"]
 
 
@@ -182,12 +194,14 @@ def test_tool_call_budget_limits_batched_calls_in_one_response():
     graph = build_research_graph(settings, model, fake_tools)
     result = graph.invoke({"question": "question"})
 
-    assert len(fake_tools.search_calls) == 4  # not 6
-    assert len(result["findings"]) == 4
+    # the search quota halves the budget: only 2 of the 4 slots can
+    # be searches, the model's extra search requests were refused
+    assert len(fake_tools.search_calls) == 2
+    assert len(result["findings"]) == 3  # 2 snippets + 1 forced fetch
     assert result["iteration"] == 2
     assert result["review_status"] == ReviewStatus.APPROVED
     assert result["final_answer"].startswith("Draft answer.")
-    # only 4 of the 10 required findings -> partial-evidence flag
+    # fewer findings than the 10 required -> partial-evidence flag
     assert "Partial evidence" in result["final_answer"]
 
 
@@ -218,9 +232,11 @@ def test_tool_call_budget_limits_batches_across_responses():
     graph = build_research_graph(settings, model, fake_tools)
     result = graph.invoke({"question": "question"})
 
-    assert len(fake_tools.search_calls) == 4  # 2 + 2; batch 3 never runs
+    # 2 searches executed (quota = half of the 4-call budget); the
+    # second batch's search requests were refused in the fetch phase
+    assert len(fake_tools.search_calls) == 2  # 2 + refused; batch 3 never runs
     assert model.call_index == 3  # 2 research invokes + 1 synthesis
-    assert len(result["findings"]) == 4
+    assert len(result["findings"]) == 2
     assert result["iteration"] == 1
     assert result["review_status"] == ReviewStatus.APPROVED
 
@@ -270,7 +286,7 @@ def test_review_gate_sends_work_back_to_research():
     result = graph.invoke({"question": "question"})
 
     assert result["iteration"] == 2  # first draft was sent back
-    assert len(result["findings"]) == 2
+    assert len(result["findings"]) == 3  # 2 from pass 1 + 1 from pass 2
     assert result["review_status"] == ReviewStatus.APPROVED
     assert result["final_answer"] == "Draft answer v2."
 
@@ -300,7 +316,7 @@ def test_rate_limit_is_retried_once():
     result = graph.invoke({"question": "question"})
 
     assert not result.get("errors")
-    assert len(result["findings"]) == 1
+    assert len(result["findings"]) == 2  # snippet + forced fetch
     assert result["final_answer"] == "Draft answer."
     assert model.call_index == 4  # one failed + three successful invokes
 
@@ -547,3 +563,276 @@ def test_synthesis_prompt_carries_every_finding_with_its_source():
         assert url in synthesis_prompt
     assert "Fact One" in synthesis_prompt
     assert "Fact Two" in synthesis_prompt
+
+
+# ---------- deterministic search-to-fetch workflow ----------
+
+
+def test_search_to_fetch_phase_transition_and_budget_split():
+    """With the default 4-call budget the workflow is deterministic:
+    up to 2 searches, then fetch-only. The toolset handed to the
+    model changes with the phase, and the model is told why."""
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("Fact One", "https://example.com/one"),
+            _search_result("Fact Two", "https://example.com/two"),
+        ],
+        page_text="Inspected page text.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "q1"}),
+            _tool_call_response("c2", args={"query": "q2"}),
+            _tool_call_response(
+                "c3", name="fetch_page", args={"url": "https://example.com/one"}
+            ),
+            _tool_call_response(
+                "c4", name="fetch_page", args={"url": "https://example.com/two"}
+            ),
+            AIMessage(content="Final answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    # exactly 2 searches then 2 fetches — the budget was partitioned
+    assert fake_tools.search_calls == ["q1", "q2"]
+    assert fake_tools.fetch_calls == [
+        "https://example.com/one",
+        "https://example.com/two",
+    ]
+    # the model saw both tools first, then only fetch_page
+    assert model.tool_bind_history[0] == ["web_search", "fetch_page"]
+    assert model.tool_bind_history[2] == ["fetch_page"]
+    assert model.tool_bind_history[3] == ["fetch_page"]
+    # the phase transition was explained to the model
+    assert any(
+        "web_search is no longer available" in str(getattr(m, "content", ""))
+        for m in model.seen_messages[2]
+    )
+    # 4 snippet findings (2 results x 2 searches) + 2 retrieved
+    # findings from the fetched pages
+    assert len(result["findings"]) == 6
+    retrieved = [f for f in result["findings"] if f.get("evidence") == "retrieved"]
+    assert len(retrieved) == 2
+    # verified (retrieved >= MIN_RETRIEVED_SOURCES) -> no label
+    assert result["final_answer"] == "Final answer."
+
+
+def test_tool_budget_never_spends_every_slot_on_searches():
+    """A model that keeps requesting searches is refused after the
+    search quota — the rest of the budget cannot be consumed by
+    searches while source URLs are available for verification."""
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[_search_result("r", "https://example.com/r")]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "q1"}),
+            _tool_call_response("c2", args={"query": "q2"}),
+            _tool_call_response("c3", args={"query": "q3"}),
+            _tool_call_response("c4", args={"query": "q4"}),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    # never more than 2 searches with a 4-call budget
+    assert len(fake_tools.search_calls) == 2
+    assert fake_tools.fetch_calls == []  # the model never verified
+    # the refused calls were answered with a controlled tool message
+    tool_texts = [
+        str(getattr(m, "content", ""))
+        for batch in model.seen_messages
+        for m in batch
+        if getattr(m, "type", "") == "tool"
+    ]
+    assert any("web_search is not available" in text for text in tool_texts)
+    # 15 snippets would not satisfy the threshold either:
+    # zero retrieved pages -> the answer is labeled UNVERIFIED
+    assert "UNVERIFIED" in result["final_answer"]
+
+
+def test_failed_page_retrieval_leaves_answer_unverified():
+    """When page verification fails, the workflow attempts it
+    deterministically, then returns a labeled unverified answer
+    instead of claiming full evidence verification."""
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("A", "https://example.com/a"),
+            _search_result("B", "https://example.com/b"),
+        ],
+        fail_fetch=True,
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "q1"}),
+            _tool_call_response("c2", args={"query": "q2"}),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    # verification was ATTEMPTED despite every fetch failing
+    assert len(fake_tools.fetch_calls) >= 1
+    assert all(f.get("evidence") == "snippet" for f in result["findings"])
+    # no crash; an honest label rather than a false "verified"
+    assert "UNVERIFIED" in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.APPROVED
+
+
+def test_min_retrieved_sources_threshold_is_configurable():
+    """MIN_RETRIEVED_SOURCES=3: fetching two pages is still not
+    enough, so the answer carries the unverified label with counts."""
+    settings = _settings(
+        max_tool_calls_per_research=4, min_retrieved_sources=3
+    )
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("A", "https://example.com/a"),
+            _search_result("B", "https://example.com/b"),
+        ],
+        page_text="Inspected.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "q1"}),
+            _tool_call_response(
+                "c2", name="fetch_page", args={"url": "https://example.com/a"}
+            ),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    retrieved = [
+        f for f in result["findings"] if f.get("evidence") == "retrieved"
+    ]
+    assert len(retrieved) == 2  # a (model) + b (forced); still < 3
+    assert "UNVERIFIED" in result["final_answer"]
+    assert "2 of 3" in result["final_answer"]
+
+
+def test_retrieved_threshold_met_means_no_label():
+    """Default threshold of 1: once a page is fetched, the answer
+    is verified and carries no warning label."""
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("A", "https://example.com/a"),
+            _search_result("B", "https://example.com/b"),
+        ],
+        page_text="Inspected.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "q1"}),
+            _tool_call_response(
+                "c2", name="fetch_page", args={"url": "https://example.com/a"}
+            ),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert "UNVERIFIED" not in result["final_answer"]
+    assert result["final_answer"] == "Draft answer."
+
+
+def test_official_source_is_verified_first_when_requested():
+    """When the user explicitly asks for official documentation,
+    first-party pages are verified before third-party ones."""
+    question = "LangGraph official documentation"
+    third_party = "https://blog.example.com/langgraph-tutorial"
+    official = "https://langchain-ai.github.io/langgraph/docs/"
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("Tutorial", third_party),
+            _search_result("Official docs", official),
+        ],
+        page_text="Official docs text.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content="Answer citing the docs."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    graph.invoke({"question": question})
+
+    # the deterministic verification step fetched the first-party
+    # page first, even though the third-party one was discovered first
+    assert fake_tools.fetch_calls == [official]
+
+
+def test_source_urls_are_deduplicated_across_searches():
+    """The same URL surfaced by several results/searches is listed
+    once in state['sources']."""
+    settings = _settings(max_tool_calls_per_research=4)
+    fake_tools = FakeTools(
+        search_results=[
+            _search_result("A", "https://example.com/a"),
+            _search_result("A again", "https://example.com/a"),
+            _search_result("B", "https://example.com/b"),
+        ]
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1", args={"query": "q1"}),
+            _tool_call_response("c2", args={"query": "q2"}),
+            AIMessage(content="done"),
+            AIMessage(content="Draft answer."),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="ok"),
+        ],
+    )
+
+    graph = build_research_graph(settings, model, fake_tools)
+    result = graph.invoke({"question": "question"})
+
+    assert result["sources"] == ["https://example.com/a", "https://example.com/b"]

@@ -27,7 +27,8 @@ python main.py "What is LangGraph?"
 | `REQUEST_TIMEOUT_SECONDS` | per-request timeout | `30` |
 | `MAX_RESEARCH_ITERATIONS` | research passes (graph-level budget) | `3` |
 | `MIN_FINDINGS` | findings required to synthesize | `3` |
-| `MAX_TOOL_CALLS_PER_RESEARCH` | executed tool invocations per research pass (counts batches in one LLM response) | `4` |
+| `MIN_RETRIEVED_SOURCES` | source **pages** that must be fetched/inspected before an answer counts as verified (snippets never satisfy it; `0` disables verification) | `1` |
+| `MAX_TOOL_CALLS_PER_RESEARCH` | executed tool invocations per research pass (counts batches in one LLM response); split ~half search / ~half fetch | `4` |
 | `MAX_EXECUTION_SECONDS` | wall-clock budget per pass | `120` |
 | `MAX_REDIRECTS` / `MAX_PAGE_BYTES` | fetch safety limits | `5` / `1000000` |
 
@@ -64,11 +65,22 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
   blocking including DNS-resolution checks, per-hop redirect
   validation, timeouts, size caps).
 - **Graph** (`agent/graph.py`): `plan` (LLM structured output),
-  `research` (bounded ReAct loop — the LLM chooses tools via tool
-  calling; `ToolExecutor` executes them explicitly), `synthesize`
-  (LLM answer from findings only), `review` (LLM quality gate),
-  `finalize`, `handle_error`.
-- **Limits are separate**: tool calls per pass, research passes, and
+  `research` (bounded, phase-partitioned ReAct loop — the tool
+  budget is deterministically split between discovery and
+  verification: the model is bound to only the currently-allowed
+  tools, out-of-phase calls are refused, and a pass that would
+  end on snippets alone force-fetches the best candidates;
+  first-party domains are verified first when the question asks
+  for official documentation), `synthesize` (LLM answer from
+  findings only; answers below the `MIN_RETRIEVED_SOURCES`
+  threshold are labeled UNVERIFIED/INCOMPLETE), `review` (LLM
+  quality gate), `finalize`, `handle_error`.
+- **Evidence provenance**: findings are tagged `retrieved` (page
+  fetched and inspected) or `snippet` (discovered URL, content
+  unverified); `sources` in state is deduplicated, and the CLI
+  prints each source as `[retrieved]` or `[discovered]`.
+- **Limits are separate**: tool calls per pass (partitioned
+  search/fetch), research passes, retrieved-source threshold, and
   wall-clock time — plus one retry for rate limits and controlled
   errors for provider failures.
 

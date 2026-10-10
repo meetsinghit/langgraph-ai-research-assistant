@@ -33,6 +33,10 @@ class ScriptedChatModel(BaseChatModel):
     #: prompt content (grounding, provenance) and that internal
     #: model messages retain their structured content blocks.
     seen_messages: list[list[Any]] = Field(default_factory=list)
+    #: tool names passed to each ``bind_tools`` call — lets tests
+    #: assert the deterministic search/fetch tool partitioning
+    #: (which tools the graph made available in each round).
+    tool_bind_history: list[list[str]] = Field(default_factory=list)
 
     @property
     def _llm_type(self) -> str:
@@ -57,6 +61,9 @@ class ScriptedChatModel(BaseChatModel):
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
+        self.tool_bind_history.append(
+            [str(getattr(tool, "name", tool)) for tool in tools]
+        )
         return self
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
@@ -72,14 +79,23 @@ class ScriptedChatModel(BaseChatModel):
         return RunnableLambda(_invoke)
 
 
+class _StubTool:
+    """Minimal tool stub exposing the ``name`` the graph filters on."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.description = name
+
+
 class FakeTools:
     """Deterministic stand-in for ResearchTools."""
 
     def __init__(
         self,
         search_results: list[dict[str, str]] | None = None,
-        page_text: str = "",
+        page_text: str = "Fetched page content.",
         fail_queries: set[str] | None = None,
+        fail_fetch: bool = False,
     ):
         self.search_results = search_results or []
         self.page_text = page_text
@@ -87,6 +103,9 @@ class FakeTools:
         #: test can exercise the agent's recovery from a bad
         #: query.
         self.fail_queries = fail_queries or set()
+        #: when True every fetch_page call raises, so a test can
+        #: exercise the unverified-answer path.
+        self.fail_fetch = fail_fetch
         self.search_calls: list[str] = []
         self.fetch_calls: list[str] = []
 
@@ -98,10 +117,14 @@ class FakeTools:
 
     def fetch_page(self, url: str) -> str:
         self.fetch_calls.append(url)
+        if self.fail_fetch:
+            raise ToolError(f"fetch_page request failed for {url}")
         return self.page_text
 
     def tool_functions(self) -> dict[str, Any]:
         return {"web_search": self.web_search, "fetch_page": self.fetch_page}
 
     def langchain_tools(self) -> list[Any]:
-        return []  # the scripted model ignores tool schemas
+        # stubs: the scripted model ignores schemas, but the graph
+        # filters these by name to partition search/fetch phases.
+        return [_StubTool("web_search"), _StubTool("fetch_page")]

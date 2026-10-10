@@ -47,6 +47,20 @@ def append_items(current: list[Any] | None, new: list[Any]) -> list[Any]:
     return current + list(new)
 
 
+def append_unique(current: list[Any] | None, new: list[Any]) -> list[Any]:
+    """Reducer: merge list updates, keeping the first occurrence only.
+
+    Order-preserving and idempotent — used for URL collections so the
+    same source is never listed twice, no matter how many searches
+    (or research passes) surface it.
+    """
+    merged: list[Any] = list(current or [])
+    for item in new:
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
 class GraphState(TypedDict, total=False):
     """Shared state flowing through the research graph.
 
@@ -57,7 +71,9 @@ class GraphState(TypedDict, total=False):
     question: str
     research_plan: Annotated[list[str], append_items]
     findings: Annotated[list[Finding], append_items]
-    sources: Annotated[list[str], append_items]
+    #: deduplicated: the same URL discovered by several searches is
+    #: listed once (see Finding.evidence for per-source provenance)
+    sources: Annotated[list[str], append_unique]
     iteration: int
     errors: Annotated[list[str], append_items]
     review_status: ReviewStatus

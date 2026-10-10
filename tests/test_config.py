@@ -69,6 +69,21 @@ def test_zero_min_findings_is_rejected():
         Settings(_env_file=None, min_findings=0)
 
 
+def test_min_retrieved_sources_defaults_to_one():
+    """Evidence-backed research requires at least one fetched page."""
+    assert Settings(_env_file=None).min_retrieved_sources == 1
+
+
+def test_zero_min_retrieved_sources_is_allowed_as_opt_out():
+    s = Settings(_env_file=None, min_retrieved_sources=0)
+    assert s.min_retrieved_sources == 0
+
+
+def test_negative_min_retrieved_sources_is_rejected():
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, min_retrieved_sources=-1)
+
+
 def test_redacted_masks_all_secrets():
     s = Settings(
         _env_file=None,

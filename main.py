@@ -71,8 +71,16 @@ def main(argv: list[str] | None = None) -> int:
     print(state.get("final_answer", "(no answer produced)"))
     print()
     print("=== SOURCES ===")
+    # [retrieved] = page fetched and inspected; [discovered] =
+    # URL found via search, content never verified.
+    retrieved = {
+        finding.get("source_url")
+        for finding in (state.get("findings") or [])
+        if finding.get("evidence") == "retrieved"
+    }
     for url in dict.fromkeys(state.get("sources") or []):
-        print(f"- {url}")
+        tag = "retrieved" if url in retrieved else "discovered"
+        print(f"- {url} [{tag}]")
     print()
     print(f"iterations: {state.get('iteration', 0)}")
     print(

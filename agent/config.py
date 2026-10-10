@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     max_plan_queries: int = Field(default=4, ge=1)
     search_results_per_query: int = Field(default=5, ge=1)
     min_findings: int = Field(default=3, ge=1)
+    # Minimum number of source PAGES that must be fetched and
+    # inspected (Finding.evidence == "retrieved") before an answer
+    # counts as verified. Search snippets never satisfy this
+    # threshold. 0 disables the requirement: no search/fetch budget
+    # partitioning and no unverified-answer label.
+    min_retrieved_sources: int = Field(default=1, ge=0)
 
     # Paid providers (OpenAI) are disabled unless explicitly enabled.
     allow_paid_providers: bool = False
