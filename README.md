@@ -32,14 +32,21 @@ python main.py "What is LangGraph?"
 | `MAX_TOOL_CALLS_PER_RESEARCH` | executed tool invocations per research pass (counts batches in one LLM response); split ~half search / ~half fetch | `4` |
 | `MAX_EXECUTION_SECONDS` | wall-clock budget **per research pass** (each pass gets its own budget; the full run is bounded by `MAX_RESEARCH_ITERATIONS` × this, plus plan/synthesize/review LLM calls, which it does not cover) | `120` |
 | `MAX_REDIRECTS` / `MAX_PAGE_BYTES` | fetch safety limits | `5` / `1000000` |
+| `MAX_EVIDENCE_CHARS` | per-source text budget injected into model prompts (snippet + page, truncated with an explicit marker beyond it) — keeps prompt size and input tokens bounded regardless of page size; full text stays in state for citations | `6000` |
 
 ## Running
 
 - `python main.py "question"` — research, then print the answer,
   sources, iteration count, token usage and estimated cost
+- `python main.py "question" --metrics run.json` — additionally
+  write the machine-readable metrics snapshot (per-node/per-call
+  latency, prompt sizes, token counts, tool outcomes; sizes and
+  counts only — never content)
 - `python main.py --verify-connection` — opt-in live smoke test
   (exactly one minimal request to the configured provider)
 - `python -m pytest` — full mocked suite (no network, no API keys)
+- `python -m evals` — offline evaluation benchmark (21 scripted
+  cases, no network, no API keys; see below)
 - `RUN_LIVE_TESTS=1 python -m pytest -m live` — opt-in live
   integration test (requires a configured provider key)
 
@@ -117,6 +124,86 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
   wall-clock time — plus one retry for rate limits and controlled
   errors for provider failures.
 
+## Offline evaluation (`python -m evals`)
+
+A deterministic benchmark in `evals/` drives the **real graph**
+with scripted model responses and canned search/page fixtures —
+no network, no API keys, no live provider (the test suite
+enforces this by making any httpx client construction fail the
+run).
+
+- `python -m evals` — human-readable summary
+  (`evals/report.json` is written by default;
+  `--out PATH` / `--no-out` to change)
+- `python -m evals --no-out` — summary only
+
+The report keeps **two independent verdicts per case**:
+
+| Verdict | What it measures |
+| --- | --- |
+| `deterministic_pass` | The run met its fixture expectations: workflow completed, tool budgets respected, deterministic gates (citation provenance, topic coverage, official-source retrieval) produced the expected decisions, expected markers present, expected `review_status`. |
+| `semantic` | Whether the draft actually *explains* each requested topic, scored against human-authored substantive markers per topic (disclaimer-aware: naming a topic inside "were not available" does not count). Also records `reviewer_false_approval`. |
+
+**How to interpret the numbers**
+
+- A case `PASS` means *expectations were met* — not that the
+  answer is objectively correct. Fixture markers are eval
+  design, not ground truth.
+- `summary.reviewer_false_approvals` lists cases the reviewer
+  approved that the semantic rubric scores inadequate — the
+  false-approval failure mode observed live in Phase 3
+  (Workstream 4). The `ws4-routing-superficial` case reproduces
+  it: every deterministic gate passes, the reviewer approves,
+  and only the rubric flags that conditional routing is merely
+  *named*, not explained.
+- Semantic scores are **diagnostics, not proofs**: keyword/URL
+  matching never establishes factual correctness, and citation
+  checks only establish provenance. An optional LLM-as-judge
+  backend (`EVAL_LLM_JUDGE=1`) exists for rubric scoring but is
+  disabled by default and never runs in tests.
+- The topic-coverage checker is deliberately lexical: it only
+  verifies requested terms appear outside known unavailability
+  disclaimers. It cannot distinguish an explanation from a
+  mention, and **no escalating regex rules were added** to try —
+  regex "superficiality" arms-races into overfitting and would
+  blur routing enforcement with quality scoring. Instead, the
+  review prompt now demands mechanism-level answers, the
+  semantic rubric measures them, and the deterministic gates
+  keep enforcing only what they can verify honestly.
+
+## Observability & token accounting
+
+Every run collects per-node, per-model-call and per-tool-call
+metrics (`agent/metrics.py`): latency, prompt size in characters,
+input/output tokens when the provider reports them, tool result
+sizes, retry counts and coarse error categories. The collector is
+content-free **by construction** — sizes, counts, categories and
+timings only; never message content, tool results, URLs or raw
+error text.
+
+- `python main.py "question" --metrics run.json` writes the full
+  JSON snapshot (also embedded per case in `evals/report.json`
+  under `run_metrics`).
+- **Where the 61K tokens went (Workstream 2)**: the live Phase 3
+  run jumped 18,923 → 61,565 input tokens for one extra fetch.
+  Cause: research prompts embedded full fetched-page text
+  (up to `MAX_PAGE_BYTES` = 1 MB per page), which was then
+  re-sent on every later model call — each fetched page
+  multiplied across remaining research rounds, synthesis and
+  review. Mitigation: `MAX_EVIDENCE_CHARS` (default 6000) caps
+  each source's text in prompts with an explicit truncation
+  marker, and duplicate findings render once. The offline
+  benchmark proves the cap holds (a 100 KB page keeps every
+  prompt under 20K chars — `tests/test_evals.py`).
+- **Known limitations**: token counts come from provider
+  `usage_metadata`; plan and review use `with_structured_output`,
+  which discards the `AIMessage`, so those calls record
+  `0` tokens (prompt size and latency are still captured).
+  Eval-report token totals are synthetic estimates from the fake
+  model (labeled in report metadata) — an exact per-node
+  breakdown of the live 61K run requires one live run with
+  `--metrics`, which was not performed in Phase 4A.
+
 ## Security notes
 
 - Retrieved web content is treated as untrusted DATA, never as
@@ -136,7 +223,7 @@ START → plan → research ⇢(conditional)⇢ research | synthesize | handle_e
 
 ```
 AI_POC/
-├── main.py                  CLI entry point
+├── main.py                  CLI entry point (+ --metrics JSON report)
 ├── requirements.txt
 ├── .env.example             config template (no secrets)
 ├── agent/
@@ -146,6 +233,12 @@ AI_POC/
 │   ├── logging_config.py    JSON-lines logging + redaction
 │   ├── llm.py               provider-specific LLM factory
 │   ├── tools.py             web_search / fetch_page + SSRF protection
+│   ├── metrics.py           per-run metrics (content-free by design)
 │   └── graph.py             node implementations + graph wiring
+├── evals/
+│   ├── cases.py             ~21-case benchmark (fixtures + expectations + rubrics)
+│   ├── semantic.py          fixture rubric scorer + opt-in LLM judge
+│   ├── harness.py           offline runner + JSON report
+│   └── __main__.py          `python -m evals` CLI
 └── tests/                   mocked unit tests + opt-in live test
 ```

@@ -59,6 +59,15 @@ class Settings(BaseSettings):
     max_execution_seconds: float = Field(default=120.0, gt=0)
     max_redirects: int = Field(default=5, ge=1)
     max_page_bytes: int = Field(default=1_000_000, ge=1)
+    # Per-SOURCE character cap for evidence embedded in model
+    # prompts. Fetched pages can be up to max_page_bytes, but
+    # every research round re-sends all findings to the model
+    # (then synthesize and review send them again) — without
+    # this cap a few large pages amplify into tens of thousands
+    # of cumulative input tokens. Truncation keeps the head of
+    # each source (where documentation intros live) and marks
+    # the cut explicitly; the full text stays in state.
+    max_evidence_chars: int = Field(default=6000, ge=500)
     max_plan_queries: int = Field(default=4, ge=1)
     search_results_per_query: int = Field(default=5, ge=1)
     min_findings: int = Field(default=3, ge=1)

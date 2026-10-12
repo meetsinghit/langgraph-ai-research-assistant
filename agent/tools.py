@@ -25,6 +25,7 @@ import logging
 import re
 import socket
 import ssl
+import time
 from typing import Any, Callable, TypedDict
 from urllib.parse import urljoin, urlparse
 
@@ -33,6 +34,7 @@ from ddgs import DDGS
 from langchain_core.tools import BaseTool, StructuredTool
 
 from agent.config import Settings
+from agent.metrics import categorize_error
 from agent.state import Finding
 
 logger = logging.getLogger("agent")
@@ -331,37 +333,97 @@ class ToolExecutor:
     Unknown tools, non-object arguments and tool failures all become
     controlled error results the LLM can react to — never exceptions
     that crash the graph.
+
+    An optional :class:`~agent.metrics.MetricsCollector` records
+    each execution's name/outcome/latency/result SIZE — never
+    arguments or result contents.
     """
 
-    def __init__(self, functions: dict[str, Callable[..., Any]]):
+    def __init__(
+        self,
+        functions: dict[str, Callable[..., Any]],
+        metrics: Any = None,
+        node: str = "research",
+    ):
         self._functions = functions
+        self._metrics = metrics
+        self._node = node
 
     def execute(self, tool_call: dict[str, Any]) -> ToolResult:
         name = tool_call.get("name")
         args = tool_call.get("args")
         if not isinstance(name, str) or name not in self._functions:
-            return ToolResult(
+            result = ToolResult(
                 tool=str(name), ok=False, data=None,
                 error=f"unknown tool: {name!r}", args={},
             )
+            self._record(result, 0.0)
+            return result
         if not isinstance(args, dict):
-            return ToolResult(
+            result = ToolResult(
                 tool=name, ok=False, data=None,
                 error="tool arguments must be an object", args={},
             )
+            self._record(result, 0.0)
+            return result
+        started = time.monotonic()
         try:
             data = self._functions[name](**args)
         except TypeError as exc:
-            return ToolResult(
+            result = ToolResult(
                 tool=name, ok=False, data=None,
-                error=f"invalid arguments for {name}: {exc}", args=dict(args),
+                error=f"invalid arguments for {name}: {exc}",
+                args=dict(args),
             )
+            self._record(result, time.monotonic() - started)
+            return result
         except Exception as exc:
-            return ToolResult(
+            result = ToolResult(
                 tool=name, ok=False, data=None,
                 error=f"tool {name} failed: {exc}", args=dict(args),
             )
-        return ToolResult(tool=name, ok=True, data=data, error=None, args=dict(args))
+            self._record(
+                result, time.monotonic() - started,
+                error_category=categorize_error(exc),
+            )
+            return result
+        result = ToolResult(
+            tool=name, ok=True, data=data, error=None, args=dict(args)
+        )
+        self._record(result, time.monotonic() - started)
+        return result
+
+    def _record(
+        self,
+        result: ToolResult,
+        latency_seconds: float,
+        *,
+        error_category: str | None = None,
+    ) -> None:
+        if self._metrics is None:
+            return
+        data = result.get("data")
+        try:
+            result_chars = (
+                len(json.dumps(data, default=str))
+                if data is not None
+                else 0
+            )
+        except (TypeError, ValueError):
+            result_chars = 0
+        category = error_category or (
+            categorize_error(result.get("error") or "")
+            if not result.get("ok")
+            else None
+        )
+        self._metrics.record_tool_call(
+            self._node,
+            str(result.get("tool")),
+            ok=bool(result.get("ok")),
+            latency_ms=latency_seconds * 1000.0,
+            result_chars=result_chars,
+            error_category=category,
+        )
 
 
 class ResearchTools:

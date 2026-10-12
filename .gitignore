@@ -19,6 +19,9 @@ dist/
 .pytest_cache/
 *.log
 
+# ---- Evaluation reports (generated, not source) ----
+evals/report.json
+
 # ---- OS junk ----
 .DS_Store
 Thumbs.db

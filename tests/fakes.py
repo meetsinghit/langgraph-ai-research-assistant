@@ -27,6 +27,18 @@ class ScriptedChatModel(BaseChatModel):
     responses: list[AIMessage] = Field(default_factory=list)
     structured_outputs: list[Any] = Field(default_factory=list)
     raise_on_call: dict[int, Exception] = Field(default_factory=dict)
+    #: how ``with_structured_output`` replays once its
+    #: scripted outputs are exhausted: "last" (default —
+    #  repeats the final output) or "cycle" (wraps around,
+    #  so eval cases can script a SEQUENCE of verdicts).
+    structured_replay: str = "last"
+    #: when True, plain invokes carry DETERMINISTIC
+    #: synthetic usage_metadata (input_tokens ~= prompt
+    #: chars / 4, output ~= content chars / 4) so the
+    #: token-accounting pipeline can be exercised offline.
+    #: These are estimates from the fake, never provider
+    #: usage; default False keeps existing tests untouched.
+    synthesize_usage: bool = False
     call_index: int = 0
     structured_index: int = 0
     #: messages observed on each plain ``invoke`` — lets tests assert
@@ -63,6 +75,20 @@ class ScriptedChatModel(BaseChatModel):
             message = self.responses[min(index, len(self.responses) - 1)]
         else:
             message = AIMessage(content="")
+        if self.synthesize_usage:
+            # copy: scripted messages are shared fixtures and must
+            # not be mutated across calls
+            input_tokens = max(1, len(str(messages)) // 4)
+            output_tokens = max(1, len(str(message.content)) // 4)
+            message = message.model_copy(
+                update={
+                    "usage_metadata": {
+                        "input_tokens": input_tokens,
+                        "output_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    }
+                }
+            )
         return ChatResult(generations=[ChatGeneration(message=message)])
 
     def bind_tools(self, tools: Any, **kwargs: Any) -> Any:
@@ -82,7 +108,10 @@ class ScriptedChatModel(BaseChatModel):
                 self.seen_structured_messages.append(list(messages))
             if not outputs:
                 raise RuntimeError("no scripted structured output available")
-            index = min(self.structured_index, len(outputs) - 1)
+            if self.structured_replay == "cycle" and outputs:
+                index = self.structured_index % len(outputs)
+            else:
+                index = min(self.structured_index, len(outputs) - 1)
             self.structured_index += 1
             return outputs[index]
 
@@ -107,9 +136,13 @@ class FakeTools:
         fail_queries: set[str] | None = None,
         fail_fetch: bool = False,
         fail_fetch_urls: set[str] | None = None,
+        pages: dict[str, str] | None = None,
     ):
         self.search_results = search_results or []
         self.page_text = page_text
+        #: per-URL page text (eval fixtures); URLs without
+        #: an entry fall back to ``page_text``.
+        self.pages = pages or {}
         #: queries that should raise (e.g. empty result set) so a
         #: test can exercise the agent's recovery from a bad
         #: query.
@@ -139,7 +172,7 @@ class FakeTools:
                 "certificate verification failed; verification is "
                 "never disabled."
             )
-        return self.page_text
+        return self.pages.get(url, self.page_text)
 
     def tool_functions(self) -> dict[str, Any]:
         return {"web_search": self.web_search, "fetch_page": self.fetch_page}

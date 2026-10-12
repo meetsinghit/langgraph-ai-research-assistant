@@ -88,6 +88,7 @@ from agent.completeness import (
 )
 from agent.config import Settings
 from agent.llm import content_to_text, estimate_cost
+from agent.metrics import MetricsCollector, categorize_error
 from agent.routing import (
     ROUTE_ERROR,
     ROUTE_FINALIZE,
@@ -163,10 +164,13 @@ _REVIEW_SYSTEM = (
     "a topic mentioned only in an unavailability disclaimer (e.g. "
     "'details were not available') is NOT coverage, and even "
     "covered topics must be verified for adequacy — coverage is not "
-    "correctness. For questions asking for official documentation, "
-    "check that the official source is cited and actually supports "
-    "the answer. Reply approved or needs_more_research with a short "
-    "reason."
+    "correctness. Naming a topic is not explaining it: verify that "
+    "each requested topic's MECHANISM is actually described (how it "
+    "works, not merely that it exists); an answer that only names a "
+    "topic, or gestures at it without substance, is inadequate. For "
+    "questions asking for official documentation, check that the "
+    "official source is cited and actually supports the answer. "
+    "Reply approved or needs_more_research with a short reason."
 )
 
 
@@ -183,23 +187,56 @@ class ReviewVerdict(BaseModel):
     reason: str
 
 
-def _findings_block(findings: list[Finding]) -> str:
+def _findings_block(
+    findings: list[Finding], max_chars: int = 6000
+) -> str:
     """Findings rendered with canonical ``[S#]`` source identifiers.
 
     The identifier (not the URL) sits next to each finding, and the
     provenance labels live in the separately rendered sources table
     — the model never sees "URL + label glued together" as the
     citation pattern to imitate.
+
+    Every finding renders (a search excerpt and the later fetched
+    page for the same source are BOTH evidence — dropping the
+    excerpt would lose the claim-to-source link), but each
+    source's COMBINED text is capped at ``max_chars`` and exact
+    duplicate findings (same source, evidence class and text —
+    e.g. a snippet re-discovered in a later pass) render once:
+    research rounds, synthesis and review all re-send these
+    blocks, so unbounded page text would otherwise multiply
+    across every model call.
     """
     if not findings:
         return "(no findings yet)"
     refs = {source_key(ref.url): ref for ref in assign_source_ids(findings)}
+    budget: dict[str, int] = {}
+    rendered: set[tuple[str, str, str]] = set()
     lines: list[str] = []
     for finding in findings:
         url = finding.get("source_url")
-        ref = refs.get(source_key(url)) if url else None
+        key = source_key(url) if url else None
+        ref = refs.get(key) if key else None
         label = f"[{ref.sid}] " if ref else ""
-        lines.append(f"- {label}{finding['text']}")
+        text = str(finding["text"])
+        evidence = str(finding.get("evidence", ""))
+        if key is not None:
+            fingerprint = (key, evidence, text)
+            if fingerprint in rendered:
+                continue
+            rendered.add(fingerprint)
+            used = budget.get(key, 0)
+            remaining = max_chars - used
+            if remaining <= 0:
+                # this source's evidence budget is spent
+                continue
+            if len(text) > remaining:
+                text = (
+                    text[:remaining]
+                    + f" …[truncated: {len(text) - remaining} more chars]"
+                )
+            budget[key] = used + len(text)
+        lines.append(f"- {label}{text}")
     return "\n".join(lines)
 
 
@@ -215,10 +252,15 @@ def _sources_block(findings: list[Finding]) -> str:
     )
 
 
-def _evidence_blocks(findings: list[Finding]) -> str:
+def _evidence_blocks(
+    findings: list[Finding], max_chars: int = 6000
+) -> str:
     """Findings + sources blocks, kept together so identifiers are
     always resolvable in the same prompt."""
-    return f"{_findings_block(findings)}\n\n{_sources_block(findings)}"
+    return (
+        f"{_findings_block(findings, max_chars)}\n\n"
+        f"{_sources_block(findings)}"
+    )
 
 
 # --- evidence provenance & verification ---------------------------
@@ -462,7 +504,9 @@ def _out_of_phase_message(name: str, allowed: frozenset[str]) -> str:
     return f"{name} is not available in this step (allowed: {', '.join(sorted(allowed))})."
 
 
-def _research_prompt(state: GraphState) -> str:
+def _research_prompt(
+    state: GraphState, max_chars: int = 6000
+) -> str:
     parts = [f"Question: {state['question']}"]
     if requests_official_sources(state["question"]):
         # Deterministic steering: repeated searches restricted to
@@ -498,7 +542,9 @@ def _research_prompt(state: GraphState) -> str:
             + "\n".join(f"- {query}" for query in plan)
         )
     findings = state.get("findings") or []
-    parts.append(f"Findings so far:\n{_evidence_blocks(findings)}")
+    parts.append(
+        f"Findings so far:\n{_evidence_blocks(findings, max_chars)}"
+    )
     candidates = _candidate_urls(
         state["question"], findings, _retrieved_urls(findings)
     )
@@ -521,21 +567,84 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     )
 
 
+def _prompt_chars(messages: list[BaseMessage]) -> int:
+    """Aggregate message content SIZE — never the content itself."""
+    total = 0
+    for message in messages:
+        content = getattr(message, "content", "")
+        if isinstance(content, list):
+            total += sum(len(str(block)) for block in content)
+        else:
+            total += len(str(content))
+    return total
+
+
 def _invoke_with_retry(
-    model: Any, messages: list[BaseMessage], retry_delay: float
+    model: Any,
+    messages: list[BaseMessage],
+    retry_delay: float,
+    *,
+    metrics: Any = None,
+    node: str = "research",
+    iteration: int | None = None,
 ) -> AIMessage:
-    """Invoke the model, retrying once after a rate-limit error."""
+    """Invoke the model, retrying once after a rate-limit error.
+
+    Records per-invocation metrics — latency, token counts and
+    prompt SIZE (character counts, never message content).
+    Structured-output invocations (plan/review) cannot report
+    token counts: LangChain's ``with_structured_output``
+    returns the parsed object and discards the underlying
+    AIMessage, so their usage is unknown (recorded as 0).
+    """
+    started = time.monotonic()
+    if metrics is not None:
+        metrics.set_iteration(iteration)
     try:
-        return model.invoke(messages)
+        response = model.invoke(messages)
     except Exception as exc:
         if _is_rate_limit_error(exc):
             logger.warning(
-                "rate limit hit; retrying once after %.1fs", retry_delay
+                "rate limit hit; retrying once after %.1fs",
+                retry_delay,
             )
+            if metrics is not None:
+                # the failed attempt is still an invocation:
+                # record it (with its category) so every attempt
+                # appears in the per-call accounting, then the
+                # retry itself
+                metrics.record_model_call(
+                    node,
+                    latency_ms=(time.monotonic() - started) * 1000.0,
+                    prompt_chars=_prompt_chars(messages),
+                    error_category=categorize_error(exc),
+                )
+                metrics.record_retry(node, categorize_error(exc))
             if retry_delay > 0:
                 time.sleep(retry_delay)
-            return model.invoke(messages)
-        raise
+            # restart the clock so the successful retry's latency
+            # is not inflated by the failed attempt + backoff
+            started = time.monotonic()
+            response = model.invoke(messages)
+        else:
+            if metrics is not None:
+                metrics.record_model_call(
+                    node,
+                    latency_ms=(time.monotonic() - started) * 1000.0,
+                    prompt_chars=_prompt_chars(messages),
+                    error_category=categorize_error(exc),
+                )
+            raise
+    delta_in, delta_out = _usage_delta(response)
+    if metrics is not None:
+        metrics.record_model_call(
+            node,
+            latency_ms=(time.monotonic() - started) * 1000.0,
+            input_tokens=delta_in,
+            output_tokens=delta_out,
+            prompt_chars=_prompt_chars(messages),
+        )
+    return response
 
 
 def _usage_delta(response: AIMessage) -> tuple[int, int]:
@@ -545,21 +654,27 @@ def _usage_delta(response: AIMessage) -> tuple[int, int]:
     return usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
 
 
-def make_plan_node(settings: Settings, model: BaseChatModel) -> Node:
+def make_plan_node(
+    settings: Settings,
+    model: BaseChatModel,
+    metrics: MetricsCollector | None = None,
+) -> Node:
     """LLM decomposes the question into search queries."""
     planner = model.with_structured_output(ResearchPlan)
 
     def plan_node(state: GraphState) -> dict[str, Any]:
         question = state["question"]
+        messages = [
+            SystemMessage(content=_PLAN_SYSTEM),
+            HumanMessage(content=question),
+        ]
+        started = time.monotonic()
         try:
-            plan = planner.invoke(
-                [
-                    SystemMessage(content=_PLAN_SYSTEM),
-                    HumanMessage(content=question),
-                ]
-            )
+            plan = planner.invoke(messages)
             queries = [
-                query.strip() for query in plan.queries if query and query.strip()
+                query.strip()
+                for query in plan.queries
+                if query and query.strip()
             ]
         except Exception as exc:
             # Graceful degradation: the raw question is always a usable query.
@@ -567,6 +682,15 @@ def make_plan_node(settings: Settings, model: BaseChatModel) -> Node:
                 "plan generation failed (%s); falling back to the raw question", exc
             )
             queries = [question]
+        if metrics is not None:
+            # Structured output: token usage is not observable
+            # here (the parsed object replaces the AIMessage);
+            # latency and prompt size still are.
+            metrics.record_model_call(
+                "plan",
+                latency_ms=(time.monotonic() - started) * 1000.0,
+                prompt_chars=_prompt_chars(messages),
+            )
         update: dict[str, Any] = {"research_plan": queries[: settings.max_plan_queries]}
         logger.info("plan created: %d query(ies)", len(update["research_plan"]))
         return update
@@ -580,6 +704,7 @@ def make_research_node(
     tools: ResearchTools,
     *,
     rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
+    metrics: MetricsCollector | None = None,
 ) -> Node:
     """Bounded, phase-partitioned ReAct loop with guaranteed verification.
 
@@ -606,7 +731,9 @@ def make_research_node(
     NEXT candidate when an earlier fetch failed. Every check
     respects the per-pass wall-clock budget.
     """
-    executor = ToolExecutor(tools.tool_functions())
+    executor = ToolExecutor(
+        tools.tool_functions(), metrics=metrics, node="research"
+    )
     executable = tools.tool_functions()
     all_tools = tools.langchain_tools()
     max_calls = settings.max_tool_calls_per_research
@@ -617,12 +744,18 @@ def make_research_node(
     def research_node(state: GraphState) -> dict[str, Any]:
         iteration = state.get("iteration", 0) + 1
         update: dict[str, Any] = {"iteration": iteration}
+        if metrics is not None:
+            metrics.set_iteration(iteration)
         started_at = time.monotonic()
         question = state["question"]
         prior_findings = list(state.get("findings") or [])
         messages: list[BaseMessage] = [
             SystemMessage(content=_RESEARCH_SYSTEM),
-            HumanMessage(content=_research_prompt(state)),
+            HumanMessage(
+                content=_research_prompt(
+                    state, settings.max_evidence_chars
+                )
+            ),
         ]
         findings: list[Finding] = []
         sources: list[str] = []
@@ -751,7 +884,12 @@ def make_research_node(
             )
             try:
                 response = _invoke_with_retry(
-                    bound_model, messages, rate_limit_retry_delay
+                    bound_model,
+                    messages,
+                    rate_limit_retry_delay,
+                    metrics=metrics,
+                    node="research",
+                    iteration=iteration,
                 )
             except Exception as exc:
                 provider_error = f"LLM provider failed: {type(exc).__name__}: {exc}"
@@ -876,6 +1014,7 @@ def make_synthesize_node(
     model: BaseChatModel,
     *,
     rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
+    metrics: MetricsCollector | None = None,
 ) -> Node:
     """LLM drafts an answer using ONLY the collected findings."""
 
@@ -893,13 +1032,21 @@ def make_synthesize_node(
         official_block = _official_sources_block(findings, state["question"])
         if official_block:
             prompt_parts.append(official_block)
-        prompt_parts.append(f"Findings:\n{_evidence_blocks(findings)}")
+        prompt_parts.append(
+            f"Findings:\n{_evidence_blocks(findings, settings.max_evidence_chars)}"
+        )
         messages = [
             SystemMessage(content=_SYNTHESIZE_SYSTEM),
             HumanMessage(content="\n\n".join(prompt_parts)),
         ]
         try:
-            response = _invoke_with_retry(model, messages, rate_limit_retry_delay)
+            response = _invoke_with_retry(
+                model,
+                messages,
+                rate_limit_retry_delay,
+                metrics=metrics,
+                node="synthesize",
+            )
         except Exception as exc:
             error = f"synthesis failed: {type(exc).__name__}: {exc}"
             logger.error(error)
@@ -989,7 +1136,11 @@ def make_synthesize_node(
     return synthesize_node
 
 
-def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
+def make_review_node(
+    settings: Settings,
+    model: BaseChatModel,
+    metrics: MetricsCollector | None = None,
+) -> Node:
     """LLM quality gate: is the evidence sufficient?
 
     The draft body (deterministic marker notes stripped) is checked
@@ -1028,13 +1179,23 @@ def make_review_node(settings: Settings, model: BaseChatModel) -> Node:
                     f"Official-source status: {_official_status_line(official_status)}\n\n"
                     f"{format_citation_report(report)}\n\n"
                     f"{format_completeness_report(completeness)}\n\n"
-                    f"Findings:\n{_evidence_blocks(findings)}\n\n"
+                    f"Findings:\n{_evidence_blocks(findings, settings.max_evidence_chars)}\n\n"
                     f"Draft answer: {answer}"
                 )
             ),
         ]
+        started = time.monotonic()
         try:
             verdict = verifier.invoke(messages)
+            if metrics is not None:
+                # Structured output: token usage is not
+                # observable here; latency and prompt size
+                # still are.
+                metrics.record_model_call(
+                    "review",
+                    latency_ms=(time.monotonic() - started) * 1000.0,
+                    prompt_chars=_prompt_chars(messages),
+                )
             status = (
                 ReviewStatus.APPROVED
                 if verdict.status == "approved"
@@ -1094,34 +1255,85 @@ def make_error_node() -> Node:
     return error_node
 
 
+def _timed_node(
+    name: str, node: Node, metrics: MetricsCollector
+) -> Node:
+    """Wrap a graph node to record its execution latency."""
+
+    def timed_node(state: GraphState) -> dict[str, Any]:
+        started = time.monotonic()
+        try:
+            return node(state)
+        finally:
+            metrics.record_node(
+                name, (time.monotonic() - started) * 1000.0
+            )
+
+    return timed_node
+
+
 def build_research_graph(
     settings: Settings,
     model: BaseChatModel,
     tools: ResearchTools,
     *,
     rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
+    metrics: MetricsCollector | None = None,
 ) -> CompiledStateGraph:
     """Wire the research graph.
 
     Conditional edges use the deterministic routing layer —
     unchanged from Phase 2.
+
+    ``metrics`` (a :class:`~agent.metrics.MetricsCollector`)
+    receives per-node, per-model-call and per-tool-call
+    instrumentation: latencies, token counts, prompt and
+    result SIZES, retry and error categories — never
+    content. When omitted, a throwaway collector is used so
+    instrumentation is always uniform.
     """
+    if metrics is None:
+        metrics = MetricsCollector()
     builder = StateGraph(GraphState)
-    builder.add_node("plan", make_plan_node(settings, model))
+    builder.add_node(
+        "plan",
+        _timed_node(
+            "plan", make_plan_node(settings, model, metrics), metrics
+        ),
+    )
     builder.add_node(
         "research",
-        make_research_node(
-            settings, model, tools,
-            rate_limit_retry_delay=rate_limit_retry_delay,
+        _timed_node(
+            "research",
+            make_research_node(
+                settings,
+                model,
+                tools,
+                rate_limit_retry_delay=rate_limit_retry_delay,
+                metrics=metrics,
+            ),
+            metrics,
         ),
     )
     builder.add_node(
         "synthesize",
-        make_synthesize_node(
-            settings, model, rate_limit_retry_delay=rate_limit_retry_delay
+        _timed_node(
+            "synthesize",
+            make_synthesize_node(
+                settings,
+                model,
+                rate_limit_retry_delay=rate_limit_retry_delay,
+                metrics=metrics,
+            ),
+            metrics,
         ),
     )
-    builder.add_node("review", make_review_node(settings, model))
+    builder.add_node(
+        "review",
+        _timed_node(
+            "review", make_review_node(settings, model, metrics), metrics
+        ),
+    )
     builder.add_node("finalize", make_finalize_node())
     builder.add_node("handle_error", make_error_node())
 

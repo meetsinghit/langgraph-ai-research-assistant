@@ -15,6 +15,7 @@ from agent.config import get_settings
 from agent.graph import build_research_graph
 from agent.llm import build_chat_model, verify_connection
 from agent.logging_config import setup_logging
+from agent.metrics import MetricsCollector
 from agent.tools import ResearchTools
 
 
@@ -29,6 +30,15 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "opt-in live smoke test: one minimal request to the "
             "configured provider"
+        ),
+    )
+    parser.add_argument(
+        "--metrics",
+        metavar="PATH",
+        help=(
+            "write a machine-readable JSON metrics report "
+            "(run id, per-node/per-call latency, token "
+            "counts, tool outcomes) to PATH"
         ),
     )
     args = parser.parse_args(argv)
@@ -54,7 +64,8 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("starting research run: %s", args.question)
     model = build_chat_model(settings)
     tools = ResearchTools(settings)
-    graph = build_research_graph(settings, model, tools)
+    metrics = MetricsCollector()
+    graph = build_research_graph(settings, model, tools, metrics=metrics)
 
     state: dict[str, Any] = {"question": args.question}
     for step in graph.stream({"question": args.question}):
@@ -96,6 +107,12 @@ def main(argv: list[str] | None = None) -> int:
         print("estimated cost: n/a for this model")
     else:
         print(f"estimated cost: ${cost:.4f}")
+    if args.metrics:
+        import json
+
+        with open(args.metrics, "w", encoding="utf-8") as handle:
+            json.dump(metrics.snapshot(), handle, indent=2)
+        print(f"metrics report: {args.metrics}")
     return 0
 
 
