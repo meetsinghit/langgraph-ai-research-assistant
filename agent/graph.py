@@ -98,7 +98,14 @@ from agent.routing import (
     route_after_review,
 )
 from agent.state import Finding, GraphState, ReviewStatus
-from agent.tools import ResearchTools, ToolExecutor, ToolResult, to_findings
+from agent.tools import (
+    ResearchTools,
+    ToolExecutor,
+    ToolResult,
+    evidence_marker,
+    shape_evidence,
+    to_findings,
+)
 
 logger = logging.getLogger("agent")
 
@@ -698,6 +705,49 @@ def make_plan_node(
     return plan_node
 
 
+def _model_visible_tool_result(
+    result: ToolResult,
+    query: str,
+    max_chars: int,
+) -> str:
+    """Serialize a tool result for the model transcript, capped.
+
+    Every executed tool call is answered with a ToolMessage so the
+    provider transcript stays valid — but a fetched page can be up
+    to ``MAX_PAGE_BYTES`` (observed live: 183K characters, ~90% of
+    a run's input tokens when re-sent to the next invocation).
+    When the serialized result exceeds ``max_chars``, only the
+    ``data`` payload is reduced (query-relevant sections via
+    :func:`~agent.tools.shape_evidence`); tool name, outcome,
+    args and error text are preserved. The metrics collector
+    records the REAL result size regardless — observability is
+    never affected by transcript bounding.
+    """
+    content = json.dumps(result, default=str)
+    if len(content) <= max_chars:
+        return content
+    data = result.get("data")
+    data_json = json.dumps(data, default=str)
+    overhead = max(0, len(content) - len(data_json))
+    # reserve headroom for JSON escaping of the shaped text
+    budget = max(64, max_chars - overhead - 64)
+    if isinstance(data, str):
+        bounded_data: Any = shape_evidence(data, query, budget)
+    else:
+        # non-text payloads (search results) normally fit; if one
+        # ever does not, degrade to shaped text — still bounded
+        bounded_data = shape_evidence(data_json, query, budget)
+    bounded = dict(result)
+    bounded["data"] = bounded_data
+    content = json.dumps(bounded, default=str)
+    if len(content) > max_chars:
+        # JSON-escape backstop: the transcript cap is absolute
+        content = content[: max(0, max_chars - 240)] + evidence_marker(
+            max_chars, len(content)
+        )
+    return content
+
+
 def make_research_node(
     settings: Settings,
     model: BaseChatModel,
@@ -802,7 +852,13 @@ def make_research_node(
             return fetches_done < fetch_quota
 
         def record(result: ToolResult) -> list[Finding]:
-            new_findings = to_findings(result)
+            # Only a bounded, query-relevant excerpt of a fetched
+            # page enters state (the raw document is not retained).
+            new_findings = to_findings(
+                result,
+                query=question,
+                max_chars=settings.max_evidence_chars,
+            )
             findings.extend(new_findings)
             for finding in new_findings:
                 url = finding["source_url"]
@@ -963,7 +1019,11 @@ def make_research_node(
                 result = executor.execute(tool_call)
                 messages.append(
                     ToolMessage(
-                        content=json.dumps(result, default=str),
+                        content=_model_visible_tool_result(
+                            result,
+                            question,
+                            settings.max_tool_result_chars,
+                        ),
                         tool_call_id=tool_call.get("id") or "",
                     )
                 )

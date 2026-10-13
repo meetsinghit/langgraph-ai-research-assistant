@@ -33,6 +33,7 @@ import httpx
 from ddgs import DDGS
 from langchain_core.tools import BaseTool, StructuredTool
 
+from agent.completeness import _requested_terms
 from agent.config import Settings
 from agent.metrics import categorize_error
 from agent.state import Finding
@@ -326,6 +327,93 @@ def _html_to_text(markup: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+# -- model-visible evidence shaping ------------------------------------
+
+#: Characters reserved for the truncation marker so
+#: ``shaped + marker <= max_chars`` always holds.
+_EVIDENCE_MARKER_RESERVE = 240
+
+#: Sentence segmentation for relevance selection. ``_html_to_text``
+#: collapses ALL whitespace, so fetched pages are one long line —
+#: blank-line "paragraphs" do not exist and sentences are the
+#: natural lightweight unit.
+_EVIDENCE_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+
+#: Fixed-size fallback segments for terminator-free content
+#: (minified text, base64 blobs, single-word dumps).
+_EVIDENCE_CHUNK_CHARS = 400
+
+
+def evidence_marker(shown: int, total: int) -> str:
+    """Explicit, content-free truncation marker."""
+    return (
+        f"…[evidence bounded: {shown} of {total} characters kept "
+        "— query-relevant sections selected; the full page was "
+        "not retained]"
+    )
+
+
+def shape_evidence(text: str, query: str, max_chars: int) -> str:
+    """Bound webpage text to ``max_chars``, keeping QUERY-RELEVANT
+    sections instead of a naive first-N-character cut.
+
+    Lightweight, deterministic and dependency-free:
+
+    - text already within budget passes through unchanged;
+    - the text is segmented into sentences (fixed-size chunks
+      when a document has no sentence terminators);
+    - the first segment is always kept (title/intro context),
+      then segments containing any of the question's topic terms
+      (``_requested_terms`` — same terms the coverage gate uses)
+      are added in original order until the budget is spent;
+    - boilerplate with no topic term (navigation, cookie notices)
+      is dropped;
+    - the result always carries an explicit marker stating the
+      original size.
+
+    The returned text is EVIDENCE for the model to read, not a
+    correctness claim; source URL and retrieved/snippet provenance
+    are attached by callers and never affected here.
+    """
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    budget = max(1, max_chars - _EVIDENCE_MARKER_RESERVE)
+    segments = [
+        segment.strip()
+        for segment in _EVIDENCE_SENTENCE_RE.split(text)
+        if segment.strip()
+    ]
+    if not segments:
+        segments = [
+            text[index : index + _EVIDENCE_CHUNK_CHARS]
+            for index in range(0, len(text), _EVIDENCE_CHUNK_CHARS)
+        ]
+
+    def _bounded(head: str) -> str:
+        if len(head) > budget:
+            head = head[:budget]
+        return head + "\n\n" + evidence_marker(len(head), len(text))
+
+    lead = segments[0]
+    if len(lead) > budget:
+        # oversized lead (terminator-free document): bounded fallback
+        return _bounded(lead)
+    kept: list[str] = [lead]
+    used = len(lead)
+    terms = _requested_terms(query)
+    if terms:
+        lowered = [segment.lower() for segment in segments]
+        for index in range(1, len(segments)):
+            if not any(term in lowered[index] for term in terms):
+                continue  # boilerplate: no topic term
+            segment = segments[index]
+            if used + len(segment) + 1 > budget:
+                continue  # too large — a later, smaller match may fit
+            kept.append(segment)
+            used += len(segment) + 1
+    return _bounded(" ".join(kept))
+
+
 class ToolExecutor:
     """Explicit, validated tool execution — the graph's tool layer.
 
@@ -473,11 +561,22 @@ class ResearchTools:
         ]
 
 
-def to_findings(result: ToolResult) -> list[Finding]:
+def to_findings(
+    result: ToolResult,
+    *,
+    query: str = "",
+    max_chars: int = 500,
+) -> list[Finding]:
     """Convert a successful tool result into verifiable findings.
 
     Findings are built ONLY from actual tool output — the agent can
     never fabricate citations.
+
+    ``query`` and ``max_chars`` control how much of a fetched page
+    is retained as finding text: an oversized page is reduced to
+    query-relevant sections (:func:`shape_evidence`), never a naive
+    first-N cut. Only this bounded excerpt is kept in state — the
+    full raw document is deliberately not retained.
     """
     if not result["ok"]:
         return []
@@ -492,7 +591,7 @@ def to_findings(result: ToolResult) -> list[Finding]:
         ]
     if result["tool"] == "fetch_page":
         url = str(result["args"].get("url", ""))
-        excerpt = str(result["data"])[:500]
+        excerpt = shape_evidence(str(result["data"]), query, max_chars)
         return [
             Finding(
                 text=excerpt,

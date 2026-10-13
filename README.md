@@ -32,7 +32,8 @@ python main.py "What is LangGraph?"
 | `MAX_TOOL_CALLS_PER_RESEARCH` | executed tool invocations per research pass (counts batches in one LLM response); split ~half search / ~half fetch | `4` |
 | `MAX_EXECUTION_SECONDS` | wall-clock budget **per research pass** (each pass gets its own budget; the full run is bounded by `MAX_RESEARCH_ITERATIONS` × this, plus plan/synthesize/review LLM calls, which it does not cover) | `120` |
 | `MAX_REDIRECTS` / `MAX_PAGE_BYTES` | fetch safety limits | `5` / `1000000` |
-| `MAX_EVIDENCE_CHARS` | per-source text budget injected into model prompts (snippet + page, truncated with an explicit marker beyond it) — keeps prompt size and input tokens bounded regardless of page size; full text stays in state for citations | `6000` |
+| `MAX_EVIDENCE_CHARS` | per-source text budget injected into model prompts (snippet + page, truncated with an explicit marker beyond it) — keeps prompt size and input tokens bounded regardless of page size; findings retain the bounded text | `6000` |
+| `MAX_TOOL_RESULT_CHARS` | per-result cap on **model-visible tool output**: oversized fetched pages are reduced to query-relevant sections (explicit marker) before entering the transcript ToolMessage — a raw page would otherwise be re-sent to the provider on the next research invocation | `8000` |
 
 ## Running
 
@@ -184,25 +185,45 @@ error text.
 - `python main.py "question" --metrics run.json` writes the full
   JSON snapshot (also embedded per case in `evals/report.json`
   under `run_metrics`).
-- **Where the 61K tokens went (Workstream 2)**: the live Phase 3
-  run jumped 18,923 → 61,565 input tokens for one extra fetch.
-  Cause: research prompts embedded full fetched-page text
-  (up to `MAX_PAGE_BYTES` = 1 MB per page), which was then
-  re-sent on every later model call — each fetched page
-  multiplied across remaining research rounds, synthesis and
-  review. Mitigation: `MAX_EVIDENCE_CHARS` (default 6000) caps
-  each source's text in prompts with an explicit truncation
-  marker, and duplicate findings render once. The offline
-  benchmark proves the cap holds (a 100 KB page keeps every
-  prompt under 20K chars — `tests/test_evals.py`).
+- **Where the tokens went (Workstream 2, two amplification
+  paths found and fixed)**:
+  1. *Prompt rendering* (Phase 4A): research prompts embedded
+     full fetched-page text (up to `MAX_PAGE_BYTES` = 1 MB per
+     page) in the findings block, re-sent on every later model
+     call. Fixed by `MAX_EVIDENCE_CHARS` (default 6000) — a
+     per-source prompt budget with an explicit truncation marker.
+  2. *Tool transcript* (live-run follow-up): the research loop
+     answers every tool call with a ToolMessage built from the
+     full tool result, so a large fetched page re-entered the
+     transcript on the next invocation. The instrumented live run
+     measured a single 183,164-character page producing a
+     189,546-character research prompt — ~90% of that run's
+     43,033 input tokens. Fixed by `MAX_TOOL_RESULT_CHARS`
+     (default 8000): oversized payloads are reduced to
+     query-relevant sections (sentence-level selection by the
+     question's topic terms, lead segment always kept, explicit
+     marker) before entering the transcript; findings retain the
+     same bounded, relevant excerpt — the raw document is not
+     retained. Offline reproduction with the same ~183K fixture:
+     research prompts drop from >150,000 to <20,000 characters
+     (`tests/test_evidence_bounds.py`).
+- **Tradeoff**: evidence is selected by lexical relevance to the
+  question, so a page whose key passage shares no topic terms
+  with the question may be under-represented; the truncation
+  marker makes the reduction explicit, and re-fetching with a
+  better query remains possible within budget.
+- Metrics reports are finalized per run (`finished_at` and
+  `total_execution_seconds` are stamped before the JSON snapshot
+  is written).
 - **Known limitations**: token counts come from provider
   `usage_metadata`; plan and review use `with_structured_output`,
-  which discards the `AIMessage`, so those calls record
-  `0` tokens (prompt size and latency are still captured).
-  Eval-report token totals are synthetic estimates from the fake
-  model (labeled in report metadata) — an exact per-node
-  breakdown of the live 61K run requires one live run with
-  `--metrics`, which was not performed in Phase 4A.
+  which discards the `AIMessage`, so those calls record `0`
+  tokens (prompt size and latency are still captured — a live
+  run shows `plan` at 0 tokens / 663 prompt chars). Eval-report
+  token totals are synthetic estimates from the fake model
+  (labeled in report metadata); the instrumented live run
+  (`run_metrics.json`, gitignored) provides real per-call
+  attribution.
 
 ## Security notes
 

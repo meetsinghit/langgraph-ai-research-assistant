@@ -216,6 +216,9 @@ class MetricsCollector:
         )
 
     def finish(self) -> None:
+        # ensure the clock has started — a snapshot taken after
+        # finish() must never compute a negative span
+        _ = self.started_at
         self._finished_at = time.time()
 
     # -- aggregation ------------------------------------------------

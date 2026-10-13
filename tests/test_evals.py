@@ -373,6 +373,10 @@ class TestBoundedPrompts:
                 {"title": "Huge", "snippet": "snippet", "url": url},
             ),
             pages={url: page},
+            # search, fetch, THEN one more model invocation — the
+            # post-fetch invoke is where an unbounded ToolMessage
+            # would re-enter the transcript (the live 61K/43K
+            # amplification path)
             research_steps=(
                 ResearchStep(
                     kind="tool_call",
@@ -384,7 +388,9 @@ class TestBoundedPrompts:
                     name="fetch_page",
                     args={"url": url},
                 ),
+                ResearchStep(kind="text", text="done"),
             ),
+            settings_overrides={"max_tool_calls_per_research": 4},
             drafts=("LangGraph builds graphs, per [S1].",),
             expected=CaseExpectations(review_status="approved"),
         )

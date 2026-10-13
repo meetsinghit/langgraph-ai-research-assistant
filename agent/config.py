@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     # each source (where documentation intros live) and marks
     # the cut explicitly; the full text stays in state.
     max_evidence_chars: int = Field(default=6000, ge=500)
+    # Per-RESULT cap on MODEL-VISIBLE tool output: a tool result
+    # is serialized into a ToolMessage in the research transcript,
+    # so an oversized fetched page (up to max_page_bytes) would
+    # otherwise be re-sent to the provider on the next invocation
+    # (observed live: one 183K-character page = ~90% of a run's
+    # input tokens). Oversized payloads are reduced to
+    # query-relevant sections with an explicit marker; the metrics
+    # collector still records the REAL result size. Separate from
+    # max_evidence_chars (which budgets how findings are rendered
+    # into research/synthesis prompts).
+    max_tool_result_chars: int = Field(default=8000, ge=500)
     max_plan_queries: int = Field(default=4, ge=1)
     search_results_per_query: int = Field(default=5, ge=1)
     min_findings: int = Field(default=3, ge=1)

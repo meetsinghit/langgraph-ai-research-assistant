@@ -320,7 +320,12 @@ def run_case(
         rate_limit_retry_delay=0.0,
         metrics=metrics,
     )
+    # stamp the wall-clock start BEFORE the run so
+    # total_execution_seconds measures the actual run
+    metrics.begin_run()
     result = graph.invoke({"question": case.question})
+    # stamp finished_at / total_execution_seconds in the report
+    metrics.finish()
 
     deterministic = _deterministic_metrics(
         case, result, fake_tools, metrics, model

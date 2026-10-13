@@ -122,6 +122,17 @@ class TestRecording:
         assert snap["totals"]["model_calls"] == 0
         assert collector.run_id != old_run
 
+    def test_finish_stamps_completed_timing(self) -> None:
+        # finish() must guarantee a completed, non-negative span
+        # even when started_at was never accessed during the run
+        collector = MetricsCollector()
+        collector.record_node("research", 5.0)
+        collector.finish()
+        snap = collector.snapshot()
+        assert snap["finished_at"] is not None
+        assert snap["total_execution_seconds"] is not None
+        assert snap["total_execution_seconds"] >= 0
+
 
 class TestRedaction:
     """The collector must never store content, URLs or raw

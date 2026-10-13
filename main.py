@@ -68,6 +68,9 @@ def main(argv: list[str] | None = None) -> int:
     graph = build_research_graph(settings, model, tools, metrics=metrics)
 
     state: dict[str, Any] = {"question": args.question}
+    # stamp the wall-clock start BEFORE the run so the metrics
+    # report measures the actual execution, not snapshot latency
+    metrics.begin_run()
     for step in graph.stream({"question": args.question}):
         for node, updates in step.items():
             logger.info("node %s completed", node)
@@ -110,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.metrics:
         import json
 
+        metrics.finish()  # stamp finished_at + total execution time
         with open(args.metrics, "w", encoding="utf-8") as handle:
             json.dump(metrics.snapshot(), handle, indent=2)
         print(f"metrics report: {args.metrics}")
