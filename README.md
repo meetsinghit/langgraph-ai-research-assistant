@@ -61,6 +61,8 @@ python main.py "What is LangGraph?"
   gates)
 - `RUN_LIVE_TESTS=1 python -m pytest -m live` — opt-in live
   integration test (requires a configured provider key)
+- `cd frontend && npm run dev` — browser UI for the local server
+  (see **Web UI (Phase 4D.2)** below)
 
 ## Server API (Phase 4D.1)
 
@@ -132,6 +134,70 @@ the same DB files recovers the run):
 in any response or event, no raw exception text (type + coarse
 category only), no public bind, no TLS/multi-user auth (loopback
 POC scope, residual risk R8).
+
+## Web UI (Phase 4D.2)
+
+A browser front-end for the same API — three-region responsive
+layout (session history · conversation · sources/diagnostics),
+live SSE progress with resume-after-drop, safe markdown rendering,
+light/dark themes. React + TypeScript + Vite + Tailwind v4 in
+`frontend/`; it talks to the unmodified Phase 4D.1 backend.
+
+**Local development:**
+
+```bash
+# shell 1 — the backend (unchanged from 4D.1)
+python -m app.main                       # 127.0.0.1:8000
+
+# shell 2 — the UI
+cd frontend
+npm install                              # first time only
+npm run dev                              # http://127.0.0.1:5173
+```
+
+Open http://127.0.0.1:5173 and paste the access token from
+`data/app_token.txt` (bootstrapped on first backend start) or your
+`APP_TOKEN` value into the connection dialog.
+
+- **Same-origin proxy:** the Vite dev server proxies `/api` to
+  `http://127.0.0.1:8000`, so the browser only ever talks to one
+  origin — no CORS changes, no service worker, and the Bearer
+  header works on the SSE stream (plain `EventSource` cannot send
+  auth headers; the UI uses `fetch` streaming).
+- **Token handling:** the token lives **in memory only** (never
+  `localStorage`, URLs, or analytics) and is sent as
+  `Authorization: Bearer …`. Because it is memory-only, a page
+  refresh requires reconnecting — the UI says so explicitly. A 401
+  or unreachable backend surfaces a friendly reconnect prompt; the
+  backend's auth is never weakened or bypassed.
+- **Sessions:** created lazily on your first question; the title is
+  derived from the question (≤120 chars) because the API has no
+  title-update endpoint (documented contract workaround — no
+  backend change). Reopening a session is read-only (GETs); a
+  follow-up question starts a new run in the same session, and
+  citations are always scoped to the run that produced them.
+- **Interrupted runs:** a "Resume research" card appears only when
+  the backend reports the run as `interrupted` *and*
+  `resume_enabled: true` — with the caveat that resumed execution
+  may repeat the interrupted step.
+- **Safe rendering:** answers render as markdown with raw HTML
+  inert (no `rehype-raw`), `javascript:`/`data:` links stripped,
+  external links `noopener noreferrer`, and unknown `[S#]`
+  citations degrading to plain text.
+
+**Commands** (from `frontend/`; no network, no API keys):
+
+- `npm run typecheck` — `tsc --noEmit`
+- `npm test` — Vitest + React Testing Library + an in-memory MSW
+  backend (79 tests: auth/connection, conversation lifecycle, SSE
+  dedup/reconnect/backoff, progress/cancel/outcome states, resume
+  gating, panels/citations, safe markdown, a11y + drawers)
+- `npm run build` — production bundle into `frontend/dist`
+  (serving it with the API is packaging scope = Phase 4D.3)
+- `python ..\frontend\scripts\dump_api_fixtures.py` — regenerate
+  `frontend/src/test/fixtures/backend/*.json` from the real FastAPI
+  app after a backend contract change (`schemaCompat.test.ts` then
+  verifies the UI types still match reality)
 
 ## Architecture
 
@@ -509,6 +575,14 @@ AI_POC/
 │   ├── harness.py           offline runner + JSON report
 │   ├── compare.py           `python -m evals.compare` report diffing
 │   └── __main__.py          `python -m evals` CLI (--security flag)
+├── frontend/                Phase 4D.2 web UI (React + TS + Vite + Tailwind)
+│   ├── src/api/             typed API client + fetch-based SSE stream
+│   │                        (Bearer auth, Last-Event-ID reconnect, seq dedup)
+│   ├── src/lib/             timeline/citations/format/messages (pure fns)
+│   ├── src/state/           in-memory auth context + app store
+│   ├── src/components/      layout, conversation, panels, safe markdown
+│   ├── src/test/            Vitest + RTL + MSW suite + real-API fixtures
+│   └── scripts/             dump_api_fixtures.py (fixtures from real FastAPI)
 └── tests/                   mocked unit tests + opt-in live test
                              (tool schema, search recovery, deadline,
                              provider retries, compare — all offline;

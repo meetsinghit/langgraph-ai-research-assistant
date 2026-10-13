@@ -1,0 +1,224 @@
+/**
+ * Diagnostics tab: execution facts for the focused run, all numbers
+ * and fixed-vocabulary labels (the backend contract is content-free —
+ * this panel renders only what the API returns).
+ *
+ * Missing usage metadata (provider didn't report tokens, or no
+ * diagnostics were persisted for an unfinished run) is shown
+ * explicitly as "Not reported" — never fabricated.
+ */
+import type { DiagnosticsSnapshot, RunDetailOut } from "../api/types";
+import {
+  formatDuration,
+  formatNumber,
+  formatPercent,
+} from "../lib/format";
+import {
+  ERROR_CATEGORY_LABELS,
+  outcomeMessage,
+  reviewLabel,
+  statusLabel,
+} from "../lib/messages";
+import { Badge } from "./ui";
+
+function Row({
+  label,
+  value,
+  hint,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+}) {
+  return (
+    <div className="flex items-baseline justify-between gap-3 py-1">
+      <dt className="text-xs text-ink-muted">{label}</dt>
+      <dd className="text-right text-sm font-medium text-ink" title={hint}>
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section className="border-b border-border px-4 py-3 last:border-b-0">
+      <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-ink-muted">
+        {title}
+      </h3>
+      {children}
+    </section>
+  );
+}
+
+export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
+  const diagnostics: DiagnosticsSnapshot | null | undefined =
+    run.diagnostics;
+  const usage = diagnostics?.token_usage;
+  const totals = diagnostics?.totals;
+  const counts = diagnostics?.counts;
+  const security = diagnostics?.security;
+  const retries = diagnostics?.retries ?? [];
+
+  const hasUsageData =
+    run.tokens_in > 0 || run.tokens_out > 0 || (usage?.coverage_ratio ?? 0) > 0;
+
+  const coverageParts: string[] = [];
+  if (usage) {
+    coverageParts.push(`${usage.provider_reported_calls} reported`);
+    coverageParts.push(`${usage.estimated_calls} estimated`);
+    if (usage.unavailable_calls > 0) {
+      coverageParts.push(`${usage.unavailable_calls} unavailable`);
+    }
+  }
+
+  const refusalEntries = Object.entries(security?.tool_refusals ?? {});
+
+  return (
+    <div aria-label="Run diagnostics">
+      <Section title="Outcome">
+        <div className="flex flex-wrap items-center gap-2 py-1">
+          <Badge tone={run.status === "completed" ? "success" : run.status === "failed" ? "danger" : "neutral"}>
+            {statusLabel(run.status)}
+          </Badge>
+          {run.review_status && reviewLabel(run.review_status) && (
+            <Badge tone={run.review_status === "approved" ? "success" : "warning"}>
+              {reviewLabel(run.review_status)}
+            </Badge>
+          )}
+          {run.outcome_status && (
+            <Badge tone="accent">{run.outcome_status}</Badge>
+          )}
+        </div>
+        {run.error_category && (
+          <p className="py-1 text-xs text-danger">
+            {ERROR_CATEGORY_LABELS[run.error_category] ?? run.error_category}
+          </p>
+        )}
+        {run.outcome_warnings.length > 0 && (
+          <ul className="mt-1 list-inside list-disc text-xs text-warning">
+            {run.outcome_warnings.map((warning) => (
+              <li key={warning}>{warning.replace(/_/g, " ")}</li>
+            ))}
+          </ul>
+        )}
+        {run.outcome_status && outcomeMessage(run.outcome_status) && (
+          <p className="mt-1 text-xs text-ink-muted">
+            {outcomeMessage(run.outcome_status)}
+          </p>
+        )}
+      </Section>
+
+      <Section title="Execution">
+        <dl>
+          <Row label="Duration" value={formatDuration(run.total_execution_seconds)} />
+          <Row
+            label="Research iterations"
+            value={
+              run.iterations > 0 ? formatNumber(run.iterations) : "—"
+            }
+          />
+          <Row
+            label="Model calls"
+            value={totals?.model_calls != null ? formatNumber(totals.model_calls) : "—"}
+          />
+          <Row
+            label="Tool calls"
+            value={
+              totals?.tool_calls != null
+                ? formatNumber(totals.tool_calls)
+                : counts
+                  ? formatNumber((counts.searches ?? 0) + (counts.fetches ?? 0))
+                  : "—"
+            }
+          />
+        </dl>
+      </Section>
+
+      <Section title="Token usage">
+        {hasUsageData ? (
+          <dl>
+            <Row label="Input tokens" value={formatNumber(run.tokens_in)} />
+            <Row label="Output tokens" value={formatNumber(run.tokens_out)} />
+            <Row
+              label="Measurement coverage"
+              value={
+                usage?.coverage_ratio != null
+                  ? formatPercent(usage.coverage_ratio)
+                  : "—"
+              }
+              hint={coverageParts.join(" · ")}
+            />
+            {coverageParts.length > 0 && (
+              <p className="pt-1 text-[11px] text-ink-muted">
+                {coverageParts.join(" · ")}
+              </p>
+            )}
+          </dl>
+        ) : (
+          <p className="py-1 text-xs text-ink-muted">
+            Token usage was not reported by the provider for this run.
+          </p>
+        )}
+      </Section>
+
+      <Section title="Retrieval">
+        {counts ? (
+          <dl>
+            <Row label="Web searches" value={formatNumber(counts.searches)} />
+            <Row label="Pages fetched" value={formatNumber(counts.fetches)} />
+            <Row
+              label="Failed tool calls"
+              value={formatNumber(counts.failed_tool_calls)}
+            />
+          </dl>
+        ) : (
+          <p className="py-1 text-xs text-ink-muted">
+            Retrieval counters are available once the run finishes.
+          </p>
+        )}
+      </Section>
+
+      <Section title="Provider retries">
+        {retries.length > 0 ? (
+          <ul className="space-y-1 py-1">
+            {retries.map((retry, index) => (
+              <li key={index} className="text-xs text-ink-muted">
+                <span className="font-medium text-ink">{retry.node}</span>
+                {retry.iteration != null && retry.iteration > 0 && ` · pass ${retry.iteration}`} —{" "}
+                {retry.reason_category.replace(/_/g, " ")}
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p className="py-1 text-xs text-ink-muted">
+            No provider retries during this run.
+          </p>
+        )}
+      </Section>
+
+      <Section title="Security summary">
+        <dl>
+          <Row
+            label="Injection signals"
+            value={formatNumber(security?.injection_signals?.total ?? 0)}
+            hint="Content-free count of advisory signals in retrieved content"
+          />
+          <Row
+            label="Answer redactions"
+            value={formatNumber(security?.answer_redactions ?? 0)}
+          />
+        </dl>
+        {refusalEntries.length > 0 && (
+          <ul className="mt-1 list-inside list-disc text-xs text-warning">
+            {refusalEntries.map(([category, count]) => (
+              <li key={category}>
+                {count}× {ERROR_CATEGORY_LABELS[category] ?? category}
+              </li>
+            ))}
+          </ul>
+        )}
+      </Section>
+    </div>
+  );
+}

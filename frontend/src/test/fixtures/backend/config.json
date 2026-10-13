@@ -1,0 +1,12 @@
+{
+  "provider": "gemini",
+  "model": "gemini-3.8-flash",
+  "thinking_level": null,
+  "max_total_execution_seconds": 180.0,
+  "max_research_iterations": 2,
+  "max_tool_calls_per_research": 2,
+  "min_findings": 1,
+  "min_retrieved_sources": 1,
+  "max_concurrent_runs": 2,
+  "resume_enabled": false
+}
