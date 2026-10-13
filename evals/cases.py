@@ -158,7 +158,7 @@ _WS4_DRAFT = (
 
 
 def benchmark_cases() -> tuple[EvalCase, ...]:
-    """The ~20-case benchmark (deterministic, offline)."""
+    """The ~23-case benchmark (deterministic, offline)."""
     official = (
         "https://docs.langchain.com/oss/python/langgraph/overview"
     )
@@ -842,6 +842,74 @@ def benchmark_cases() -> tuple[EvalCase, ...]:
                     "conditional routing",
                     ("predicate", "edge", "branch"),
                 ),
+            ),
+        )
+    )
+
+    # 22 — WS-A: the model issues a legacy alias argument
+    # (``queries`` instead of the canonical ``query``). The
+    # executor's narrow, allow-listed normalization renames it
+    # (value untouched) and the search executes — if the alias
+    # normalization ever regresses, the call is refused as an
+    # invalid-arguments schema error, no findings are collected
+    # and this case fails.
+    cases.append(
+        EvalCase(
+            case_id="invalid-tool-args-recovery",
+            category="tool failure cases",
+            question="Explain LangGraph.",
+            search_results=(_result("Page", wiki_a),),
+            pages={wiki_a: "LangGraph builds graphs."},
+            research_steps=(
+                ResearchStep(
+                    kind="tool_call",
+                    name="web_search",
+                    args={"queries": "q"},
+                ),
+                ResearchStep(kind="text", text="done"),
+            ),
+            drafts="LangGraph builds graphs, per [S1].",
+            expected=CaseExpectations(
+                review_status="approved",
+                markers=["LangGraph builds graphs"],
+            ),
+        )
+    )
+
+    # 23 — WS-B: the first query returns no results (classified
+    # ``empty_results`` — the run must not crash or hang), and the
+    # model recovers by issuing a different query that succeeds.
+    # A regression in search-error classification/recovery breaks
+    # the run path and fails the case.
+    cases.append(
+        EvalCase(
+            case_id="search-failure-recovery",
+            category="tool failure cases",
+            question="Explain LangGraph.",
+            search_results=(_result("Page", wiki_a),),
+            pages={wiki_a: "LangGraph builds graphs."},
+            fail_queries=frozenset({"q"}),
+            research_steps=(
+                ResearchStep(
+                    kind="tool_call",
+                    name="web_search",
+                    args={"query": "q"},
+                ),
+                ResearchStep(
+                    kind="tool_call",
+                    name="web_search",
+                    args={"query": "langgraph"},
+                ),
+                ResearchStep(kind="text", text="done"),
+            ),
+            # two searches are needed (one fails, one succeeds):
+            # lift the per-pass search quota so the second call
+            # is in-phase rather than refused by the budget
+            settings_overrides={"max_tool_calls_per_research": 4},
+            drafts="LangGraph builds graphs, per [S1].",
+            expected=CaseExpectations(
+                review_status="approved",
+                markers=["LangGraph builds graphs"],
             ),
         )
     )

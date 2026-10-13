@@ -19,7 +19,7 @@ from evals.cases import (
     TopicRubric,
     benchmark_cases,
 )
-from evals.harness import run_benchmark, run_case
+from evals.harness import _case_settings, run_benchmark, run_case
 from evals.semantic import (
     RubricJudge,
     evaluate_semantics,
@@ -161,10 +161,14 @@ class TestDeterministicScoring:
     def test_budget_respected_in_every_case(self) -> None:
         for case in benchmark_cases():
             result = run_case(case)
+            # each pass must stay within THAT case's configured
+            # tool-call budget (a fixture may lift its own quota —
+            # e.g. the two-search recovery scenario — but never
+            # silently exceed the shared default of 2)
+            limit = _case_settings(case).max_tool_calls_per_research
             assert result.metrics["budget_compliant"], case.case_id
             assert (
-                result.metrics["max_tool_calls_per_pass"]
-                <= 2
+                result.metrics["max_tool_calls_per_pass"] <= limit
             ), case.case_id
 
 
@@ -319,15 +323,24 @@ class TestTokenAccounting:
     def test_structured_nodes_measure_prompt_but_not_tokens(
         self, result
     ) -> None:
-        # plan and review use with_structured_output: the parsed
-        # object replaces the AIMessage, so token usage is
-        # unobservable there by design — prompt size and latency
-        # are still captured.
+        # plan and review use with_structured_output: the offline
+        # scripted model reports no usage metadata for structured
+        # calls, so WS-E records honestly null (never a fake zero)
+        # and counts those calls as usage-unavailable. Prompt size
+        # and latency are still captured.
         by_node = result.metrics["tokens_by_node"]
         assert by_node["plan"]["prompt_chars"] > 0
         assert by_node["plan"]["input_tokens"] == 0
+        assert (
+            by_node["plan"]["usage_unavailable_calls"]
+            == by_node["plan"]["calls"]
+        )
         assert by_node["review"]["prompt_chars"] > 0
         assert by_node["review"]["input_tokens"] == 0
+        assert (
+            by_node["review"]["usage_unavailable_calls"]
+            == by_node["review"]["calls"]
+        )
 
     def test_per_call_entries_have_tokens_and_latency(
         self, result
@@ -338,9 +351,29 @@ class TestTokenAccounting:
             assert "latency_ms" in call
             assert "prompt_chars" in call
             assert "input_tokens" in call
+            assert "usage_source" in call
+            assert call["usage_source"] in (
+                "provider",
+                "estimated",
+                "unavailable",
+            )
+            # honest measurement state: a value or null — null means
+            # "not measured", never a fabricated zero
+            assert call["input_tokens"] is None or call["input_tokens"] >= 0
             assert "error_category" in call
-        assert any(c["input_tokens"] > 0 for c in calls)
+        measured = [
+            c for c in calls if c["input_tokens"] is not None
+        ]
+        assert any(c["input_tokens"] > 0 for c in measured)
+        assert any(c["input_tokens"] is None for c in calls)
         assert any(c["prompt_chars"] > 0 for c in calls)
+        coverage = result.run_metrics["token_usage"]
+        assert (
+            coverage["provider_reported_calls"]
+            + coverage["estimated_calls"]
+            + coverage["unavailable_calls"]
+            == len(calls)
+        )
 
     def test_rate_limit_retry_is_counted(self) -> None:
         case = next(

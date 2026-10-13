@@ -27,6 +27,12 @@ class ScriptedChatModel(BaseChatModel):
     responses: list[AIMessage] = Field(default_factory=list)
     structured_outputs: list[Any] = Field(default_factory=list)
     raise_on_call: dict[int, Exception] = Field(default_factory=dict)
+    #: structured (plan/review) invokes at these indices raise —
+    #: mirrors ``raise_on_call`` for the ``with_structured_output``
+    #: path so provider failures on structured nodes are testable.
+    structured_raise_on_call: dict[int, Exception] = Field(
+        default_factory=dict
+    )
     #: how ``with_structured_output`` replays once its
     #: scripted outputs are exhausted: "last" (default —
     #  repeats the final output) or "cycle" (wraps around,
@@ -39,6 +45,12 @@ class ScriptedChatModel(BaseChatModel):
     #: These are estimates from the fake, never provider
     #: usage; default False keeps existing tests untouched.
     synthesize_usage: bool = False
+    #: when True AND the caller asked for ``include_raw=True``,
+    #: the raw AIMessage of a structured result carries synthetic
+    #: usage_metadata — exercises the WS-E structured-usage
+    #: capture path offline (default False: usage is honestly
+    #: "unavailable", matching a provider that reports none).
+    structured_usage: bool = False
     call_index: int = 0
     structured_index: int = 0
     #: messages observed on each plain ``invoke`` — lets tests assert
@@ -99,6 +111,10 @@ class ScriptedChatModel(BaseChatModel):
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
         outputs = self.structured_outputs
+        # mirrors LangChain: include_raw=True returns
+        # {"raw", "parsed", "parsing_error"} instead of the bare
+        # parsed object (WS-E reads usage from "raw")
+        include_raw = bool(kwargs.get("include_raw"))
 
         def _invoke(messages: Any) -> Any:
             # recorded separately from seen_messages so tests can
@@ -106,14 +122,37 @@ class ScriptedChatModel(BaseChatModel):
             # shifting plain-invoke positional indices
             if isinstance(messages, list):
                 self.seen_structured_messages.append(list(messages))
+            index = self.structured_index
+            if self.structured_replay == "cycle" and outputs:
+                slot = index % len(outputs)
+            else:
+                slot = min(index, len(outputs) - 1) if outputs else 0
+            self.structured_index += 1
+            if index in self.structured_raise_on_call:
+                raise self.structured_raise_on_call[index]
             if not outputs:
                 raise RuntimeError("no scripted structured output available")
-            if self.structured_replay == "cycle" and outputs:
-                index = self.structured_index % len(outputs)
-            else:
-                index = min(self.structured_index, len(outputs) - 1)
-            self.structured_index += 1
-            return outputs[index]
+            parsed = outputs[slot]
+            if not include_raw:
+                return parsed
+            raw = AIMessage(content=f"[structured output] {parsed!r}")
+            if self.structured_usage:
+                input_tokens = max(1, len(str(messages)) // 4)
+                output_tokens = max(1, len(str(parsed)) // 4)
+                raw = raw.model_copy(
+                    update={
+                        "usage_metadata": {
+                            "input_tokens": input_tokens,
+                            "output_tokens": output_tokens,
+                            "total_tokens": input_tokens + output_tokens,
+                        }
+                    }
+                )
+            return {
+                "raw": raw,
+                "parsed": parsed,
+                "parsing_error": None,
+            }
 
         return RunnableLambda(_invoke)
 
@@ -181,3 +220,23 @@ class FakeTools:
         # stubs: the scripted model ignores schemas, but the graph
         # filters these by name to partition search/fetch phases.
         return [_StubTool("web_search"), _StubTool("fetch_page")]
+
+
+class FakeClock:
+    """Deterministic monotonic clock for deadline tests (WS-C).
+
+    Callable like ``time.monotonic`` (pass it to
+    ``build_research_graph(..., clock=clock)``); ``advance()``
+    moves time forward — a fake slow tool can call ``advance()``
+    when invoked to simulate an operation that overruns the budget,
+    with zero real sleeping.
+    """
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.now = float(start)
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += float(seconds)

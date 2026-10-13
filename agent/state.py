@@ -85,3 +85,10 @@ class GraphState(TypedDict, total=False):
     tokens_in: int
     tokens_out: int
     estimated_cost_usd: float
+    #: the run's shared global execution budget (an
+    #: agent.deadline.RunDeadline), stamped once per invocation by
+    #: the graph's ``start`` node — every node and retry consults it
+    deadline: Any
+    #: True once a guard/loop observed the global deadline expired;
+    #: routing uses it to terminate instead of starting new work
+    deadline_exceeded: bool

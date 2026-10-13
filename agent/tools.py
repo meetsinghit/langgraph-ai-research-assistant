@@ -32,9 +32,11 @@ from urllib.parse import urljoin, urlparse
 import httpx
 from ddgs import DDGS
 from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from agent.completeness import _requested_terms
 from agent.config import Settings
+from agent.deadline import RunDeadline
 from agent.metrics import categorize_error
 from agent.state import Finding
 
@@ -57,6 +59,38 @@ class UnsafeURLError(ToolError):
     """The URL (or a redirect target) was rejected by SSRF protection."""
 
 
+#: Search-failure taxonomy (fixed vocabulary — never error text).
+#: ddgs raises a GENERIC ``DDGSException`` both for "the index had
+#: nothing" and for engine-side HTTP failures, so class alone cannot
+#: separate them; see :func:`classify_search_failure`.
+SEARCH_ERROR_CATEGORIES = frozenset(
+    {
+        "empty_results",        # valid request, index returned nothing
+        "rate_limited",         # 429 / backend rate limit
+        "timeout",              # backend or network timeout
+        "upstream_unavailable", # 5xx / connection faults (transient)
+        "invalid_query",        # backend rejected the query (permanent)
+        "unknown",              # anything else — not retried blindly
+        "deadline",             # aborted: the run's global deadline hit
+    }
+)
+
+
+class SearchError(ToolError):
+    """A search failure carrying its taxonomy ``category``.
+
+    The executor records ``category`` (a fixed vocabulary) as the
+    metrics error category, so "no results" is never conflated with
+    "backend down" in operational reporting.
+    """
+
+    def __init__(self, message: str, *, category: str) -> None:
+        super().__init__(message)
+        if category not in SEARCH_ERROR_CATEGORIES:
+            raise ValueError(f"unknown search category: {category!r}")
+        self.category = category
+
+
 class SearchResult(TypedDict):
     """One web search result with verifiable provenance."""
 
@@ -73,6 +107,116 @@ class ToolResult(TypedDict):
     data: Any
     error: str | None
     args: dict[str, Any]
+
+
+# -- tool-call argument schemas (WS-A) ---------------------------------
+#
+# Live bug this fixes: Gemini called ``web_search(queries=...)`` while
+# the Python callable expected ``query``. The previous schema was
+# INFERRED from a bare closure signature with a vague description, so
+# the model had no explicit contract to follow. These Pydantic models
+# are advertised verbatim in the JSON schema the provider sees
+# (required fields, types, per-field descriptions) AND enforced before
+# execution, so a malformed call becomes one structured, actionable
+# tool error the model can correct — never a TypeError crash or a
+# silent reinterpretation.
+
+
+class WebSearchArgs(BaseModel):
+    """Explicit argument contract for ``web_search``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(
+        min_length=1,
+        description=(
+            "Search terms as ONE string, e.g. "
+            "'LangGraph checkpointers'. The argument name must be "
+            "'query' (not 'queries')."
+        ),
+    )
+
+
+class FetchPageArgs(BaseModel):
+    """Explicit argument contract for ``fetch_page``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(
+        description=(
+            "Full http(s) URL to fetch. The argument name must be "
+            "'url'."
+        ),
+    )
+
+
+TOOL_ARG_SCHEMAS: dict[str, type[BaseModel]] = {
+    "web_search": WebSearchArgs,
+    "fetch_page": FetchPageArgs,
+}
+
+#: Deterministic argument-NAME aliases: rename-only, allow-listed,
+#: applied only when the canonical field is absent. Decision (WS-A):
+#: normalizing ``queries`` -> ``query`` is justified because it is
+#: unambiguous (exactly one canonical target, one provided key), it
+#: reproduces an observed live mis-call, and the VALUE is passed
+#: through untouched — no type coercion, no invented arguments, no
+#: retry loop. Anything outside this table is rejected as a schema
+#: error so genuinely malformed calls stay visible instead of being
+#: silently "repaired".
+_ARG_ALIASES: dict[str, dict[str, str]] = {
+    "web_search": {"queries": "query", "search_query": "query"},
+    "fetch_page": {"page_url": "url", "target_url": "url"},
+}
+
+
+def _normalize_arg_names(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Apply the allow-listed rename-only aliases for ``tool``."""
+    aliases = _ARG_ALIASES.get(tool)
+    if not aliases:
+        return args
+    normalized = dict(args)
+    for alias, canonical in aliases.items():
+        if alias in normalized and canonical not in normalized:
+            logger.info(
+                "tool %s: normalized argument name %r -> %r "
+                "(value passed through unchanged)",
+                tool,
+                alias,
+                canonical,
+            )
+            normalized[canonical] = normalized.pop(alias)
+    return normalized
+
+
+def _schema_error_text(
+    tool: str,
+    schema: type[BaseModel],
+    exc: ValidationError,
+    provided: dict[str, Any],
+) -> str:
+    """One structured, actionable error for a malformed tool call.
+
+    Names and types only — values are summarized by the schema, never
+    echoed back at length.
+    """
+    details = "; ".join(
+        ".".join(str(part) for part in error.get("loc", ()))
+        + f": {error.get('msg', 'invalid')}"
+        for error in exc.errors()[:3]
+    )
+    properties = schema.model_json_schema().get("properties", {})
+    expected = (
+        "{"
+        + ", ".join(f"{name}: {spec.get('type', 'any')}" for name, spec in properties.items())
+        + "}"
+    )
+    names = sorted(str(key) for key in provided)[:5]
+    return (
+        f"invalid arguments for {tool}: {details}. "
+        f"Expected arguments {expected}; provided argument names {names}. "
+        f"Call {tool} again with the exact argument names."
+    )
 
 
 #: Actionable guidance appended to TLS failures. It never suggests
@@ -121,55 +265,150 @@ def _describe_http_failure(url: str, exc: Exception) -> str:
     return base
 
 
-def web_search(
-    query: str,
-    *,
-    max_results: int = 5,
-    timeout: float = 30.0,
-    ddgs_factory: Callable[..., Any] | None = None,
-) -> list[SearchResult]:
-    """Search the web via DuckDuckGo (free, no API key).
+#: Hard cap on backend queries per web_search tool call: the ladder
+#: is original -> site-filter removed -> terms simplified (<=3
+#: variants) and a transient failure may repeat the current variant
+#: exactly once. One tool call therefore costs at most 3 network
+#: requests, keeping recovery inside the existing tool-call budget.
+_MAX_SEARCH_ATTEMPTS = 3
 
-    Uses the maintained ``ddgs`` package. An empty result set is
-    a FAILURE to gather evidence, not evidence itself: it raises
-    ``ToolError`` so the caller (LLM) gets a meaningful message
-    and can retry with a different query, instead of silently
-    receiving a "successful" response with no data.
+#: Politeness pause before repeating a rate-limited request. Kept
+#: small on purpose; always clamped to the run's remaining global
+#: deadline budget (``RunDeadline.pause_budget``).
+_RATE_LIMIT_PAUSE_SECONDS = 1.5
+
+
+def classify_search_failure(exc: BaseException | str) -> str:
+    """Map a backend failure to the search-error taxonomy.
+
+    ddgs raises a generic ``DDGSException`` for three very different
+    situations — no results (message ``"No results found."``),
+    engine-side HTTP errors (message carries the status) and wrapped
+    transport faults — so exception class alone is insufficient;
+    well-known message markers are inspected (the same way ddgs
+    itself special-cases ``TimeoutException``). Returns one of
+    :data:`SEARCH_ERROR_CATEGORIES` — never the error text.
     """
-    if not query.strip():
-        raise ToolError("web_search: query must not be empty")
-    factory = ddgs_factory or DDGS
-    try:
-        with factory(timeout=timeout) as ddgs:
-            raw = ddgs.text(query, max_results=max_results)
-            if not raw:
-                broader = _without_site_filter(query)
-                if broader != query:
-                    # Site-restricted queries fail when the
-                    # index lacks that site: fall back once to
-                    # the unrestricted query instead of
-                    # returning nothing.
-                    logger.info(
-                        "web_search: no results for site-restricted "
-                        "query %r; retrying as %r",
-                        query,
-                        broader,
-                    )
-                    raw = ddgs.text(broader, max_results=max_results)
-    except ToolError:
-        raise
-    except Exception as exc:
-        # Provider errors and timeouts surface with their type
-        # and message so the LLM can react meaningfully.
-        raise ToolError(
-            f"web_search failed for query {query!r}: {type(exc).__name__}: {exc}"
-        ) from exc
+    if isinstance(exc, SearchError):
+        return exc.category
+    name = type(exc).__name__.lower()
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if "ratelimit" in name or "429" in text or "rate limit" in text or "too many requests" in text:
+        return "rate_limited"
+    if "timeout" in name or "timed out" in text or "timeout" in text:
+        return "timeout"
+    if "no results" in text:
+        return "empty_results"
+    if any(
+        marker in text
+        for marker in (
+            " 500",
+            " 502",
+            " 503",
+            " 504",
+            "http 5",
+            "bad gateway",
+            "service unavailable",
+            "unavailable",
+            "connection reset",
+            "connection aborted",
+            "temporarily",
+        )
+    ):
+        return "upstream_unavailable"
+    if any(
+        marker in text
+        for marker in ("400", "bad request", "invalid", "unsupported")
+    ):
+        return "invalid_query"
+    return "unknown"
 
+
+def _search_error_message(
+    category: str, query: str, detail: str
+) -> str:
+    """Actionable, model-facing error text per category.
+
+    Every message tells the LLM what to do next; none of them is
+    shown to metrics (only ``category`` is).
+    """
+    if category == "empty_results":
+        return (
+            f"web_search returned no results for query {query!r}. "
+            "Broaden the query: remove site: filters and overly "
+            "specific terms, or try different keywords."
+        )
+    if category == "timeout":
+        return (
+            f"web_search failed for query {query!r}: timed out "
+            f"({detail}). The search backend timed out — retry once "
+            "or simplify the query."
+        )
+    if category == "rate_limited":
+        return (
+            f"web_search failed for query {query!r}: rate limited by "
+            f"the search backend ({detail}). Wait briefly and retry "
+            "with fewer queries."
+        )
+    if category == "upstream_unavailable":
+        return (
+            f"web_search failed for query {query!r}: search backend "
+            f"temporarily unavailable ({detail}). Retry once shortly "
+            "or rephrase the query."
+        )
+    if category == "invalid_query":
+        return (
+            f"web_search failed for query {query!r}: the query was "
+            f"rejected as invalid ({detail}). Simplify it — drop "
+            "quotes and boolean operators."
+        )
+    if category == "deadline":
+        return (
+            "web_search skipped: the run's global execution deadline "
+            "has expired."
+        )
+    return f"web_search failed for query {query!r}: {detail}"
+
+
+def _search_variants(query: str) -> list[str]:
+    """Bounded query-transformation ladder for empty/invalid results.
+
+    1. the original query;
+    2. with ``site:`` filters removed (an index lacking that site
+       returns nothing — this was the original Phase 1 fallback);
+    3. with quoting/boolean operators stripped (free-text indexes
+       commonly reject them).
+
+    The tool NEVER invents new terms: alternative queries are the
+    planner/model's job, keeping recovery deterministic.
+    """
+    variants = [query]
+    broader = _without_site_filter(query)
+    if broader != query:
+        variants.append(broader)
+    simplified = _simplify_query(variants[-1])
+    if simplified and simplified != variants[-1]:
+        variants.append(simplified)
+    return variants[:_MAX_SEARCH_ATTEMPTS]
+
+
+def _simplify_query(query: str) -> str:
+    """Drop quoting and boolean/paren operators; keep every term."""
+    text = query.replace('"', " ").replace("'", " ")
+    text = re.sub(r"[(){}\[\]]", " ", text)
+    text = re.sub(
+        r"\b(AND|OR|NOT|NEAR)\b", " ", text, flags=re.IGNORECASE
+    )
+    return " ".join(text.split())
+
+
+def _map_search_results(raw: list[dict[str, Any]] | None) -> list[SearchResult]:
+    """Normalize backend items; results without a URL are dropped
+    (no verifiable provenance = not usable evidence)."""
     results: list[SearchResult] = []
     for item in raw or []:
         url = str(item.get("href") or item.get("url") or "").strip()
         if not url:
-            # A result without a URL has no verifiable provenance.
             continue
         results.append(
             {
@@ -178,13 +417,114 @@ def web_search(
                 "url": url,
             }
         )
-    if not results:
-        raise ToolError(
-            f"web_search returned no results for query {query!r}. "
-            "Broaden the query: remove site: filters and overly "
-            "specific terms, or try different keywords."
-        )
     return results
+
+
+def web_search(
+    query: str,
+    *,
+    max_results: int = 5,
+    timeout: float = 30.0,
+    ddgs_factory: Callable[..., Any] | None = None,
+    deadline: RunDeadline | None = None,
+    transient_pause: float = _RATE_LIMIT_PAUSE_SECONDS,
+) -> list[SearchResult]:
+    """Search the web via DuckDuckGo (free, no API key), with a
+    bounded, category-aware recovery ladder.
+
+    An empty result set is a FAILURE to gather evidence, not
+    evidence: the call raises :class:`SearchError` with a taxonomy
+    category so the caller (LLM) gets an actionable message and the
+    metrics collector records WHICH kind of failure occurred.
+
+    Recovery is bounded and category-driven:
+
+    - ``empty_results`` / ``invalid_query``  -> advance the query
+      transformation ladder (site-filter removal, operator stripping),
+      at most ``_MAX_SEARCH_ATTEMPTS`` backend calls total;
+    - ``timeout`` / ``rate_limited`` / ``upstream_unavailable``
+      -> repeat the SAME query exactly once (rate limits pause
+      ``transient_pause`` seconds first, clamped to the run's global
+      deadline budget);
+    - ``unknown`` -> no blind retry; surface the failure.
+
+    ``ddgs_factory`` is the backend seam (see
+    :class:`SearchBackendSession`): alternative providers plug in
+    behind the same factory contract without touching recovery logic.
+    """
+    if deadline is not None and deadline.expired():
+        raise SearchError(
+            "web_search skipped: the run's global execution deadline "
+            "has expired",
+            category="deadline",
+        )
+    if not query.strip():
+        raise SearchError(
+            "web_search: query must not be empty", category="invalid_query"
+        )
+    factory = ddgs_factory or DDGS
+    variants = _search_variants(query)
+
+    variant_index = 0
+    attempts = 0
+    transient_retry_used = False
+    last_category = "unknown"
+    last_detail = ""
+
+    while (
+        attempts < _MAX_SEARCH_ATTEMPTS
+        and variant_index < len(variants)
+    ):
+        if attempts and deadline is not None and deadline.expired():
+            break  # no new backend request after the deadline
+        attempts += 1
+        variant = variants[variant_index]
+        try:
+            with factory(timeout=timeout) as ddgs:
+                raw = ddgs.text(variant, max_results=max_results)
+            results = _map_search_results(raw)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            last_category = classify_search_failure(exc)
+            last_detail = f"{type(exc).__name__}: {exc}"
+            results = []
+        else:
+            if results:
+                if variant_index:
+                    logger.info(
+                        "web_search: recovered on attempt %d with a "
+                        "query variant (%d results)",
+                        attempts,
+                        len(results),
+                    )
+                return results
+            last_category = "empty_results"
+            last_detail = "the search index returned no results"
+
+        if last_category in ("empty_results", "invalid_query"):
+            variant_index += 1  # transform the query, bounded ladder
+            continue
+        if (
+            last_category
+            in ("timeout", "rate_limited", "upstream_unavailable")
+            and not transient_retry_used
+        ):
+            transient_retry_used = True
+            pause = (
+                transient_pause if last_category == "rate_limited" else 0.0
+            )
+            if deadline is not None:
+                pause = deadline.pause_budget(pause)
+                if deadline.expired():
+                    break
+            if pause > 0:
+                time.sleep(pause)
+            continue  # repeat the current variant exactly once
+        break  # unknown category, or the transient retry is spent
+
+    raise SearchError(
+        _search_error_message(last_category, query, last_detail),
+        category=last_category,
+    )
 
 
 def fetch_page(
@@ -195,6 +535,7 @@ def fetch_page(
     max_bytes: int = 1_000_000,
     max_redirects: int = 5,
     ca_bundle: str | None = None,
+    deadline: RunDeadline | None = None,
 ) -> str:
     """Retrieve a public webpage's text, enforcing SSRF and size limits.
 
@@ -203,7 +544,18 @@ def fetch_page(
     (every hop is validated manually) and a TLS context from
     :func:`build_ssl_context` — certificate verification is always
     on; ``ca_bundle`` selects an explicit CA bundle when given.
+
+    ``deadline`` (the run's global execution budget) is checked
+    before every redirect hop: no new request starts after the
+    deadline expires. The caller is expected to cap ``timeout`` by
+    the remaining budget (``ResearchTools.with_budget``), so both
+    in-flight time and hop count stay bounded by the global budget.
     """
+    if deadline is not None and deadline.expired():
+        raise ToolError(
+            f"fetch_page skipped for {url}: the run's global "
+            "execution deadline has expired"
+        )
     own_client = client is None
     if own_client:
         kwargs: dict[str, Any] = {
@@ -219,7 +571,11 @@ def fetch_page(
     try:
         try:
             return _fetch_with_client(
-                client, url, max_bytes=max_bytes, max_redirects=max_redirects
+                client,
+                url,
+                max_bytes=max_bytes,
+                max_redirects=max_redirects,
+                deadline=deadline,
             )
         except httpx.HTTPError as exc:
             raise ToolError(_describe_http_failure(url, exc)) from exc
@@ -234,9 +590,17 @@ def _fetch_with_client(
     *,
     max_bytes: int,
     max_redirects: int,
+    deadline: RunDeadline | None = None,
 ) -> str:
     current_url = url
     for _hop in range(max_redirects + 1):
+        if deadline is not None and deadline.expired():
+            # No new request after expiry (the in-flight hop, if any,
+            # was itself bounded by the capped timeout).
+            raise ToolError(
+                f"fetch_page aborted for {url}: the run's global "
+                "execution deadline has expired"
+            )
         _validate_url(current_url)
         request = client.build_request("GET", current_url)
         response = client.send(request, stream=True)
@@ -418,9 +782,22 @@ class ToolExecutor:
     """Explicit, validated tool execution — the graph's tool layer.
 
     The LLM proposes tool calls; this class dispatches them safely.
-    Unknown tools, non-object arguments and tool failures all become
-    controlled error results the LLM can react to — never exceptions
-    that crash the graph.
+    Unknown tools, non-object arguments, SCHEMA violations (missing
+    required fields, wrong types, unexpected keywords), tool failures
+    and search-taxonomy failures all become controlled error results
+    the LLM can react to — never exceptions that crash the graph.
+
+    Argument handling (WS-A):
+
+    1. allow-listed rename-only aliases are applied (``queries`` ->
+       ``query``) — values are never reinterpreted;
+    2. the tool's Pydantic schema is validated BEFORE execution, so
+       malformed calls fail fast with an actionable message;
+    3. ``SearchError.category`` (search taxonomy) is preserved as the
+       metrics error category; other exceptions fall back to
+       :func:`categorize_error` — schema errors land in
+       ``validation``, keeping them distinct from network/provider/
+       search failures.
 
     An optional :class:`~agent.metrics.MetricsCollector` records
     each execution's name/outcome/latency/result SIZE — never
@@ -432,10 +809,17 @@ class ToolExecutor:
         functions: dict[str, Callable[..., Any]],
         metrics: Any = None,
         node: str = "research",
+        *,
+        arg_schemas: dict[str, type[BaseModel]] | None = None,
     ):
         self._functions = functions
         self._metrics = metrics
         self._node = node
+        # ``None`` -> the built-in schemas; a dict (possibly empty)
+        # -> caller's explicit choice (tests inject unschemed tools).
+        self._arg_schemas = (
+            TOOL_ARG_SCHEMAS if arg_schemas is None else arg_schemas
+        )
 
     def execute(self, tool_call: dict[str, Any]) -> ToolResult:
         name = tool_call.get("name")
@@ -445,15 +829,29 @@ class ToolExecutor:
                 tool=str(name), ok=False, data=None,
                 error=f"unknown tool: {name!r}", args={},
             )
-            self._record(result, 0.0)
+            self._record(result, 0.0, error_category="validation")
             return result
         if not isinstance(args, dict):
             result = ToolResult(
                 tool=name, ok=False, data=None,
                 error="tool arguments must be an object", args={},
             )
-            self._record(result, 0.0)
+            self._record(result, 0.0, error_category="validation")
             return result
+        schema = self._arg_schemas.get(name)
+        if schema is not None:
+            normalized = _normalize_arg_names(name, args)
+            try:
+                validated = schema.model_validate(normalized)
+            except ValidationError as exc:
+                result = ToolResult(
+                    tool=name, ok=False, data=None,
+                    error=_schema_error_text(name, schema, exc, normalized),
+                    args=dict(args),
+                )
+                self._record(result, 0.0, error_category="validation")
+                return result
+            args = validated.model_dump()
         started = time.monotonic()
         try:
             data = self._functions[name](**args)
@@ -463,16 +861,29 @@ class ToolExecutor:
                 error=f"invalid arguments for {name}: {exc}",
                 args=dict(args),
             )
-            self._record(result, time.monotonic() - started)
+            self._record(
+                result, time.monotonic() - started,
+                error_category="validation",
+            )
             return result
         except Exception as exc:
+            # ToolErrors already carry their own actionable message
+            # (search taxonomy, SSRF, TLS) — pass it through verbatim
+            # instead of double-prefixing it. Structured errors keep
+            # their category: SearchError contributes its taxonomy
+            # value, everything else is categorized coarsely.
+            category = getattr(exc, "category", None) or categorize_error(exc)
+            error = (
+                str(exc)
+                if isinstance(exc, ToolError)
+                else f"tool {name} failed: {exc}"
+            )
             result = ToolResult(
-                tool=name, ok=False, data=None,
-                error=f"tool {name} failed: {exc}", args=dict(args),
+                tool=name, ok=False, data=None, error=error, args=dict(args)
             )
             self._record(
                 result, time.monotonic() - started,
-                error_category=categorize_error(exc),
+                error_category=category,
             )
             return result
         result = ToolResult(
@@ -519,12 +930,40 @@ class ResearchTools:
 
     def __init__(self, settings: Settings):
         self._settings = settings
+        #: Run-level execution budget (None outside graph runs):
+        #: gates tool-internal retries and redirect hops.
+        self._deadline: RunDeadline | None = None
+
+    def with_budget(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+        deadline: RunDeadline | None = None,
+    ) -> "ResearchTools":
+        """Per-run copy whose request timeouts are capped by the
+        remaining global budget and whose internal retries stop at
+        the run deadline. Returns a NEW instance so a shared,
+        graph-level toolset is never mutated across runs.
+        """
+        settings = self._settings
+        if timeout_seconds is not None:
+            # model_copy bypasses pydantic validation on purpose:
+            # the capped value may be far below the configured
+            # default and must stay usable (it is a runtime budget,
+            # not user configuration).
+            settings = settings.model_copy(
+                update={"request_timeout_seconds": timeout_seconds}
+            )
+        clone = ResearchTools(settings)
+        clone._deadline = deadline
+        return clone
 
     def web_search(self, query: str) -> list[SearchResult]:
         return web_search(
             query,
             max_results=self._settings.search_results_per_query,
             timeout=self._settings.request_timeout_seconds,
+            deadline=self._deadline,
         )
 
     def fetch_page(self, url: str) -> str:
@@ -534,6 +973,7 @@ class ResearchTools:
             max_bytes=self._settings.max_page_bytes,
             max_redirects=self._settings.max_redirects,
             ca_bundle=self._settings.ssl_ca_bundle,
+            deadline=self._deadline,
         )
 
     def tool_functions(self) -> dict[str, Callable[..., Any]]:
@@ -541,22 +981,37 @@ class ResearchTools:
         return {"web_search": self.web_search, "fetch_page": self.fetch_page}
 
     def langchain_tools(self) -> list[BaseTool]:
-        """LangChain tool wrappers (JSON schemas) exposed to the LLM."""
+        """LangChain tool wrappers exposed to the LLM.
+
+        Each wrapper advertises the EXPLICIT Pydantic argument schema
+        (``WebSearchArgs`` / ``FetchPageArgs``) instead of a schema
+        inferred from a bare closure signature — the model sees exact
+        argument names, required fields, types and descriptions
+        (WS-A). The executor enforces the same schemas before the
+        function runs, so provider and code can never disagree about
+        the contract.
+        """
 
         def search(query: str) -> list[dict[str, str]]:
-            """Search the web for a query. Returns results with titles, snippets and source URLs."""
+            """Search the web. REQUIRED ARGUMENTS: {"query": "<search terms as one string>"}. Returns results with titles, snippets and source URLs."""
             return list(self.web_search(query))
 
         def fetch(url: str) -> str:
-            """Fetch a public HTTP(S) webpage and return its text content."""
+            """Fetch a public HTTP(S) webpage and return its text content. REQUIRED ARGUMENTS: {"url": "<full http(s) URL>"}."""
             return self.fetch_page(url)
 
         return [
             StructuredTool.from_function(
-                name="web_search", description=search.__doc__, func=search
+                name="web_search",
+                description=search.__doc__,
+                func=search,
+                args_schema=WebSearchArgs,
             ),
             StructuredTool.from_function(
-                name="fetch_page", description=fetch.__doc__, func=fetch
+                name="fetch_page",
+                description=fetch.__doc__,
+                func=fetch,
+                args_schema=FetchPageArgs,
             ),
         ]
 

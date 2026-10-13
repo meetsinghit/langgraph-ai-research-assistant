@@ -7,6 +7,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from typing import Any
 
@@ -15,7 +16,7 @@ from agent.config import get_settings
 from agent.graph import build_research_graph
 from agent.llm import build_chat_model, verify_connection
 from agent.logging_config import setup_logging
-from agent.metrics import MetricsCollector
+from agent.metrics import MetricsCollector, categorize_error
 from agent.tools import ResearchTools
 
 
@@ -71,15 +72,37 @@ def main(argv: list[str] | None = None) -> int:
     # stamp the wall-clock start BEFORE the run so the metrics
     # report measures the actual execution, not snapshot latency
     metrics.begin_run()
-    for step in graph.stream({"question": args.question}):
-        for node, updates in step.items():
-            logger.info("node %s completed", node)
-            for key, value in (updates or {}).items():
-                if isinstance(value, list) and isinstance(state.get(key), list):
-                    state[key] = state[key] + value  # reducer semantics
-                else:
-                    state[key] = value
-            print(f"[{node}] {_summarize(updates)}")
+    try:
+        for step in graph.stream({"question": args.question}):
+            for node, updates in step.items():
+                logger.info("node %s completed", node)
+                for key, value in (updates or {}).items():
+                    if isinstance(value, list) and isinstance(
+                        state.get(key), list
+                    ):
+                        state[key] = state[key] + value  # reducer semantics
+                    else:
+                        state[key] = value
+                print(f"[{node}] {_summarize(updates)}")
+    except Exception as exc:
+        # Honest failure accounting: even an unhandled exception
+        # produces a terminal FAILED report — category only, never
+        # the exception text (it can echo the question, a URL or a
+        # page fragment).
+        logger.error(
+            "run failed with %s (category: %s)",
+            type(exc).__name__,
+            categorize_error(exc),
+        )
+        metrics.set_outcome(
+            "FAILED", warnings=["unhandled_exception"]
+        )
+        metrics.finish()
+        if args.metrics:
+            with open(args.metrics, "w", encoding="utf-8") as handle:
+                json.dump(metrics.snapshot(), handle, indent=2)
+            print(f"metrics report: {args.metrics}", file=sys.stderr)
+        raise
 
     print()
     print("=== ANSWER ===")
@@ -110,12 +133,22 @@ def main(argv: list[str] | None = None) -> int:
         print("estimated cost: n/a for this model")
     else:
         print(f"estimated cost: ${cost:.4f}")
+    # terminal accounting (WS-F): stamp timing, then report the run
+    # outcome — COMPLETED / COMPLETED_WITH_WARNINGS / INCOMPLETE /
+    # TIMED_OUT / FAILED with content-free warning labels
+    metrics.finish()
+    report = metrics.snapshot()
+    outcome = report.get("outcome") or {}
+    status = outcome.get("status", "UNSPECIFIED")
+    warnings = outcome.get("warnings") or []
+    suffix = f" [{', '.join(warnings)}]" if warnings else ""
+    print(f"run outcome: {status}{suffix}")
+    total = report.get("total_execution_seconds")
+    if total is not None:
+        print(f"execution time: {total:.2f}s")
     if args.metrics:
-        import json
-
-        metrics.finish()  # stamp finished_at + total execution time
         with open(args.metrics, "w", encoding="utf-8") as handle:
-            json.dump(metrics.snapshot(), handle, indent=2)
+            json.dump(report, handle, indent=2)
         print(f"metrics report: {args.metrics}")
     return 0
 

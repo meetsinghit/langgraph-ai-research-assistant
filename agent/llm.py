@@ -35,6 +35,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -239,6 +241,170 @@ def estimate_cost(
     if model in _FREE_TIER_MODELS:
         return 0.0
     return None
+
+
+# ---------------------------------------------------------------------------
+# Provider failure classification (WS-D)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ProviderFailure:
+    """A classified provider error: fixed-vocabulary ``category``,
+    whether it is safe to retry, and the provider's ``Retry-After``
+    hint in seconds when observable (never the raw error text)."""
+
+    category: str
+    retryable: bool
+    retry_after: float | None = None
+
+
+#: Fixed vocabulary for provider failures (WS-D). Metrics record the
+#: category, never the message.
+PROVIDER_FAILURE_CATEGORIES = (
+    "rate_limit",       # 429 / quota exhaustion — retryable
+    "unavailable",      # 503 / overloaded — retryable
+    "internal",         # 500/502/504 — retryable
+    "timeout",          # request deadline — retryable once
+    "network",          # transient connection faults — retryable
+    "invalid_request",  # 400/malformed request — permanent, no retry
+    "auth",             # 401/403/bad key — permanent, no retry
+    "unknown",          # unrecognised — NOT retried blindly
+)
+
+_RETRY_AFTER_RE = re.compile(
+    r"retry[- ]after[^0-9]{0,40}(\d+(?:\.\d+)?)", re.IGNORECASE
+)
+
+
+def _retry_after_seconds(
+    exc: BaseException, text: str
+) -> float | None:
+    """Provider Retry-After hint, best effort: an exception attribute
+    first, then the well-known header/phrase in the message."""
+    value = getattr(exc, "retry_after", None)
+    if value is not None:
+        try:
+            return max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    match = _RETRY_AFTER_RE.search(text)
+    if match:
+        return max(0.0, float(match.group(1)))
+    return None
+
+
+def classify_provider_error(exc: BaseException) -> ProviderFailure:
+    """Classify a model-invocation failure for retry decisions.
+
+    Deterministic, message-marker based (integrations wrap SDK
+    exceptions inconsistently, so class checks alone are unreliable):
+
+    - retryable: ``rate_limit``, ``unavailable``, ``internal``,
+      ``timeout``, ``network`` — these get bounded exponential
+      backoff with jitter, honouring Retry-After when present;
+    - permanent: ``auth``, ``invalid_request`` — NEVER retried (a
+      bad key or malformed request fails identically every time);
+    - ``unknown`` — not retried: an unrecognised failure could be
+      anything, and blind retries on an unknown error multiply load
+      without evidence of transience.
+
+    Combined with SDK retries being disabled at construction
+    (``max_retries=1``), exactly ONE layer performs retries.
+    """
+    name = type(exc).__name__.lower()
+    text = f"{type(exc).__name__}: {exc}".lower()
+
+    if any(
+        marker in text
+        for marker in (
+            "401",
+            "403",
+            "api key",
+            "api_key",
+            "unauthenticated",
+            "unauthorized",
+            "unauthorised",
+            "permission denied",
+            "permission_denied",
+            "invalid authentication",
+        )
+    ):
+        return ProviderFailure("auth", False)
+    if any(
+        marker in text
+        for marker in (
+            "400",
+            "404",
+            "bad request",
+            "badrequest",
+            "invalid_argument",
+            "invalid argument",
+            "invalid value",
+            "invalid name",
+            "invalid tool",
+            "unsupported",
+        )
+    ):
+        return ProviderFailure("invalid_request", False)
+    if any(
+        marker in text
+        for marker in (
+            "429",
+            "rate limit",
+            "ratelimit",
+            "too many requests",
+            "resource exhausted",
+            "quota",
+        )
+    ):
+        return ProviderFailure(
+            "rate_limit", True, _retry_after_seconds(exc, text)
+        )
+    if any(
+        marker in text
+        for marker in (
+            "503",
+            "unavailable",
+            "overloaded",
+            "try again later",
+        )
+    ):
+        return ProviderFailure(
+            "unavailable", True, _retry_after_seconds(exc, text)
+        )
+    if any(
+        marker in text
+        for marker in ("500", "502", "504", "internal error", "internal server")
+    ):
+        return ProviderFailure(
+            "internal", True, _retry_after_seconds(exc, text)
+        )
+    if (
+        "timeout" in name
+        or "timed out" in text
+        or "timeout" in text
+        or "deadline" in text
+    ):
+        return ProviderFailure(
+            "timeout", True, _retry_after_seconds(exc, text)
+        )
+    if any(
+        marker in text
+        for marker in (
+            "connection",
+            "transport",
+            "broken pipe",
+            "reset by peer",
+            "unreachable",
+            "temporarily disconnected",
+            "dns",
+        )
+    ):
+        return ProviderFailure(
+            "network", True, _retry_after_seconds(exc, text)
+        )
+    return ProviderFailure("unknown", False)
 
 
 def verify_connection(

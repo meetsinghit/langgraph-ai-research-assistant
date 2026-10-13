@@ -9,8 +9,17 @@ construction):
   timings;
 - error information is reduced to a coarse category
   (``rate_limit`` / ``tls`` / ``ssrf`` / ``provider`` /
-  ``tool`` / ``validation`` / ``unknown``), never the raw
-  error text (which can echo a URL, a question or a snippet);
+  ``tool`` / ``validation`` / ``deadline`` / ``unknown``),
+  never the raw error text (which can echo a URL, a question
+  or a snippet); search failures additionally carry their
+  taxonomy category (``empty_results`` / ``timeout`` / ...);
+- token counts distinguish WHAT WAS MEASURED: a model call
+  that reported usage contributes its provider-reported
+  numbers; a call whose usage was not observable records
+  ``null`` tokens with ``usage_source: "unavailable"`` —
+  unmeasured usage is NEVER reported as a genuine zero, and
+  ``token_usage.coverage`` states how much of the run is
+  actually measured;
 - the snapshot is JSON-serializable so it can be written to
   a per-run report without further transformation.
 
@@ -22,9 +31,28 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
-__all__ = ["MetricsCollector", "categorize_error"]
+__all__ = [
+    "MetricsCollector",
+    "RunOutcome",
+    "categorize_error",
+]
+
+#: Outcome taxonomy for a completed run (WS-F). Computed by the
+#: graph's terminal nodes, never guessed from partial data:
+#: COMPLETED, COMPLETED_WITH_WARNINGS, INCOMPLETE, TIMED_OUT, FAILED
+#: (+ UNSPECIFIED when no terminal node ran — e.g. the caller never
+#: let the graph finish).
+RunOutcome = (
+    "COMPLETED",
+    "COMPLETED_WITH_WARNINGS",
+    "INCOMPLETE",
+    "TIMED_OUT",
+    "FAILED",
+    "UNSPECIFIED",
+)
+_OUTCOMES = frozenset(RunOutcome)
 
 
 def categorize_error(exc: BaseException | str) -> str:
@@ -40,6 +68,8 @@ def categorize_error(exc: BaseException | str) -> str:
         return "tls"
     if "non-public" in text or "private" in text or "unsafe" in text:
         return "ssrf"
+    if "execution deadline" in text or "deadline has expired" in text:
+        return "deadline"
     if "unknown tool" in text or "invalid arguments" in text or "must be an object" in text:
         return "validation"
     if "llm provider" in text or "provider failed" in text:
@@ -51,15 +81,25 @@ def categorize_error(exc: BaseException | str) -> str:
 
 @dataclass
 class ModelCallMetrics:
-    """One model invocation (size, not content)."""
+    """One model invocation (size, not content).
+
+    ``input_tokens``/``output_tokens`` are ``None`` when the
+    provider did not report usage for this call (structured-output
+    calls without raw-message access, failed attempts). ``None`` is
+    JSON ``null`` — deliberately distinct from a measured zero.
+    ``usage_source`` says where any number came from:
+    ``provider`` (actually reported), ``estimated`` (only when
+    estimation is explicitly enabled), ``unavailable``.
+    """
 
     node: str
     iteration: int | None
     invocation: int
     latency_ms: float
-    input_tokens: int
-    output_tokens: int
-    prompt_chars: int
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    prompt_chars: int = 0
+    usage_source: str = "unavailable"
     error_category: str | None = None
 
 
@@ -118,6 +158,14 @@ class MetricsCollector:
         default_factory=list, init=False
     )
     _iteration: int | None = field(default=None, init=False)
+    # -- WS-C / WS-F run-level reporting ----------------------------
+    _deadline_seconds: float | None = field(default=None, init=False)
+    _deadline_exceeded: bool = field(default=False, init=False)
+    _outcome: str | None = field(default=None, init=False)
+    _outcome_warnings: tuple[str, ...] = field(
+        default_factory=tuple, init=False
+    )
+    _quality: dict[str, Any] | None = field(default=None, init=False)
 
     # -- lifecycle ------------------------------------------------
 
@@ -143,10 +191,65 @@ class MetricsCollector:
         self._nodes.clear()
         self._retries.clear()
         self._iteration = None
+        self._deadline_seconds = None
+        self._deadline_exceeded = False
+        self._outcome = None
+        self._outcome_warnings = ()
+        self._quality = None
 
     def set_iteration(self, iteration: int | None) -> None:
         """Current research iteration (context for later events)."""
         self._iteration = iteration
+
+    # -- run-level reporting (WS-C / WS-F) ---------------------------
+
+    def record_deadline(self, total_seconds: float) -> None:
+        """Stamp the run's configured global execution budget."""
+        self._deadline_seconds = float(total_seconds)
+
+    def mark_deadline_exceeded(self) -> None:
+        """A node observed the global deadline as expired."""
+        self._deadline_exceeded = True
+
+    def set_outcome(
+        self, status: str, warnings: Iterable[str] = ()
+    ) -> None:
+        """Terminal run status (see :data:`RunOutcome`).
+
+        Warnings are content-free labels: the caller's (state-derived)
+        ones first, then what the collector itself observed
+        (``tool_failures``, ``provider_retries``,
+        ``partial_token_coverage`` — mixed measured/unmeasured calls).
+        Deterministic upgrade rule: COMPLETED carrying any warning
+        becomes COMPLETED_WITH_WARNINGS, so a run with failed tools or
+        retries can never be reported as a clean COMPLETED.
+        """
+        if status not in _OUTCOMES:
+            raise ValueError(f"unknown run outcome: {status!r}")
+        merged: list[str] = list(dict.fromkeys(warnings))
+        if any(not c.ok for c in self._tool_calls):
+            merged.append("tool_failures")
+        if self._retries:
+            merged.append("provider_retries")
+        reported = sum(
+            1
+            for call in self._model_calls
+            if call.input_tokens is not None
+            or call.output_tokens is not None
+        )
+        if reported and reported < len(self._model_calls):
+            merged.append("partial_token_coverage")
+        if status == "COMPLETED" and merged:
+            status = "COMPLETED_WITH_WARNINGS"
+        self._outcome = status
+        self._outcome_warnings = tuple(dict.fromkeys(merged))
+
+    def set_quality(self, **fields: Any) -> None:
+        """Content-free quality summary (booleans, counts, enum
+        strings — never text, URLs or topic names)."""
+        summary = dict(self._quality or {})
+        summary.update(fields)
+        self._quality = summary
 
     # -- recording ------------------------------------------------
 
@@ -155,11 +258,23 @@ class MetricsCollector:
         node: str,
         *,
         latency_ms: float,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
         prompt_chars: int = 0,
         error_category: str | None = None,
+        usage_source: str | None = None,
     ) -> None:
+        """Record one model invocation.
+
+        Omitting ``input_tokens``/``output_tokens`` means the usage
+        was NOT measured — the call records ``null`` with
+        ``usage_source: "unavailable"`` instead of a fake zero.
+        Passing numbers without an explicit source means the provider
+        reported them (``provider``); estimation must pass
+        ``usage_source="estimated"`` so reports never confuse the
+        two.
+        """
+        measured = input_tokens is not None or output_tokens is not None
         self._model_calls.append(
             ModelCallMetrics(
                 node=node,
@@ -169,6 +284,8 @@ class MetricsCollector:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 prompt_chars=prompt_chars,
+                usage_source=usage_source
+                or ("provider" if measured else "unavailable"),
                 error_category=error_category,
             )
         )
@@ -225,8 +342,23 @@ class MetricsCollector:
 
     def snapshot(self) -> dict[str, Any]:
         """JSON-safe metrics report (sizes and counts only)."""
-        total_in = sum(call.input_tokens for call in self._model_calls)
-        total_out = sum(call.output_tokens for call in self._model_calls)
+        # The usage-source triad partitions every call: provider
+        # (actually reported), estimated (explicitly labelled) and
+        # unavailable (never measured — null, not zero).
+        provider_calls = [
+            call
+            for call in self._model_calls
+            if call.usage_source == "provider"
+        ]
+        estimated_calls = [
+            call
+            for call in self._model_calls
+            if call.usage_source == "estimated"
+        ]
+        measured = provider_calls + estimated_calls
+        unavailable_calls = len(self._model_calls) - len(measured)
+        total_in = sum(call.input_tokens or 0 for call in measured)
+        total_out = sum(call.output_tokens or 0 for call in measured)
         by_node: dict[str, dict[str, Any]] = {}
         for call in self._model_calls:
             entry = by_node.setdefault(
@@ -235,17 +367,28 @@ class MetricsCollector:
                     "calls": 0,
                     "input_tokens": 0,
                     "output_tokens": 0,
+                    "usage_unavailable_calls": 0,
                     "prompt_chars": 0,
                     "latency_ms": 0.0,
                 },
             )
             entry["calls"] += 1
-            entry["input_tokens"] += call.input_tokens
-            entry["output_tokens"] += call.output_tokens
+            if call.input_tokens is None and call.output_tokens is None:
+                entry["usage_unavailable_calls"] += 1
+            entry["input_tokens"] += call.input_tokens or 0
+            entry["output_tokens"] += call.output_tokens or 0
             entry["prompt_chars"] += call.prompt_chars
             entry["latency_ms"] += call.latency_ms
         searches = [c for c in self._tool_calls if c.tool == "web_search"]
         fetches = [c for c in self._tool_calls if c.tool == "fetch_page"]
+        failed_searches = [c for c in searches if not c.ok]
+        failed_fetches = [c for c in fetches if not c.ok]
+
+        # Outcome: status + fully merged warning labels (explicit
+        # state-derived ones and collector-observed ones were merged
+        # deterministically by set_outcome).
+        warnings = list(self._outcome_warnings)
+
         return {
             "run_id": self.run_id,
             "started_at": self.started_at,
@@ -255,6 +398,14 @@ class MetricsCollector:
                 if self._finished_at
                 else None
             ),
+            "outcome": {
+                "status": self._outcome or "UNSPECIFIED",
+                "warnings": warnings,
+            },
+            "deadline": {
+                "configured_seconds": self._deadline_seconds,
+                "exceeded": self._deadline_exceeded,
+            },
             "totals": {
                 "input_tokens": total_in,
                 "output_tokens": total_out,
@@ -263,6 +414,21 @@ class MetricsCollector:
                 "retries": len(self._retries),
                 "prompt_chars": sum(
                     call.prompt_chars for call in self._model_calls
+                ),
+            },
+            "token_usage": {
+                "input_tokens": total_in,
+                "output_tokens": total_out,
+                "provider_reported_calls": len(provider_calls),
+                "estimated_calls": len(estimated_calls),
+                "unavailable_calls": unavailable_calls,
+                "coverage_ratio": (
+                    round(len(measured) / len(self._model_calls), 3)
+                    if self._model_calls
+                    else 0.0
+                ),
+                "sources": _count_by(
+                    call.usage_source for call in self._model_calls
                 ),
             },
             "tokens_by_node": by_node,
@@ -275,6 +441,7 @@ class MetricsCollector:
                     "input_tokens": c.input_tokens,
                     "output_tokens": c.output_tokens,
                     "prompt_chars": c.prompt_chars,
+                    "usage_source": c.usage_source,
                     "error_category": c.error_category,
                 }
                 for c in self._model_calls
@@ -302,6 +469,18 @@ class MetricsCollector:
             "counts": {
                 "searches": len(searches),
                 "fetches": len(fetches),
+                "failed_searches": len(failed_searches),
+                "failed_fetches": len(failed_fetches),
+                "search_success_rate": (
+                    round((len(searches) - len(failed_searches)) / len(searches), 3)
+                    if searches
+                    else None
+                ),
+                "fetch_success_rate": (
+                    round((len(fetches) - len(failed_fetches)) / len(fetches), 3)
+                    if fetches
+                    else None
+                ),
                 "failed_tool_calls": sum(
                     1 for c in self._tool_calls if not c.ok
                 ),
@@ -309,6 +488,7 @@ class MetricsCollector:
                     c.error_category for c in self._tool_calls if not c.ok
                 ),
             },
+            "quality": self._quality,
             "retries": [
                 {
                     "node": r.node,

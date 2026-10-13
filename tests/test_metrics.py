@@ -27,6 +27,8 @@ class TestCategorizeError:
             ("tool arguments must be an object", "validation"),
             ("llm provider failed", "provider"),
             ("provider failed with 500", "provider"),
+            ("execution deadline of 180s exhausted", "deadline"),
+            ("global execution deadline has expired", "deadline"),
             ("something inexplicable", "unknown"),
         ],
     )
@@ -213,3 +215,151 @@ class TestRedaction:
         assert "rate_limit" in dumped
         assert "api.example.com" not in dumped
         assert "abc123" not in dumped
+
+
+class TestTokenHonestyAndOutcome:
+    """WS-E / WS-F: unmeasured usage stays null (never a fake zero),
+    coverage is reported, and the terminal outcome follows the
+    COMPLETED / COMPLETED_WITH_WARNINGS / INCOMPLETE / TIMED_OUT /
+    FAILED taxonomy with deterministic warning merging."""
+
+    def test_unmeasured_usage_is_null_with_unavailable_source(self) -> None:
+        collector = MetricsCollector()
+        collector.record_model_call("plan", latency_ms=1.0, prompt_chars=90)
+
+        snap = collector.snapshot()
+        call = snap["model_calls"][0]
+        assert call["input_tokens"] is None
+        assert call["output_tokens"] is None
+        assert call["usage_source"] == "unavailable"
+        usage = snap["token_usage"]
+        assert usage["provider_reported_calls"] == 0
+        assert usage["unavailable_calls"] == 1
+        assert usage["coverage_ratio"] == 0.0
+        # totals sum only measured values — they never fabricate zeros
+        assert usage["input_tokens"] == 0
+
+    def test_provider_reported_and_estimated_sources_are_distinguished(
+        self,
+    ) -> None:
+        collector = MetricsCollector()
+        collector.record_model_call(
+            "research", latency_ms=1.0, input_tokens=100,
+            output_tokens=20,
+        )
+        collector.record_model_call(
+            "synthesize", latency_ms=1.0, input_tokens=50,
+            output_tokens=10, usage_source="estimated",
+        )
+
+        usage = collector.snapshot()["token_usage"]
+        # the triad partitions every call — estimated usage is never
+        # passed off as provider-reported
+        assert usage["provider_reported_calls"] == 1
+        assert usage["estimated_calls"] == 1
+        assert usage["unavailable_calls"] == 0
+        assert usage["coverage_ratio"] == 1.0
+        assert usage["sources"] == {"provider": 1, "estimated": 1}
+        # totals include measured values of both kinds
+        assert usage["input_tokens"] == 150
+
+    def test_clean_run_stays_completed_without_warnings(self) -> None:
+        collector = MetricsCollector()
+        collector.record_model_call(
+            "research", latency_ms=1.0, input_tokens=10,
+            output_tokens=5,
+        )
+        collector.set_outcome("COMPLETED")
+
+        snap = collector.snapshot()
+        assert snap["outcome"]["status"] == "COMPLETED"
+        assert snap["outcome"]["warnings"] == []
+
+    def test_completed_with_observations_upgrades_to_with_warnings(
+        self,
+    ) -> None:
+        collector = MetricsCollector()
+        collector.record_model_call(
+            "research", latency_ms=1.0, input_tokens=10,
+            output_tokens=5,
+        )
+        collector.record_tool_call(
+            "research", "web_search", ok=False, latency_ms=2.0,
+            error_category="timeout",
+        )
+        collector.record_retry("research", "unavailable")
+        collector.set_outcome("COMPLETED")
+
+        outcome = collector.snapshot()["outcome"]
+        assert outcome["status"] == "COMPLETED_WITH_WARNINGS"
+        assert "tool_failures" in outcome["warnings"]
+        assert "provider_retries" in outcome["warnings"]
+
+    def test_mixed_token_coverage_is_a_warning_not_a_silent_gap(
+        self,
+    ) -> None:
+        collector = MetricsCollector()
+        collector.record_model_call(
+            "research", latency_ms=1.0, input_tokens=10,
+        )
+        collector.record_model_call("plan", latency_ms=1.0)  # unmeasured
+        collector.set_outcome("COMPLETED")
+
+        outcome = collector.snapshot()["outcome"]
+        assert outcome["status"] == "COMPLETED_WITH_WARNINGS"
+        assert "partial_token_coverage" in outcome["warnings"]
+
+    def test_worse_statuses_keep_warnings_but_do_not_upgrade(
+        self,
+    ) -> None:
+        collector = MetricsCollector()
+        collector.set_outcome("TIMED_OUT", warnings=["state_errors"])
+
+        outcome = collector.snapshot()["outcome"]
+        assert outcome["status"] == "TIMED_OUT"
+        assert "state_errors" in outcome["warnings"]
+
+    def test_unknown_outcome_status_is_rejected(self) -> None:
+        collector = MetricsCollector()
+        with pytest.raises(ValueError, match="unknown run outcome"):
+            collector.set_outcome("WORKED_SORT_OF")
+
+    def test_deadline_and_quality_surface_in_snapshot(self) -> None:
+        collector = MetricsCollector()
+        collector.record_deadline(180.0)
+        collector.mark_deadline_exceeded()
+        collector.set_quality(
+            citations_ok=True,
+            coverage_ok=False,
+            review_status="needs_more_research",
+            retrieved_sources=2,
+            snippet_sources=1,
+        )
+
+        snap = collector.snapshot()
+        assert snap["deadline"] == {
+            "configured_seconds": 180.0,
+            "exceeded": True,
+        }
+        assert snap["quality"]["citations_ok"] is True
+        assert snap["quality"]["coverage_ok"] is False
+        assert snap["quality"]["retrieved_sources"] == 2
+        # booleans/counts/enum strings only — no text, no URLs
+        assert isinstance(snap["quality"]["review_status"], str)
+
+    def test_begin_run_resets_outcome_deadline_and_quality(self) -> None:
+        collector = MetricsCollector()
+        collector.record_deadline(180.0)
+        collector.mark_deadline_exceeded()
+        collector.set_outcome("FAILED", warnings=["state_errors"])
+        collector.set_quality(citations_ok=False)
+
+        collector.begin_run()
+        snap = collector.snapshot()
+        assert snap["deadline"] == {
+            "configured_seconds": None,
+            "exceeded": False,
+        }
+        assert snap["outcome"]["status"] == "UNSPECIFIED"
+        assert snap["outcome"]["warnings"] == []
+        assert snap["quality"] is None

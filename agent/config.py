@@ -55,8 +55,35 @@ class Settings(BaseSettings):
     # Wall-clock budget PER RESEARCH PASS: every pass gets its own
     # budget. The full run is bounded by max_research_iterations x
     # this value, plus plan/synthesize/review LLM calls, which this
-    # limit does NOT cover.
+    # limit does NOT cover — see max_total_execution_seconds for the
+    # end-to-end budget that DOES cover those.
     max_execution_seconds: float = Field(default=120.0, gt=0)
+    # END-TO-END execution deadline for ONE graph run (WS-C),
+    # covering plan + research + tools + synthesize + review +
+    # retries + finalization. Separate from (and stricter than)
+    # max_execution_seconds: one monotonic deadline is stamped at
+    # run start; no new operation starts after it expires. A call
+    # already in flight cannot be cancelled (sync architecture), so
+    # actual overrun is bounded by the in-flight operation — tool
+    # request timeouts are capped by the remaining budget; provider
+    # request timeouts are fixed at client construction (documented
+    # limitation). Keep it >= max_execution_seconds so a single
+    # research pass can finish within the global budget.
+    max_total_execution_seconds: float = Field(default=180.0, gt=0)
+
+    # -- provider retry policy (WS-D) ----------------------------------
+    # Retries AFTER the first attempt, applied only to failures
+    # classified retryable (429/quota, 5xx, timeout, transient
+    # network). Auth and invalid-request errors are never retried.
+    # Default 1 preserves the historical rate-limit behaviour.
+    # SDK-level retries stay disabled (max_retries=1 at provider
+    # construction, see agent/llm.py) so the layers never multiply.
+    llm_max_retries: int = Field(default=1, ge=0, le=6)
+    # Upper bound for ONE backoff sleep (exponential base doubles per
+    # retry; provider Retry-After wins over the computed backoff but
+    # is still clamped by this bound). Every sleep is additionally
+    # clamped to the remaining global deadline budget.
+    retry_backoff_max_seconds: float = Field(default=30.0, gt=0)
     max_redirects: int = Field(default=5, ge=1)
     max_page_bytes: int = Field(default=1_000_000, ge=1)
     # Per-SOURCE character cap for evidence embedded in model

@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import time
 from typing import Any, Callable, Literal
 
@@ -87,7 +88,8 @@ from agent.completeness import (
     format_completeness_report,
 )
 from agent.config import Settings
-from agent.llm import content_to_text, estimate_cost
+from agent.deadline import RunDeadline
+from agent.llm import classify_provider_error, content_to_text, estimate_cost
 from agent.metrics import MetricsCollector, categorize_error
 from agent.routing import (
     ROUTE_ERROR,
@@ -564,14 +566,15 @@ def _research_prompt(
     return "\n\n".join(parts)
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    text = f"{type(exc).__name__}: {exc}".lower()
-    return (
-        "429" in text
-        or "rate limit" in text
-        or "ratelimit" in text
-        or "too many requests" in text
-    )
+def _retry_kwargs(settings: Settings, state: GraphState) -> dict[str, Any]:
+    """Retry-policy context every node passes to
+    :func:`_invoke_with_retry`: the run's shared global deadline plus
+    the bounded, configurable attempt/backoff budget (WS-C / WS-D)."""
+    return {
+        "deadline": state.get("deadline"),
+        "max_retries": settings.llm_max_retries,
+        "backoff_max": settings.retry_backoff_max_seconds,
+    }
 
 
 def _prompt_chars(messages: list[BaseMessage]) -> int:
@@ -594,55 +597,100 @@ def _invoke_with_retry(
     metrics: Any = None,
     node: str = "research",
     iteration: int | None = None,
-) -> AIMessage:
-    """Invoke the model, retrying once after a rate-limit error.
+    deadline: RunDeadline | None = None,
+    max_retries: int = 1,
+    backoff_max: float = 30.0,
+    sleep: Callable[[float], None] | None = None,
+    rng: Callable[[], float] | None = None,
+) -> Any:
+    """Invoke the model with bounded, category-aware retries (WS-D).
 
-    Records per-invocation metrics — latency, token counts and
-    prompt SIZE (character counts, never message content).
-    Structured-output invocations (plan/review) cannot report
-    token counts: LangChain's ``with_structured_output``
-    returns the parsed object and discards the underlying
-    AIMessage, so their usage is unknown (recorded as 0).
+    - only failures :func:`~agent.llm.classify_provider_error` marks
+      RETRYABLE are retried (429/quota, 5xx, timeout, transient
+      network); auth and invalid-request fail immediately and
+      unknown errors are never retried blindly;
+    - the attempt budget is ``1 + max_retries`` (``LLM_MAX_RETRIES``);
+      backoff starts at ``retry_delay``, doubles per retry, is
+      jittered in ``[0.5x, 1.5x)`` and clamped to ``backoff_max``;
+      a provider ``Retry-After`` hint replaces the computed backoff
+      (still clamped by ``backoff_max``);
+    - every sleep is clamped to the remaining GLOBAL deadline budget
+      and no retry starts once that deadline has expired;
+    - SDK-level retries are disabled at provider construction, so
+      this is the only retry layer — the two never multiply;
+    - every attempt (failed or not) is recorded with its category;
+      usage comes from ``usage_metadata`` (plain messages) or the
+      ``raw`` message of an ``include_raw`` structured result, and
+      stays ``None``/"unavailable" when the provider did not report
+      it — never a fabricated zero.
+
+    Returns the raw result: an ``AIMessage`` for plain invocations or
+    the ``{"raw", "parsed", "parsing_error"}`` dict for structured
+    ones.
     """
+    sleep_fn = sleep if sleep is not None else time.sleep
+    random_fn = rng if rng is not None else random.random
     started = time.monotonic()
     if metrics is not None:
         metrics.set_iteration(iteration)
-    try:
-        response = model.invoke(messages)
-    except Exception as exc:
-        if _is_rate_limit_error(exc):
-            logger.warning(
-                "rate limit hit; retrying once after %.1fs",
-                retry_delay,
-            )
+    attempt = 0
+    while True:
+        try:
+            response = model.invoke(messages)
+            break
+        except Exception as exc:
+            failure = classify_provider_error(exc)
             if metrics is not None:
-                # the failed attempt is still an invocation:
-                # record it (with its category) so every attempt
-                # appears in the per-call accounting, then the
-                # retry itself
+                # every attempt (failed or not) is an invocation:
+                # record it with its CATEGORY so retries and their
+                # causes stay observable without any error text
                 metrics.record_model_call(
                     node,
                     latency_ms=(time.monotonic() - started) * 1000.0,
                     prompt_chars=_prompt_chars(messages),
-                    error_category=categorize_error(exc),
+                    error_category=failure.category,
                 )
-                metrics.record_retry(node, categorize_error(exc))
-            if retry_delay > 0:
-                time.sleep(retry_delay)
+            deadline_ok = deadline is None or not deadline.expired()
+            can_retry = (
+                failure.retryable and attempt < max_retries and deadline_ok
+            )
+            if not can_retry:
+                if (
+                    failure.retryable
+                    and attempt < max_retries
+                    and not deadline_ok
+                ):
+                    logger.warning(
+                        "global deadline expired; not retrying %s "
+                        "provider failure",
+                        failure.category,
+                    )
+                raise
+            attempt += 1
+            if metrics is not None:
+                metrics.record_retry(node, failure.category)
+            if failure.retry_after is not None:
+                # provider guidance wins over the computed backoff
+                delay = failure.retry_after
+            else:
+                delay = retry_delay * (2 ** (attempt - 1))
+                delay *= 0.5 + random_fn()  # jitter decorrelates clients
+            delay = min(delay, backoff_max)
+            if deadline is not None:
+                delay = deadline.pause_budget(delay)
+            logger.warning(
+                "%s provider failure (retry %d/%d); retrying in %.2fs",
+                failure.category,
+                attempt,
+                max_retries,
+                delay,
+            )
+            if delay > 0:
+                sleep_fn(delay)
             # restart the clock so the successful retry's latency
             # is not inflated by the failed attempt + backoff
             started = time.monotonic()
-            response = model.invoke(messages)
-        else:
-            if metrics is not None:
-                metrics.record_model_call(
-                    node,
-                    latency_ms=(time.monotonic() - started) * 1000.0,
-                    prompt_chars=_prompt_chars(messages),
-                    error_category=categorize_error(exc),
-                )
-            raise
-    delta_in, delta_out = _usage_delta(response)
+    delta_in, delta_out = _response_usage(response)
     if metrics is not None:
         metrics.record_model_call(
             node,
@@ -661,13 +709,55 @@ def _usage_delta(response: AIMessage) -> tuple[int, int]:
     return usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
 
 
+def _response_usage(response: Any) -> tuple[int | None, int | None]:
+    """Provider-reported usage, honest about absence.
+
+    Handles plain messages and ``include_raw`` structured results
+    (WS-E): returns ``(None, None)`` when no usage was reported —
+    the metrics collector then records ``null`` with
+    ``usage_source: "unavailable"`` instead of a fake zero. A usage
+    block that exists but omits a field is a measured zero.
+    """
+    message = response
+    if isinstance(response, dict):
+        message = response.get("raw")
+    usage = getattr(message, "usage_metadata", None)
+    if not usage:
+        return None, None
+    return int(usage.get("input_tokens") or 0), int(
+        usage.get("output_tokens") or 0
+    )
+
+
+def _structured_parsed(result: Any) -> Any:
+    """Parsed object from an ``include_raw`` structured result.
+
+    Falls back to the bare object when an integration ignored
+    ``include_raw`` (documented degradation: usage then reads as
+    unavailable — never fabricated).
+    """
+    if isinstance(result, dict) and ("raw" in result or "parsed" in result):
+        return result.get("parsed")
+    return result
+
+
 def make_plan_node(
     settings: Settings,
     model: BaseChatModel,
     metrics: MetricsCollector | None = None,
+    *,
+    rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
 ) -> Node:
-    """LLM decomposes the question into search queries."""
-    planner = model.with_structured_output(ResearchPlan)
+    """LLM decomposes the question into search queries.
+
+    Structured output uses ``include_raw=True`` (WS-E): the parsed
+    plan comes from ``parsed`` while provider-reported token usage is
+    read from the ``raw`` message — captured when the provider
+    reports it, honestly ``unavailable`` when not. Provider failures
+    get the same bounded, category-aware retries (and global-deadline
+    clamping) as research and synthesis calls.
+    """
+    planner = model.with_structured_output(ResearchPlan, include_raw=True)
 
     def plan_node(state: GraphState) -> dict[str, Any]:
         question = state["question"]
@@ -675,34 +765,48 @@ def make_plan_node(
             SystemMessage(content=_PLAN_SYSTEM),
             HumanMessage(content=question),
         ]
-        started = time.monotonic()
         try:
-            plan = planner.invoke(messages)
-            queries = [
-                query.strip()
-                for query in plan.queries
-                if query and query.strip()
-            ]
+            result = _invoke_with_retry(
+                planner,
+                messages,
+                rate_limit_retry_delay,
+                metrics=metrics,
+                node="plan",
+                **_retry_kwargs(settings, state),
+            )
         except Exception as exc:
             # Graceful degradation: the raw question is always a usable query.
             logger.warning(
                 "plan generation failed (%s); falling back to the raw question", exc
             )
             queries = [question]
-        if metrics is not None:
-            # Structured output: token usage is not observable
-            # here (the parsed object replaces the AIMessage);
-            # latency and prompt size still are.
-            metrics.record_model_call(
-                "plan",
-                latency_ms=(time.monotonic() - started) * 1000.0,
-                prompt_chars=_prompt_chars(messages),
-            )
+        else:
+            plan = _structured_parsed(result)
+            if plan is None or not isinstance(plan, ResearchPlan):
+                # missing OR wrong-typed parse (an integration can
+                # hand back garbage without raising) — same honest
+                # degradation as a raising parse error
+                logger.warning(
+                    "plan structured output missing or unparseable; "
+                    "falling back to the raw question"
+                )
+                queries = [question]
+            else:
+                queries = [
+                    query.strip()
+                    for query in plan.queries
+                    if query and query.strip()
+                ]
         update: dict[str, Any] = {"research_plan": queries[: settings.max_plan_queries]}
         logger.info("plan created: %d query(ies)", len(update["research_plan"]))
         return update
 
-    return plan_node
+    return _deadline_guarded(
+        "plan",
+        plan_node,
+        metrics,
+        extra={"errors": ["global execution deadline expired before planning"]},
+    )
 
 
 def _model_visible_tool_result(
@@ -781,9 +885,6 @@ def make_research_node(
     NEXT candidate when an earlier fetch failed. Every check
     respects the per-pass wall-clock budget.
     """
-    executor = ToolExecutor(
-        tools.tool_functions(), metrics=metrics, node="research"
-    )
     executable = tools.tool_functions()
     all_tools = tools.langchain_tools()
     max_calls = settings.max_tool_calls_per_research
@@ -792,6 +893,34 @@ def make_research_node(
     verify_required = settings.min_retrieved_sources > 0
 
     def research_node(state: GraphState) -> dict[str, Any]:
+        deadline = state.get("deadline")
+        if deadline is not None and deadline.expired():
+            # WS-C: no new work starts after the global deadline — a
+            # controlled skip whose error the routers act on (route
+            # short-circuits on the flag, so no further pass runs).
+            message = (
+                "global execution deadline expired before research "
+                "could start"
+            )
+            logger.warning(message)
+            if metrics is not None:
+                metrics.mark_deadline_exceeded()
+            return {"deadline_exceeded": True, "errors": [message]}
+        # Per-pass tool budget (WS-C): request timeouts are capped by
+        # the REMAINING global budget and tool-internal retries stop
+        # at the deadline. ``with_budget`` returns a fresh copy — the
+        # graph-level toolset is never mutated across runs.
+        budget_tools: Any = tools
+        if deadline is not None and hasattr(tools, "with_budget"):
+            budget_tools = tools.with_budget(
+                timeout_seconds=deadline.timeout_budget(
+                    settings.request_timeout_seconds
+                ),
+                deadline=deadline,
+            )
+        executor = ToolExecutor(
+            budget_tools.tool_functions(), metrics=metrics, node="research"
+        )
         iteration = state.get("iteration", 0) + 1
         update: dict[str, Any] = {"iteration": iteration}
         if metrics is not None:
@@ -894,6 +1023,17 @@ def make_research_node(
                     logger.warning(message)
                     update["errors"] = [message]
                     return
+                if deadline is not None and deadline.expired():
+                    message = (
+                        "global execution deadline expired during "
+                        "verification"
+                    )
+                    logger.warning(message)
+                    update["errors"] = [message]
+                    update["deadline_exceeded"] = True
+                    if metrics is not None:
+                        metrics.mark_deadline_exceeded()
+                    return
                 pending = [url for url in candidates() if url not in attempted_urls]
                 if not pending:
                     return
@@ -923,6 +1063,17 @@ def make_research_node(
                 logger.warning(message)
                 update["errors"] = [message]
                 break
+            if deadline is not None and deadline.expired():
+                message = (
+                    "global execution deadline expired during research; "
+                    "stopping this pass"
+                )
+                logger.warning(message)
+                update["errors"] = [message]
+                update["deadline_exceeded"] = True
+                if metrics is not None:
+                    metrics.mark_deadline_exceeded()
+                break
             allowed = allowed_now()
             if not allowed:
                 logger.info(
@@ -946,6 +1097,7 @@ def make_research_node(
                     metrics=metrics,
                     node="research",
                     iteration=iteration,
+                    **_retry_kwargs(settings, state),
                 )
             except Exception as exc:
                 provider_error = f"LLM provider failed: {type(exc).__name__}: {exc}"
@@ -983,6 +1135,26 @@ def make_research_node(
                     )
                     logger.warning(message)
                     update["errors"] = [message]
+                    messages.append(
+                        ToolMessage(
+                            content=f"not executed: {message}",
+                            tool_call_id=tool_call.get("id") or "",
+                        )
+                    )
+                    continue
+                if deadline is not None and deadline.expired():
+                    # WS-C: never START another tool call after the
+                    # global deadline; still answer the call so the
+                    # provider transcript stays valid.
+                    message = (
+                        "global execution deadline expired before a "
+                        "scheduled tool call"
+                    )
+                    logger.warning(message)
+                    update["errors"] = [message]
+                    update["deadline_exceeded"] = True
+                    if metrics is not None:
+                        metrics.mark_deadline_exceeded()
                     messages.append(
                         ToolMessage(
                             content=f"not executed: {message}",
@@ -1032,9 +1204,13 @@ def make_research_node(
                     searches_done += 1
                 elif name == "fetch_page":
                     fetches_done += 1
-                    args = tool_call.get("args")
-                    if isinstance(args, dict) and args.get("url"):
-                        attempted_urls.add(str(args["url"]))
+                    # Use the EXECUTOR's validated args (alias-
+                    # normalized, schema-checked) so a mis-named
+                    # ``page_url`` still marks the URL attempted and
+                    # force_verify does not re-fetch it.
+                    executed = result.get("args") or {}
+                    if executed.get("url"):
+                        attempted_urls.add(str(executed["url"]))
                 logger.info(
                     "tool %s -> %s",
                     result["tool"],
@@ -1106,6 +1282,7 @@ def make_synthesize_node(
                 rate_limit_retry_delay,
                 metrics=metrics,
                 node="synthesize",
+                **_retry_kwargs(settings, state),
             )
         except Exception as exc:
             error = f"synthesis failed: {type(exc).__name__}: {exc}"
@@ -1193,13 +1370,42 @@ def make_synthesize_node(
             update["estimated_cost_usd"] = cost
         return update
 
-    return synthesize_node
+    return _deadline_guarded("synthesize", synthesize_node, metrics)
+
+
+def _quality_summary(
+    report: Any,
+    completeness: Any,
+    official_status: OfficialSourceStatus,
+    status: ReviewStatus,
+    findings: list[Finding],
+) -> dict[str, Any]:
+    """Content-free quality summary for the metrics report (WS-F).
+
+    Booleans, counts and enum strings only — never the citation
+    reasons, the missing topic names or any source URL (the
+    redaction guarantee holds for quality data too).
+    """
+    retrieved = sum(
+        1 for finding in findings if finding.get("evidence") == "retrieved"
+    )
+    return {
+        "citations_ok": bool(report.ok),
+        "coverage_ok": bool(completeness.ok),
+        "official_status": official_status.value,
+        "review_status": status.value,
+        "missing_topics": len(completeness.missing),
+        "retrieved_sources": retrieved,
+        "snippet_sources": len(findings) - retrieved,
+    }
 
 
 def make_review_node(
     settings: Settings,
     model: BaseChatModel,
     metrics: MetricsCollector | None = None,
+    *,
+    rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
 ) -> Node:
     """LLM quality gate: is the evidence sufficient?
 
@@ -1216,8 +1422,13 @@ def make_review_node(
     finalizes the already-labeled answer). None of these checks
     proves factual correctness — they only verify provenance,
     coverage and official-source retrieval.
+
+    Structured output uses ``include_raw=True`` (WS-E) so the
+    provider's token usage for this call is captured (or honestly
+    marked unavailable), and the deterministic check outcomes are
+    mirrored into the metrics quality summary (content-free).
     """
-    verifier = model.with_structured_output(ReviewVerdict)
+    verifier = model.with_structured_output(ReviewVerdict, include_raw=True)
 
     def review_node(state: GraphState) -> dict[str, Any]:
         findings = state.get("findings") or []
@@ -1244,69 +1455,220 @@ def make_review_node(
                 )
             ),
         ]
-        started = time.monotonic()
         try:
-            verdict = verifier.invoke(messages)
-            if metrics is not None:
-                # Structured output: token usage is not
-                # observable here; latency and prompt size
-                # still are.
-                metrics.record_model_call(
-                    "review",
-                    latency_ms=(time.monotonic() - started) * 1000.0,
-                    prompt_chars=_prompt_chars(messages),
-                )
-            status = (
-                ReviewStatus.APPROVED
-                if verdict.status == "approved"
-                else ReviewStatus.NEEDS_MORE_RESEARCH
+            result = _invoke_with_retry(
+                verifier,
+                messages,
+                rate_limit_retry_delay,
+                metrics=metrics,
+                node="review",
+                **_retry_kwargs(settings, state),
             )
-            logger.info("review: %s (%s)", status.value, verdict.reason)
-            failed_checks: list[str] = []
-            if not report.ok:
-                failed_checks.append("citation validation")
-            if not completeness.ok:
-                failed_checks.append("topic coverage")
-            if official_status in (
-                OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY,
-                OfficialSourceStatus.NO_OFFICIAL_SOURCE,
-            ):
-                # An explicitly official-documentation question must
-                # not pass as an unqualified APPROVED when no official
-                # page was retrieved — regardless of the reviewer.
-                failed_checks.append("official-source retrieval")
-            if status == ReviewStatus.APPROVED and failed_checks:
-                logger.warning(
-                    "quality gate: overriding approved -> "
-                    "needs_more_research (failed: %s)",
-                    ", ".join(failed_checks),
-                )
-                status = ReviewStatus.NEEDS_MORE_RESEARCH
-            return {"review_status": status}
         except Exception as exc:
             # Fail-safe: a failed review must never silently restart research.
             error = f"review failed: {type(exc).__name__}: {exc}"
             logger.error(error)
+            if metrics is not None:
+                metrics.set_quality(
+                    **_quality_summary(
+                        report,
+                        completeness,
+                        official_status,
+                        ReviewStatus.FAILED,
+                        findings,
+                    )
+                )
             return {"review_status": ReviewStatus.FAILED, "errors": [error]}
+        verdict = _structured_parsed(result)
+        if verdict is None or not isinstance(verdict, ReviewVerdict):
+            # include_raw keeps parsing failures explicit instead of
+            # raising from deep inside the integration; a wrong-typed
+            # "parsed" value is treated exactly like a parse failure.
+            error = (
+                "review failed: structured verdict missing or unparseable"
+            )
+            logger.error(error)
+            if metrics is not None:
+                metrics.set_quality(
+                    **_quality_summary(
+                        report,
+                        completeness,
+                        official_status,
+                        ReviewStatus.FAILED,
+                        findings,
+                    )
+                )
+            return {"review_status": ReviewStatus.FAILED, "errors": [error]}
+        status = (
+            ReviewStatus.APPROVED
+            if verdict.status == "approved"
+            else ReviewStatus.NEEDS_MORE_RESEARCH
+        )
+        logger.info("review: %s (%s)", status.value, verdict.reason)
+        failed_checks: list[str] = []
+        if not report.ok:
+            failed_checks.append("citation validation")
+        if not completeness.ok:
+            failed_checks.append("topic coverage")
+        if official_status in (
+            OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY,
+            OfficialSourceStatus.NO_OFFICIAL_SOURCE,
+        ):
+            # An explicitly official-documentation question must
+            # not pass as an unqualified APPROVED when no official
+            # page was retrieved — regardless of the reviewer.
+            failed_checks.append("official-source retrieval")
+        if status == ReviewStatus.APPROVED and failed_checks:
+            logger.warning(
+                "quality gate: overriding approved -> "
+                "needs_more_research (failed: %s)",
+                ", ".join(failed_checks),
+            )
+            status = ReviewStatus.NEEDS_MORE_RESEARCH
+        if metrics is not None:
+            metrics.set_quality(
+                **_quality_summary(
+                    report, completeness, official_status, status, findings
+                )
+            )
+        return {"review_status": status}
 
-    return review_node
+    return _deadline_guarded("review", review_node, metrics)
 
 
-def make_finalize_node() -> Node:
-    """Terminal pass-through: the final answer is already in state."""
+def _run_outcome(
+    *, deadline_hit: bool, answer: bool, review: ReviewStatus | None
+) -> str:
+    """Deterministic run outcome (WS-F taxonomy).
+
+    TIMED_OUT outranks everything (the run stopped early — even if
+    an answer exists, it was not fully processed). FAILED covers no
+    answer / failed review. COMPLETED requires an approved verdict;
+    a budget-spent ``needs_more_research`` (answer labeled but the
+    gate was not satisfied) is INCOMPLETE. ``set_outcome`` upgrades
+    COMPLETED to COMPLETED_WITH_WARNINGS when observed warnings
+    (tool failures, provider retries, mixed token coverage) exist.
+    """
+    if deadline_hit:
+        return "TIMED_OUT"
+    if not answer or review == ReviewStatus.FAILED:
+        return "FAILED"
+    if review == ReviewStatus.APPROVED:
+        return "COMPLETED"
+    return "INCOMPLETE"
+
+
+def _partial_deadline_answer(
+    state: GraphState, findings: list[Finding]
+) -> str:
+    """Honest partial result after a global-deadline stop (WS-C).
+
+    Preserves the PROVENANCE gathered before the deadline without
+    synthesizing any claim: synthesis/review never ran, so this
+    lists sources only and says so explicitly.
+    """
+    sources = list(state.get("sources") or [])
+    if not sources:
+        seen: set[str] = set()
+        for finding in findings:
+            url = str(finding.get("source_url") or "")
+            if url and url not in seen:
+                seen.add(url)
+                sources.append(url)
+    lines = [
+        "Research exceeded the global execution time budget and did "
+        "not complete a verified answer.",
+        "",
+        "Sources gathered before the deadline:",
+    ]
+    lines.extend(f"- {url}" for url in sources)
+    if not sources:
+        lines.append("- none")
+    lines.append("")
+    lines.append(
+        "This partial result lists provenance only. Synthesis and "
+        "quality review did not run before the deadline, so no "
+        "claims were generated."
+    )
+    return "\n".join(lines)
+
+
+def make_finalize_node(
+    settings: Settings | None = None,
+    metrics: MetricsCollector | None = None,
+) -> Node:
+    """Terminal node: passes the answer through and records the
+    run's OUTCOME (WS-F).
+
+    Deadline semantics (WS-C): when the global deadline expired
+    before an answer existed, the run is TIMED_OUT and the sources
+    gathered before the deadline are preserved as a partial result —
+    provenance only. An answer that already exists is kept
+    untouched (the run is still reported TIMED_OUT: the quality
+    gates after the answer did not complete).
+    """
 
     def finalize_node(state: GraphState) -> dict[str, Any]:
-        return {}
+        deadline_hit = bool(state.get("deadline_exceeded"))
+        answer = state.get("final_answer", "")
+        review = state.get("review_status")
+        findings = state.get("findings") or []
+        update: dict[str, Any] = {}
+        if deadline_hit and not answer:
+            update["final_answer"] = _partial_deadline_answer(
+                state, findings
+            )
+            logger.warning(
+                "global deadline expired with %d finding(s) and no "
+                "answer; returning provenance only",
+                len(findings),
+            )
+        if metrics is not None:
+            warnings: list[str] = []
+            if state.get("errors"):
+                warnings.append("state_errors")
+            if review == ReviewStatus.NEEDS_MORE_RESEARCH:
+                warnings.append("review_wanted_more_research")
+            metrics.set_outcome(
+                _run_outcome(
+                    deadline_hit=deadline_hit,
+                    answer=bool(answer or update.get("final_answer")),
+                    review=review,
+                ),
+                warnings=warnings,
+            )
+            retrieved = sum(
+                1
+                for finding in findings
+                if finding.get("evidence") == "retrieved"
+            )
+            metrics.set_quality(
+                retrieved_sources=retrieved,
+                snippet_sources=len(findings) - retrieved,
+            )
+        return update
 
     return finalize_node
 
 
-def make_error_node() -> Node:
-    """Controlled failure: a clear, readable error as the answer."""
+def make_error_node(metrics: MetricsCollector | None = None) -> Node:
+    """Controlled failure: a clear, readable error as the answer.
+
+    Also stamps the terminal outcome (WS-F): a run that stopped
+    because the global deadline expired is TIMED_OUT, every other
+    controlled failure is FAILED. ``handle_error`` routes straight
+    to END, so this node is the only place that outcome can be
+    recorded for error runs.
+    """
 
     def error_node(state: GraphState) -> dict[str, Any]:
         errors = state.get("errors") or []
         detail = "; ".join(errors) if errors else "unknown error"
+        if metrics is not None:
+            metrics.set_outcome(
+                "TIMED_OUT" if state.get("deadline_exceeded") else "FAILED",
+                warnings=["state_errors"] if errors else [],
+            )
         return {
             "final_answer": f"Research could not be completed: {detail}",
             "review_status": ReviewStatus.FAILED,
@@ -1332,6 +1694,69 @@ def _timed_node(
     return timed_node
 
 
+def _deadline_guarded(
+    name: str,
+    node: Node,
+    metrics: MetricsCollector | None,
+    *,
+    extra: dict[str, Any] | None = None,
+) -> Node:
+    """Skip ``node`` when the run's global deadline has expired (WS-C).
+
+    A guard returns a small state update instead of raising: routing
+    stays pure and deterministic, and the terminal nodes convert the
+    flag into an honest TIMED_OUT outcome. Nodes that legitimately
+    run after expiry (the finalize pass-through, handle_error) are
+    deliberately NOT guarded.
+    """
+
+    def guarded(state: GraphState) -> dict[str, Any]:
+        deadline = state.get("deadline")
+        if deadline is not None and deadline.expired():
+            logger.warning(
+                "global execution deadline (%.0fs) expired before %s "
+                "could run; skipping",
+                getattr(deadline, "total_seconds", 0.0),
+                name,
+            )
+            if metrics is not None:
+                metrics.mark_deadline_exceeded()
+            update: dict[str, Any] = {"deadline_exceeded": True}
+            if extra:
+                update.update(extra)
+            return update
+        return node(state)
+
+    return guarded
+
+
+def make_start_node(
+    settings: Settings,
+    metrics: MetricsCollector | None = None,
+    clock: Callable[[], float] | None = None,
+) -> Node:
+    """Stamp ONE run-level global deadline before any work (WS-C).
+
+    ``start`` runs once per graph invocation (state is per-invocation),
+    so every node, retry, backoff sleep and tool call consults the
+    SAME monotonic expiry. The configured budget is mirrored into the
+    metrics report; ``clock`` is injectable so tests can drive a fake
+    clock deterministically.
+    """
+
+    def start_node(state: GraphState) -> dict[str, Any]:
+        if metrics is not None:
+            metrics.record_deadline(settings.max_total_execution_seconds)
+        return {
+            "deadline": RunDeadline(
+                settings.max_total_execution_seconds, clock=clock
+            ),
+            "deadline_exceeded": False,
+        }
+
+    return start_node
+
+
 def build_research_graph(
     settings: Settings,
     model: BaseChatModel,
@@ -1339,26 +1764,50 @@ def build_research_graph(
     *,
     rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
     metrics: MetricsCollector | None = None,
+    clock: Callable[[], float] | None = None,
 ) -> CompiledStateGraph:
     """Wire the research graph.
 
     Conditional edges use the deterministic routing layer —
-    unchanged from Phase 2.
+    unchanged from Phase 2, plus the WS-C global-deadline
+    short-circuits (they read ``deadline_exceeded`` from state and
+    only ever terminate research earlier, never add paths).
 
     ``metrics`` (a :class:`~agent.metrics.MetricsCollector`)
     receives per-node, per-model-call and per-tool-call
     instrumentation: latencies, token counts, prompt and
-    result SIZES, retry and error categories — never
-    content. When omitted, a throwaway collector is used so
-    instrumentation is always uniform.
+    result SIZES, retry and error categories, the terminal run
+    OUTCOME and a content-free quality summary — never content.
+    When omitted, a throwaway collector is used so instrumentation
+    is always uniform.
+
+    ``clock`` is the monotonic clock for the run's global deadline
+    (the ``start`` node stamps one deadline per invocation); tests
+    pass a fake clock so timeout paths are deterministic and never
+    sleep.
     """
     if metrics is None:
         metrics = MetricsCollector()
     builder = StateGraph(GraphState)
     builder.add_node(
+        "start",
+        _timed_node(
+            "start",
+            make_start_node(settings, metrics, clock=clock),
+            metrics,
+        ),
+    )
+    builder.add_node(
         "plan",
         _timed_node(
-            "plan", make_plan_node(settings, model, metrics), metrics
+            "plan",
+            make_plan_node(
+                settings,
+                model,
+                metrics,
+                rate_limit_retry_delay=rate_limit_retry_delay,
+            ),
+            metrics,
         ),
     )
     builder.add_node(
@@ -1391,13 +1840,29 @@ def build_research_graph(
     builder.add_node(
         "review",
         _timed_node(
-            "review", make_review_node(settings, model, metrics), metrics
+            "review",
+            make_review_node(
+                settings,
+                model,
+                metrics,
+                rate_limit_retry_delay=rate_limit_retry_delay,
+            ),
+            metrics,
         ),
     )
-    builder.add_node("finalize", make_finalize_node())
-    builder.add_node("handle_error", make_error_node())
+    builder.add_node(
+        "finalize",
+        _timed_node(
+            "finalize", make_finalize_node(settings, metrics), metrics
+        ),
+    )
+    builder.add_node(
+        "handle_error",
+        _timed_node("handle_error", make_error_node(metrics), metrics),
+    )
 
-    builder.add_edge(START, "plan")
+    builder.add_edge(START, "start")
+    builder.add_edge("start", "plan")
     builder.add_edge("plan", "research")
     builder.add_edge("synthesize", "review")
     builder.add_edge("finalize", END)

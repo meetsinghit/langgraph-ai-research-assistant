@@ -41,11 +41,24 @@ def route_after_research(
 ) -> Route:
     """Decide what happens after a research step. First match wins:
 
+    0. ``error``/``synthesize`` – the GLOBAL deadline is spent: never
+                        start another research pass (with findings we
+                        still attempt synthesis — its own guard
+                        decides; without any evidence this is a
+                        controlled failure). This short-circuit also
+                        prevents research<->review loops when every
+                        node guard is skipping.
     1. ``error``      – every research attempt failed, nothing to work with
     2. ``synthesize`` – enough evidence collected, OR the iteration budget is
                         spent (the synthesize node flags partial evidence)
     3. ``research``   – more evidence needed and budget remains
     """
+    if state.get("deadline_exceeded"):
+        return (
+            ROUTE_SYNTHESIZE
+            if state.get("findings")
+            else ROUTE_ERROR
+        )
     if has_fatal_error(state):
         return ROUTE_ERROR
     if has_sufficient_evidence(
@@ -70,10 +83,17 @@ def route_after_review(
                                  else ``finalize``
     - anything else (``PENDING``, missing, or unexpected) -> ``finalize``
 
+    The GLOBAL deadline always wins: once ``deadline_exceeded`` is
+    set the route is ``finalize`` even when the reviewer asked for
+    more research — restarting research after the budget is spent
+    would loop forever (every guard would skip and re-route).
+
     Fail-safe rule: an unrecognised status must NEVER silently restart
     research — an unknown state is a bug to surface, not a reason to
     spend more iterations.
     """
+    if state.get("deadline_exceeded"):
+        return ROUTE_FINALIZE
     status = state.get("review_status")
     if status in (ReviewStatus.APPROVED, ReviewStatus.FAILED):
         return ROUTE_FINALIZE
