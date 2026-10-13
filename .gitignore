@@ -21,6 +21,7 @@ dist/
 
 # ---- Evaluation reports (generated, not source) ----
 evals/report.json
+evals/security_report.json
 run_metrics*.json
 
 # ---- OS junk ----

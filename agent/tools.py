@@ -8,11 +8,20 @@ Security rules enforced here:
   blocks DNS-based SSRF bypasses
 - redirects are followed manually, and EVERY hop is re-validated,
   which blocks unsafe redirects
+- URLs with embedded credentials (userinfo) and non-web ports
+  (only 80/443) are refused
+- non-HTML/text content types are refused (missing header tolerated)
+- cleartext-HTTP requests are PINNED to the address that just passed
+  validation (Host header preserved), closing the DNS
+  time-of-check/time-of-use window for http:// — https cannot be
+  pinned without breaking SNI/verification, so its residual window
+  is documented instead (docs/SECURITY.md)
 - per-request timeout, response-size cap and redirect cap
 
-Note: DNS is resolved for validation and then resolved again by the
-HTTP client (a TOCTOU window exists in any such design); every hop
-is re-checked to keep that window small.
+Note: DNS is resolved for validation; for cleartext HTTP the fetch
+then uses exactly that validated address, while HTTPS re-resolves
+inside the client under full TLS verification (a small residual
+rebind window exists there — never traded for verify=False).
 
 Retrieved content is DATA for the agent, never instructions.
 """
@@ -27,7 +36,7 @@ import socket
 import ssl
 import time
 from typing import Any, Callable, TypedDict
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 from ddgs import DDGS
@@ -57,6 +66,18 @@ class ToolError(RuntimeError):
 
 class UnsafeURLError(ToolError):
     """The URL (or a redirect target) was rejected by SSRF protection."""
+
+
+class PolicyRefusal(ToolError):
+    """A deterministic security policy refused the tool call.
+
+    Carries an explicit category (preserved by the executor into
+    metrics) so policy refusals are distinguishable from operational
+    failures — currently raised when ``fetch_page`` is asked for a
+    URL that ``web_search`` did not discover in this run.
+    """
+
+    category = "policy"
 
 
 #: Search-failure taxonomy (fixed vocabulary — never error text).
@@ -129,6 +150,7 @@ class WebSearchArgs(BaseModel):
 
     query: str = Field(
         min_length=1,
+        max_length=400,
         description=(
             "Search terms as ONE string, e.g. "
             "'LangGraph checkpointers'. The argument name must be "
@@ -143,6 +165,8 @@ class FetchPageArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     url: str = Field(
+        min_length=1,
+        max_length=2048,
         description=(
             "Full http(s) URL to fetch. The argument name must be "
             "'url'."
@@ -576,6 +600,10 @@ def fetch_page(
                 max_bytes=max_bytes,
                 max_redirects=max_redirects,
                 deadline=deadline,
+                # Pinning rewrites the request target for OWN clients
+                # only: an injected client is a test transport whose
+                # fixtures match original URLs.
+                pin_http=own_client,
             )
         except httpx.HTTPError as exc:
             raise ToolError(_describe_http_failure(url, exc)) from exc
@@ -591,6 +619,7 @@ def _fetch_with_client(
     max_bytes: int,
     max_redirects: int,
     deadline: RunDeadline | None = None,
+    pin_http: bool = False,
 ) -> str:
     current_url = url
     for _hop in range(max_redirects + 1):
@@ -601,8 +630,13 @@ def _fetch_with_client(
                 f"fetch_page aborted for {url}: the run's global "
                 "execution deadline has expired"
             )
-        _validate_url(current_url)
-        request = client.build_request("GET", current_url)
+        addresses = _validate_url(current_url)
+        request_url, request_headers = _connect_target(
+            current_url, addresses, pin=pin_http
+        )
+        request = client.build_request(
+            "GET", request_url, headers=request_headers or None
+        )
         response = client.send(request, stream=True)
         try:
             if response.is_redirect:
@@ -613,6 +647,20 @@ def _fetch_with_client(
                     )
                 current_url = urljoin(current_url, location)
                 continue
+            if not _allowed_content_type(
+                response.headers.get("content-type")
+            ):
+                main_type = (
+                    (response.headers.get("content-type") or "")
+                    .split(";", 1)[0]
+                    .strip()
+                    .lower()
+                )
+                raise ToolError(
+                    f"fetch refused for {current_url}: unsupported "
+                    f"content type {main_type!r} (only HTML or "
+                    "plain-text documents are processed)"
+                )
             raw, truncated = _read_capped(response, max_bytes)
         finally:
             response.close()
@@ -621,6 +669,66 @@ def _fetch_with_client(
             text = f"{text} [content truncated]"
         return text
     raise ToolError(f"exceeded {max_redirects} redirects starting from {url}")
+
+
+#: Content types the fetcher will process. HTML and plain text are
+#: research material; anything else (PDF, images, archives, octet
+#: streams) is refused with a controlled error instead of being
+#: decoded to mojibake. A MISSING header is tolerated (legacy
+#: servers and test transports) — the body is then parsed as text.
+_ALLOWED_CONTENT_TYPES = frozenset({"application/xhtml+xml"})
+
+
+def _allowed_content_type(header: str | None) -> bool:
+    if not header:
+        return True  # absent header: tolerate and parse as text
+    main_type = header.split(";", 1)[0].strip().lower()
+    return main_type.startswith("text/") or main_type in _ALLOWED_CONTENT_TYPES
+
+
+def _connect_target(
+    url: str, addresses: list[str], *, pin: bool
+) -> tuple[str, dict[str, str]]:
+    """Cleartext-HTTP destination pinning (DNS time-of-check/time-of-use
+    closure).
+
+    For ``http://`` URLs whose host is a NAME (not a literal IP), the
+    request is sent to the address that just passed validation, with
+    the original host in the ``Host`` header — a DNS answer changing
+    between validation and connection can no longer steer the fetch
+    to a forbidden internal address.
+
+    ``https://`` cannot be pinned this way: TLS requires SNI and
+    certificate hostname verification for the ORIGINAL name, and
+    connecting to a raw IP would either break verification or force
+    ``verify=False`` (never acceptable). For https the validation
+    happens one line above the request, inside the same hop, keeping
+    the residual rebind window minimal; it is documented as a
+    limitation in docs/SECURITY.md with egress filtering as the
+    production-grade control.
+    """
+    if not pin:
+        return url, {}
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "http":
+        return url, {}
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return url, {}
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return url, {}  # literal IP: validation already proved it public
+    target = addresses[0]
+    authority = f"[{target}]" if ":" in target else target
+    if parsed.port is not None:
+        authority = f"{authority}:{parsed.port}"
+    pinned = urlunparse(parsed._replace(netloc=authority))
+    # ``parsed.netloc`` cannot contain userinfo here — _validate_url
+    # refused it earlier in this same hop.
+    return pinned, {"Host": parsed.netloc}
 
 
 def _read_capped(response: httpx.Response, max_bytes: int) -> tuple[str, bool]:
@@ -637,13 +745,43 @@ def _read_capped(response: httpx.Response, max_bytes: int) -> tuple[str, bool]:
     return b"".join(chunks).decode("utf-8", errors="replace"), truncated
 
 
-def _validate_url(url: str) -> None:
-    """Reject unsafe schemes, localhost and non-public destinations."""
+#: Only standard web ports are fetchable. This is not the primary
+#: SSRF control (non-public ADDRESSES are), but it stops a public
+#: host from steering the fetcher at unusual services (internal
+#: admin panels commonly exposed on 8080/8443, SMTP on 25, etc.).
+_ALLOWED_PORTS = frozenset({80, 443})
+
+
+def _validate_url(url: str) -> list[str]:
+    """Reject unsafe schemes, credentials, ports, localhost and
+    non-public destinations.
+
+    Returns the VALIDATED global addresses the host resolves to
+    (the literal address itself for IP URLs) so callers can pin the
+    actual connection target to what was just validated — closing
+    the DNS time-of-check/time-of-use window for cleartext HTTP
+    (see :func:`_fetch_with_client`).
+    """
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     if scheme not in ("http", "https"):
         raise UnsafeURLError(
             f"blocked scheme {scheme!r} (only http/https allowed): {url}"
+        )
+    if parsed.username is not None or parsed.password is not None:
+        # The URL is deliberately NOT echoed back: userinfo can carry
+        # attacker- or user-supplied secrets we must not reproduce in
+        # tool messages, logs or metrics.
+        raise UnsafeURLError(
+            "URLs with embedded credentials (userinfo) are blocked"
+        )
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsafeURLError(f"malformed port in URL: {url}") from exc
+    if port is not None and port not in _ALLOWED_PORTS:
+        raise UnsafeURLError(
+            f"port {port} is blocked (only 80/443 allowed): {url}"
         )
     hostname = parsed.hostname
     if not hostname:
@@ -660,9 +798,10 @@ def _validate_url(url: str) -> None:
     if literal_ip is not None:
         if not literal_ip.is_global:
             raise UnsafeURLError(f"non-public IP address is blocked: {url}")
-        return  # literal public IP — nothing to resolve
+        return [str(literal_ip)]  # literal public IP — nothing to resolve
 
     # Hostname: resolve and reject if ANY address is non-public.
+    addresses: list[str] = []
     for family, _, _, _, sockaddr in socket.getaddrinfo(host, None):
         address = sockaddr[0]
         if not ipaddress.ip_address(address).is_global:
@@ -670,6 +809,11 @@ def _validate_url(url: str) -> None:
                 f"hostname {host!r} resolves to non-public address "
                 f"{address}: {url}"
             )
+        if address not in addresses:
+            addresses.append(address)
+    if not addresses:
+        raise UnsafeURLError(f"hostname {host!r} did not resolve: {url}")
+    return addresses
 
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -811,6 +955,7 @@ class ToolExecutor:
         node: str = "research",
         *,
         arg_schemas: dict[str, type[BaseModel]] | None = None,
+        sensitive_values: tuple[str, ...] | list[str] = (),
     ):
         self._functions = functions
         self._metrics = metrics
@@ -819,6 +964,15 @@ class ToolExecutor:
         # -> caller's explicit choice (tests inject unschemed tools).
         self._arg_schemas = (
             TOOL_ARG_SCHEMAS if arg_schemas is None else arg_schemas
+        )
+        # DLP (Phase 4C): known secret VALUES (API keys) that must
+        # never appear in tool arguments. Trivially short values are
+        # dropped — a 3-character "secret" would refuse every call.
+        # The values themselves are never logged, echoed or recorded.
+        self._sensitive_values = tuple(
+            value
+            for value in sensitive_values
+            if isinstance(value, str) and len(value) >= 8
         )
 
     def execute(self, tool_call: dict[str, Any]) -> ToolResult:
@@ -852,6 +1006,27 @@ class ToolExecutor:
                 self._record(result, 0.0, error_category="validation")
                 return result
             args = validated.model_dump()
+        if self._sensitive_values and self._args_contain_secret(args):
+            # DLP refusal (Phase 4C): a tool call carrying a known
+            # secret value (e.g. an API key in a query or URL) is
+            # refused BEFORE execution — this is the outbound-channel
+            # control that keeps an injected page from turning the
+            # fetcher into an exfiltration vector. The refused args
+            # are deliberately NOT echoed into the result, never
+            # recorded in metrics and never passed to the function.
+            result = ToolResult(
+                tool=name, ok=False, data=None,
+                error=(
+                    "tool call refused: the arguments contain a "
+                    "configured sensitive value (data-loss "
+                    "prevention). Credentials and configuration "
+                    "values are never needed in tool arguments — "
+                    "drop them and call the tool again without them."
+                ),
+                args={},
+            )
+            self._record(result, 0.0, error_category="dlp")
+            return result
         started = time.monotonic()
         try:
             data = self._functions[name](**args)
@@ -891,6 +1066,21 @@ class ToolExecutor:
         )
         self._record(result, time.monotonic() - started)
         return result
+
+    def _args_contain_secret(self, args: dict[str, Any]) -> bool:
+        """True when the serialized arguments embed a known secret value.
+
+        Exact, case-sensitive substring match against the configured
+        secret VALUES (API keys). The serialization is local and
+        never stored — only the boolean leaves this method.
+        """
+        try:
+            serialized = json.dumps(args, default=str)
+        except (TypeError, ValueError):
+            serialized = str(args)
+        return any(
+            value in serialized for value in self._sensitive_values
+        )
 
     def _record(
         self,

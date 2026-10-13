@@ -79,6 +79,16 @@ def categorize_error(exc: BaseException | str) -> str:
     return "unknown"
 
 
+#: Error categories produced by DETERMINISTIC security controls (as
+#: opposed to operational failures like timeouts). The snapshot's
+#: ``security.tool_refusals`` block counts these, so "the guard
+#: fired" is observable without ever recording what was refused or
+#: why in text form.
+SECURITY_REFUSAL_CATEGORIES = frozenset(
+    {"validation", "policy", "dlp", "ssrf"}
+)
+
+
 @dataclass
 class ModelCallMetrics:
     """One model invocation (size, not content).
@@ -166,6 +176,13 @@ class MetricsCollector:
         default_factory=tuple, init=False
     )
     _quality: dict[str, Any] | None = field(default=None, init=False)
+    # -- WS-4C security reporting ------------------------------------
+    #: (source_kind, categories) per untrusted-text scan. Categories
+    #: are fixed-vocabulary; matched text is never stored.
+    _injection_signals: list[tuple[str, tuple[str, ...]]] = field(
+        default_factory=list, init=False
+    )
+    _answer_redactions: int = field(default=0, init=False)
 
     # -- lifecycle ------------------------------------------------
 
@@ -196,6 +213,8 @@ class MetricsCollector:
         self._outcome = None
         self._outcome_warnings = ()
         self._quality = None
+        self._injection_signals.clear()
+        self._answer_redactions = 0
 
     def set_iteration(self, iteration: int | None) -> None:
         """Current research iteration (context for later events)."""
@@ -250,6 +269,29 @@ class MetricsCollector:
         summary = dict(self._quality or {})
         summary.update(fields)
         self._quality = summary
+
+    # -- security reporting (Phase 4C) -------------------------------
+
+    def record_injection_signals(
+        self, source: str, categories: tuple[str, ...]
+    ) -> None:
+        """Record instruction-like PATTERN signals in untrusted text.
+
+        Content-free by construction: only the source kind (e.g.
+        "search_result", "page", "tool_error", "draft") and
+        fixed-vocabulary category names are stored — never the
+        matched text. A signal is a defense-in-depth indicator, NOT
+        proof that an attack occurred or succeeded.
+        """
+        if not categories:
+            return
+        self._injection_signals.append((str(source), tuple(categories)))
+
+    def record_answer_redactions(self, count: int) -> None:
+        """Record credential-pattern redactions applied to the
+        outgoing answer (a count only — never the redacted value)."""
+        if count > 0:
+            self._answer_redactions += int(count)
 
     # -- recording ------------------------------------------------
 
@@ -487,6 +529,34 @@ class MetricsCollector:
                 "tool_error_categories": _count_by(
                     c.error_category for c in self._tool_calls if not c.ok
                 ),
+            },
+            # Phase 4C: deterministic security posture of THIS run —
+            # refusals that fired, injection-signal counts and answer
+            # redactions. Counts and fixed-vocabulary categories
+            # only: never matched text, URLs or credentials.
+            "security": {
+                "injection_signals": {
+                    "total": sum(
+                        len(cats) for _, cats in self._injection_signals
+                    ),
+                    "by_category": _count_by(
+                        cat
+                        for _, cats in self._injection_signals
+                        for cat in cats
+                    ),
+                    "by_source": _count_by(
+                        source
+                        for source, cats in self._injection_signals
+                        if cats
+                    ),
+                },
+                "tool_refusals": _count_by(
+                    c.error_category
+                    for c in self._tool_calls
+                    if not c.ok
+                    and c.error_category in SECURITY_REFUSAL_CATEGORIES
+                ),
+                "answer_redactions": self._answer_redactions,
             },
             "quality": self._quality,
             "retries": [

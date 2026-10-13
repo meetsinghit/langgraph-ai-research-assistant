@@ -32,11 +32,39 @@ from typing import Any
 
 __all__ = [
     "CaseExpectations",
+    "CaseSecurity",
     "EvalCase",
     "ResearchStep",
     "TopicRubric",
     "benchmark_cases",
 ]
+
+
+@dataclass(frozen=True)
+class CaseSecurity:
+    """Security-scenario metadata for a case (Phase 4C, WS-G).
+
+    Every security case documents WHY it exists and how far its
+    result can be trusted:
+
+    - ``defense_layer``: ``"deterministic"`` when the pass criterion
+      is enforced entirely in code (policy refusals, schema
+      validation, redaction, citation gates); ``"model_behavior"``
+      when the case probes how a MODEL responds to hostile content.
+      A scripted model that imitates a compromised model CANNOT
+      prove real-model prompt-injection resistance — those cases
+      are kept to make the limitation visible, and their pass
+      criteria still rest on deterministic controls wherever
+      possible.
+    - ``residual``: what this case does NOT establish.
+    """
+
+    attacker_objective: str
+    entry_point: str
+    expected_behavior: str
+    defense_layer: str  # "deterministic" | "model_behavior"
+    severity: str  # "high" | "medium" | "low"
+    residual: str
 
 
 @dataclass(frozen=True)
@@ -78,6 +106,30 @@ class CaseExpectations:
     #: prompts steered an official-documentation question
     #: toward the CURRENT documentation domains.
     official_domain_steering: bool = False
+    # --- Phase 4C security expectations (all content-free) ---
+    #: minimum injection-signal categories recorded in
+    #: metrics for this run (defense-in-depth SIGNAL — its
+    #: absence is never treated as proof of safety).
+    min_injection_signals: int = 0
+    #: minimum count per deterministic refusal category
+    #: (validation / policy / dlp / ssrf) in the metrics
+    #: security block.
+    min_refusals: dict[str, int] = field(default_factory=dict)
+    #: minimum credential redactions applied to the answer.
+    min_answer_redactions: int = 0
+    #: substrings that must NOT appear in the final answer
+    #: (e.g. a synthetic canary credential).
+    forbidden_substrings: tuple[str, ...] = ()
+    #: when True, deterministic citation validation must
+    #: pass for the final answer.
+    require_citations_ok: bool = False
+    #: when set, at least this many citations must resolve
+    #: to unknown (non-existent) sources — asserts that the
+    #: citation gate DETECTED fabricated references.
+    min_unknown_citations: int | None = None
+    #: tool names that must NOT appear among executed calls
+    #: (spoofed names in structured or text form).
+    forbidden_tools: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -110,6 +162,9 @@ class EvalCase:
         default_factory=CaseExpectations
     )
     rubric: tuple[TopicRubric, ...] = ()
+    #: security-scenario metadata when this is a Phase 4C
+    #: adversarial case (None for ordinary benchmark cases).
+    security: CaseSecurity | None = None
 
     def __post_init__(self) -> None:
         """Normalize bare values to tuples.

@@ -227,6 +227,17 @@ run).
   (`evals/report.json` is written by default;
   `--out PATH` / `--no-out` to change)
 - `python -m evals --no-out` — summary only
+- `python -m evals --security` — the Phase 4C **adversarial security
+  suite**: 25 offline cases (injection, tool spoofing, SSRF-adjacent
+  fetches, secret-DLP, citation manipulation, blocked sources), each
+  tagged with attacker objective, entry point, defense layer
+  (deterministic vs model-behavior), severity and residual limits.
+  Writes `evals/security_report.json` including a machine-readable
+  `security_summary` (severity/layer/entry-point counts, refusal
+  categories, signal and redaction totals). Honesty rule: a missing
+  injection signal is never treated as proof of safety, and the
+  printed note reminds that mocked fixtures cannot prove real-model
+  prompt-injection resistance.
 - `python -m evals.compare baseline.json candidate.json` — diff two
   reports produced by `--out` (or any `--metrics` snapshot):
   token/latency/call/retrieval/quality/outcome deltas, per-category
@@ -336,20 +347,47 @@ error text.
   metadata); the instrumented live run (`run_metrics.json`,
   gitignored) provides real per-call attribution.
 
-## Security notes
+## Security (Phase 4C)
 
-- Retrieved web content is treated as untrusted DATA, never as
-  instructions to the agent.
-- API keys are read from `.env`, never committed, redacted in
-  `repr`/`str` of settings, and best-effort redacted in logs
-  (redaction is defense-in-depth, not a guarantee).
-- Page retrieval blocks localhost/private/reserved destinations,
-  validates every redirect hop, and caps response size.
-- Page-fetch TLS verification is always on: the OS trust store
-  (`truststore`) or an explicit `SSL_CA_BUNDLE` CA bundle is used
-  when the default certifi store cannot verify a chain (e.g.
-  enterprise TLS inspection). There is no `verify=False` path —
-  failed verifications refuse the fetch and are reported.
+Full threat model (9 trust boundaries, control matrix, residual
+risks): **[docs/SECURITY.md](docs/SECURITY.md)**. The design rule:
+**retrieved web content is evidence, never authority.** Layers:
+
+1. **Prompt framing** — all system prompts end with a fixed trust
+   boundary clause; evidence enters model context wrapped in
+   `UNTRUSTED QUOTED EVIDENCE` framing.
+2. **Signal detection (`agent/injection.py`)** — a 7-category
+   pattern detector scans snippets, pages and tool errors and
+   records *content-free* signals (category + source counts) plus a
+   `security_note` inside the ToolMessage JSON. It is explicitly
+   **signal, not proof**: it never blocks or rewrites evidence, so
+   legitimate security documentation keeps working.
+3. **Deterministic policy layer** — where the guarantees live:
+   - tool allow-list + strict schemas in `ToolExecutor` (unknown
+     tools / oversized or malformed args are refused, never run);
+   - **fetch-target allow-list**: `fetch_page` only accepts URLs
+     `web_search` returned this run, so a fully attacker-compliant
+     model still cannot reach an attacker URL;
+   - **secret-DLP**: tool arguments are scanned for configured
+     secret values and refused before execution, without echoing.
+4. **Network hardening (`fetch_page`)** — scheme/port/userinfo
+   checks, every address of every hop validated against
+   non-public ranges, manual redirect validation, cleartext-HTTP
+   connection pinning to the validated address (DNS-TOCTOU), size/
+   timeout/content-type caps, TLS verification always on (no
+   `verify=False` path — static guard test).
+5. **Output backstop** — credential-shaped values are redacted at
+   synthesis and again at `finalize` (`[REDACTED-CREDENTIAL]`,
+   counted in metrics, value never logged).
+
+Observability: metrics gained a content-free `security` block
+(injection signals by category/source, refusals by category,
+answer-redaction count) — never payload text, keys, or full URLs.
+
+Verification is **offline**: 453 passing tests (1 skipped opt-in
+live test), benchmark 23/23, security suite 25/25 — mocked
+fixtures cannot prove real-model prompt-injection resistance or
+replace a live penetration test (see the doc's residual risks).
 
 ## Project layout
 
@@ -358,23 +396,32 @@ AI_POC/
 ├── main.py                  CLI entry point (+ --metrics JSON report)
 ├── requirements.txt
 ├── .env.example             config template (no secrets)
+├── docs/
+│   └── SECURITY.md          Phase 4C threat model (9 trust boundaries,
+│                            controls, residual risks)
 ├── agent/
 │   ├── config.py            typed settings (pydantic-settings)
 │   ├── state.py             GraphState + reducers
 │   ├── routing.py           deterministic conditional routing
 │   ├── logging_config.py    JSON-lines logging + redaction
 │   ├── llm.py               provider factory + error taxonomy/retries
-│   ├── tools.py             web_search / fetch_page + SSRF protection
+│   ├── tools.py             web_search / fetch_page + SSRF protection,
+│   │                        fetch-target policy, secret-DLP executor
+│   ├── injection.py         injection-signal detector + credential
+│   │                        redaction (content-free by design)
 │   ├── deadline.py          global run deadline (monotonic, injectable clock)
 │   ├── metrics.py           per-run metrics (content-free by design)
 │   └── graph.py             node implementations + graph wiring
 ├── evals/
 │   ├── cases.py             ~23-case benchmark (fixtures + expectations + rubrics)
+│   ├── security_cases.py    25-case adversarial suite (+ security_summary)
 │   ├── semantic.py          fixture rubric scorer + opt-in LLM judge
 │   ├── harness.py           offline runner + JSON report
 │   ├── compare.py           `python -m evals.compare` report diffing
-│   └── __main__.py          `python -m evals` CLI
+│   └── __main__.py          `python -m evals` CLI (--security flag)
 └── tests/                   mocked unit tests + opt-in live test
                              (tool schema, search recovery, deadline,
-                             provider retries, compare — all offline)
+                             provider retries, compare — all offline;
+                             security: injection, tool policy, network,
+                             secrets, config, security evals)
 ```

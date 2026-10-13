@@ -444,11 +444,25 @@ def test_internal_messages_preserve_thought_signature_metadata():
 
 def test_fetch_page_retrieves_and_inspects_primary_source():
     """The workflow can retrieve a primary-source page with
-    fetch_page and turn its text into a retrieved finding."""
+    fetch_page and turn its text into a retrieved finding.
+
+    The URL is first surfaced by web_search (Phase 4C policy: fetch
+    only accepts search-discovered sources).
+    """
     settings = _settings()
-    fake_tools = FakeTools(page_text="Primary source full text.")
+    fake_tools = FakeTools(
+        page_text="Primary source full text.",
+        search_results=[
+            {
+                "title": "Primary source",
+                "snippet": "snippet",
+                "url": "https://docs.example.com/",
+            }
+        ],
+    )
     model = ScriptedChatModel(
         responses=[
+            _tool_call_response("c0", name="web_search", args={"query": "q"}),
             _tool_call_response("c1", name="fetch_page", args={"url": "https://docs.example.com/"}),
             AIMessage(content="done"),
             AIMessage(content="Answer grounded in the fetched page."),
@@ -463,10 +477,13 @@ def test_fetch_page_retrieves_and_inspects_primary_source():
     result = graph.invoke({"question": "question"})
 
     assert fake_tools.fetch_calls == ["https://docs.example.com/"]
-    assert len(result["findings"]) == 1
-    assert result["findings"][0]["source_url"] == "https://docs.example.com/"
+    # search surfaced the URL (snippet finding) and the fetch added
+    # the inspected copy: two findings, one deduplicated source.
+    assert len(result["findings"]) == 2
+    assert result["findings"][0].get("evidence") != "retrieved"
+    assert result["findings"][1]["source_url"] == "https://docs.example.com/"
     # fetch_page evidence is inspected content, not a discovered snippet
-    assert result["findings"][0].get("evidence") == "retrieved"
+    assert result["findings"][1].get("evidence") == "retrieved"
     assert result["sources"] == ["https://docs.example.com/"]
 
 
