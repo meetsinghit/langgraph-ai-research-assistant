@@ -24,6 +24,12 @@ evals/report.json
 evals/security_report.json
 run_metrics*.json
 
+# ---- Runtime application data (SQLite DBs, WAL, bootstrap token) ----
+# Contains conversation content, checkpoints and the local API token:
+# sensitive at rest, and deleting it is NOT secure erasure (see
+# docs/SECURITY.md §4).
+data/
+
 # ---- OS junk ----
 .DS_Store
 Thumbs.db

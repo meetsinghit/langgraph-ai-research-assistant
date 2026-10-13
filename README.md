@@ -62,6 +62,77 @@ python main.py "What is LangGraph?"
 - `RUN_LIVE_TESTS=1 python -m pytest -m live` — opt-in live
   integration test (requires a configured provider key)
 
+## Server API (Phase 4D.1)
+
+The same graph, behind a local FastAPI service — sessions, runs,
+resumable checkpoints and a server-sent-event progress stream.
+The CLI above is unchanged; the engine is shared.
+
+**Start the server** (loopback-only by default):
+
+```bash
+python -m app.main                 # 127.0.0.1:8000 (api_host/api_port in .env)
+# then, in another shell:
+TOKEN=$(cat data/app_token.txt)    # bootstrapped on first start (or set APP_TOKEN)
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8000/api/health
+```
+
+Every endpoint except `GET /api/health` requires the Bearer token —
+**including SSE streams**. `data/` (SQLite DBs, WAL, token file) is
+git-ignored and sensitive at rest; deleting it is *not* secure
+erasure (see [docs/SECURITY.md §10](docs/SECURITY.md)).
+
+| Method & path | Purpose |
+|---|---|
+| `GET /api/health` | liveness (unauthenticated) |
+| `GET /api/config` | content-free capabilities (e.g. `resume_enabled`), budgets — never secrets |
+| `POST /api/sessions` · `GET /api/sessions` | create / list sessions |
+| `GET /api/sessions/{id}` | session + its runs (summary rows) |
+| `DELETE /api/sessions/{id}` | delete a session, its runs, sources, events and checkpoints (cascade) |
+| `POST /api/sessions/{id}/runs` | start a run; optional `Idempotency-Key` header replays the same run instead of starting a duplicate (409 on key reuse with a different question) |
+| `GET /api/runs/{id}` | run detail: status, answer, review, sources, outcome, content-free diagnostics |
+| `POST /api/runs/{id}/cancel` | cooperative cancel (202); terminal runs → 409 |
+| `POST /api/runs/{id}/resume` | continue an interrupted run from its checkpoint (202), see below |
+| `GET /api/runs/{id}/events` | SSE stream of sequenced, content-free progress events |
+
+**Run lifecycle:** `queued → running → (cancelling →) completed |
+failed | cancelled`, plus `interrupted` — a row left `running` by a
+crash/restart is marked `interrupted` at startup and becomes
+resumable.
+
+**SSE integrity:** every event is persisted first with a monotonically
+increasing `seq` before it is delivered. Reconnect with the standard
+`Last-Event-ID` header (or `?after=<seq>`) to replay exactly the
+events after that id — no gaps, no duplicates, race-free against
+live publishing. Streams send `: heartbeat` comments while idle and
+end with the terminal event; disconnecting detaches the subscriber.
+
+**Resume semantics (capability-gated):** the server advertises
+`resume_enabled` only when a LangGraph checkpointer is configured;
+otherwise resume returns **409 `resume_unverified`** (an
+unverifiable resume is disabled, not guessed at). Other refusals:
+**409 `not_interrupted`** (only interrupted runs resume) and
+**409 `no_checkpoint`** (nothing to continue from). Guarantees,
+all covered by cross-instance crash tests (a second app instance on
+the same DB files recovers the run):
+
+- completed nodes and their tool actions are **not replayed** — the
+  resumed execution continues at the interrupted node;
+- the *interrupted node itself* re-executes (LangGraph at-least-once
+  semantics — plan for idempotency before adding side effects);
+- the resumed execution gets a **fresh deadline and budget**; the
+  persisted `deadline_total_seconds` records the run's original
+  configured budget, it is not an expiry timestamp;
+- provenance (sources/findings), review state and security
+  diagnostics survive the restart;
+- concurrent resume attempts elect **exactly one** worker (winner
+  202, loser 409).
+
+**Not exposed (deliberately):** no prompt/argument/page-text fields
+in any response or event, no raw exception text (type + coarse
+category only), no public bind, no TLS/multi-user auth (loopback
+POC scope, residual risk R8).
+
 ## Architecture
 
 ```
@@ -384,10 +455,12 @@ Observability: metrics gained a content-free `security` block
 (injection signals by category/source, refusals by category,
 answer-redaction count) — never payload text, keys, or full URLs.
 
-Verification is **offline**: 453 passing tests (1 skipped opt-in
+Verification is **offline**: 506 passing tests (1 skipped opt-in
 live test), benchmark 23/23, security suite 25/25 — mocked
 fixtures cannot prove real-model prompt-injection resistance or
 replace a live penetration test (see the doc's residual risks).
+Phase 4D extended the model with the API surface (TB10) and the
+persistence/erasure policy (§10).
 
 ## Project layout
 
@@ -397,8 +470,20 @@ AI_POC/
 ├── requirements.txt
 ├── .env.example             config template (no secrets)
 ├── docs/
-│   └── SECURITY.md          Phase 4C threat model (9 trust boundaries,
-│                            controls, residual risks)
+│   └── SECURITY.md          Phase 4C threat model (10 trust boundaries,
+│                            controls, residual risks) + Phase 4D
+│                            API surface (TB10) & erasure policy (§10)
+├── app/                     Phase 4D FastAPI service
+│   ├── main.py              app factory, auth middleware, token bootstrap,
+│   │                        checkpointer wiring, `python -m app.main`
+│   ├── api.py               routers + SSE stream (Last-Event-ID replay)
+│   ├── runs.py              run lifecycle manager (threads, CAS state
+│   │                        transitions, cancel/resume, event sanitizing)
+│   ├── events.py            durable sequenced event channel
+│   ├── repository.py        SQLite CRUD + status vocabulary
+│   ├── db.py                schema (sessions/runs/sources/events), WAL
+│   ├── schemas.py           request/response contracts
+│   └── __init__.py
 ├── agent/
 │   ├── config.py            typed settings (pydantic-settings)
 │   ├── state.py             GraphState + reducers
@@ -410,8 +495,13 @@ AI_POC/
 │   ├── injection.py         injection-signal detector + credential
 │   │                        redaction (content-free by design)
 │   ├── deadline.py          global run deadline (monotonic, injectable clock)
+│   ├── runtime.py           RunContext: LIVE deadline/cancel/sink passed
+│   │                        via LangGraph context (never persisted)
 │   ├── metrics.py           per-run metrics (content-free by design)
 │   └── graph.py             node implementations + graph wiring
+├── data/                    runtime state (git-ignored): app.db,
+│                            checkpoints.db, app_token.txt — sensitive,
+│                            deletion ≠ secure erasure
 ├── evals/
 │   ├── cases.py             ~23-case benchmark (fixtures + expectations + rubrics)
 │   ├── security_cases.py    25-case adversarial suite (+ security_summary)
@@ -423,5 +513,8 @@ AI_POC/
                              (tool schema, search recovery, deadline,
                              provider retries, compare — all offline;
                              security: injection, tool policy, network,
-                             secrets, config, security evals)
+                             secrets, config, security evals;
+                             Phase 4D app: auth, lifecycle, idempotency,
+                             SSE replay/races, crash recovery/resume,
+                             cancellation, API redaction)
 ```

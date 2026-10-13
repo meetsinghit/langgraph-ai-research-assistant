@@ -17,7 +17,12 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 ProviderName = Literal["gemini", "openrouter", "openai"]
 ThinkingLevel = Literal["low", "medium", "high"]
 
-_SECRET_FIELDS = ("gemini_api_key", "openrouter_api_key", "openai_api_key")
+_SECRET_FIELDS = (
+    "gemini_api_key",
+    "openrouter_api_key",
+    "openai_api_key",
+    "app_token",
+)
 
 
 class Settings(BaseSettings):
@@ -130,6 +135,41 @@ class Settings(BaseSettings):
     # --- Observability ---
     log_level: str = "INFO"
     log_file: str = "research_agent.log"
+
+    # --- Application server (Phase 4D) ---
+    # Bearer token for the local API. Unset = the server bootstraps
+    # one into ``<data_dir>/app_token.txt`` on first start (git-
+    # ignored; treat the file like a credential).
+    app_token: str | None = None
+    # Bind address — 127.0.0.1 by default. This is a SINGLE-USER,
+    # LOCAL-ONLY service: do not bind or publish it publicly without
+    # proper access controls (see docs/SECURITY.md).
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=1, le=65535)
+    # Comma-separated browser origins allowed to call the API (the
+    # Vite dev server during development).
+    cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
+    # Concurrent research runs; each run owns its model/tools/metrics.
+    max_concurrent_runs: int = Field(default=2, ge=1, le=8)
+    # Directory for the SQLite databases and the bootstrap token
+    # file. The database files contain research content — treat the
+    # directory as sensitive (see docs/SECURITY.md).
+    data_dir: str = "data"
+    # SSE keepalive interval for idle streams.
+    sse_heartbeat_seconds: float = Field(default=15.0, gt=0)
+    # Follow-up context (server-derived from prior runs of the same
+    # session; never client-supplied) bounds.
+    followup_context_max_turns: int = Field(default=3, ge=0, le=10)
+    followup_context_max_chars: int = Field(default=4000, ge=0, le=20000)
+
+    @property
+    def cors_origin_list(self) -> list[str]:
+        """Parsed :attr:`cors_origins` (trimmed, blanks dropped)."""
+        return [
+            origin.strip()
+            for origin in self.cors_origins.split(",")
+            if origin.strip()
+        ]
 
     @field_validator("log_level")
     @classmethod

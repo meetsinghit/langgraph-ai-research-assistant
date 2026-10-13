@@ -168,7 +168,7 @@ def test_happy_path_deadline_is_stamped_and_not_exceeded():
 
     result = graph.invoke({"question": "question"})
 
-    assert result["deadline"].total_seconds == (
+    assert result["deadline_total_seconds"] == (
         settings.max_total_execution_seconds
     )
     assert result.get("deadline_exceeded") is False

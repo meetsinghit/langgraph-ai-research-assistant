@@ -1,4 +1,4 @@
-# Threat Model & Security Design — AI Research Assistant (Phase 4C)
+# Threat Model & Security Design — AI Research Assistant (Phase 4C, API surface added in Phase 4D)
 
 **Status:** POC, verified *offline* against mocked transports,
 scripted models and fixture sources. Passing tests and eval cases
@@ -24,6 +24,7 @@ before returning it. **Assets in scope:**
 | Outbound network position | SSRF into loopback, private ranges, cloud metadata |
 | Logs, metrics, reports | Must stay content-free (no payloads, keys, or full URLs) |
 | Prompt integrity | The system prompts are the control plane for every gate |
+| **Runtime data (Phase 4D)** — `data/app.db`, `data/checkpoints.db` (+ WAL), `data/app_token.txt` | Conversation content, answers/sources, LangGraph checkpoints and the local API token: sensitive at rest; checkpoint files additionally hold prompt-derived state |
 
 **Out of scope (explicitly):** deployment infrastructure, provider
 side, the operator's own machine hygiene, and *semantic truth* of
@@ -257,6 +258,37 @@ keys, or full URLs.
 
 ---
 
+### TB10 — API client → server *(Phase 4D HTTP surface)*
+
+*Adversary:* anything that can reach the API port with requests it
+shouldn't make (other local processes, or a remote client if the
+operator exposes the port).
+
+- **Controls:**
+  - **Bearer auth on everything except `GET /api/health`** — the
+    token comes from `APP_TOKEN` or is bootstrapped once into
+    `data/app_token.txt` (owner-only file on POSIX; git-ignored
+    everywhere). SSE streams require the same header (a browser
+    `EventSource` alone is therefore not enough — no silent
+    unauthenticated event leak).
+  - **`127.0.0.1` default bind** — the server is loopback-only
+    unless the operator explicitly changes `api_host`; it is never
+    intended for public exposure (no TLS, single-user token).
+  - Empty CORS allow-list by default; docs/OpenAPI/schema routes
+    disabled; request bodies capped at 64 KiB.
+  - **Responses and SSE events are contract-typed**: progress
+    events are content-free (node/tool/category/latency only —
+    never arguments, page text or prompts), error responses carry a
+    fixed message plus a coarse `error_category`, and provider
+    exception text is type-only in state (raw text goes to logs).
+  - Session/run IDs are unguessable UUIDs and always scoped — a
+    404/403 is returned for cross-session access attempts.
+- **Residual:** the token is stored in plaintext next to the data
+  it protects (acceptable while loopback-only); no per-user authn,
+  no rate limiting beyond concurrency limits (see R8).
+
+---
+
 ## 4. Threat catalog → controls (OWASP LLM mapping)
 
 | Threat (style) | Boundary | Primary control(s) | Layer | Test evidence |
@@ -333,11 +365,14 @@ Honesty rules baked into the suite:
 
 ## 7. Verification status
 
-**Verified offline (deterministic):** 453 passing tests (1 skipped —
-the opt-in live test), including the five new security suites;
-benchmark 23/23 with no unexplained regressions; security suite 25/25;
-mocked-transport SSRF/redirect/pinning/TLS tests; canary-based
-exfiltration tests over prompts, logs, metrics and report JSON.
+**Verified offline (deterministic):** 506 passing tests (1 skipped —
+the opt-in live test), including the five security suites and the
+Phase 4D API suites (auth, lifecycle, idempotency, SSE replay/race,
+crash-recovery/resume, cancellation, canary exfiltration over every
+response surface); benchmark 23/23 with no unexplained regressions;
+security suite 25/25; mocked-transport SSRF/redirect/pinning/TLS
+tests; canary-based exfiltration tests over prompts, logs, metrics,
+report JSON, API responses, SSE streams and the SQLite files.
 
 **NOT verified:**
 
@@ -363,6 +398,7 @@ exfiltration tests over prompts, logs, metrics and report JSON.
 | R5 | **No outbound rate limiting / destination reputation** — budgets bound *this run*, not a compromised long-lived deployment. | POC scope. | Deploy behind egress controls with allow-listing. |
 | R6 | **Supply-chain depth** — pins prevent drift but don't attest provenance (no hashes/SBOM/signatures). | Approval-gated tooling constraint. | Add hash-pinning + SBOM scan before any production pilot. |
 | R7 | **Single-tenant trust** — the operator's question is trusted input. | POC usage model. | Multi-tenant would need per-tenant isolation and TB1 hardening. |
+| R8 | **Loopback HTTP + single bearer token** (Phase 4D API) — no TLS, no per-user authn, no request rate limiting; the token sits in `data/app_token.txt`. | Single-user, localhost-by-design POC scope (TB10). | Keep `api_host=127.0.0.1`; never port-forward without a TLS-terminating reverse proxy that adds real authn; rotate `APP_TOKEN` by deleting the token file and restarting. |
 
 ---
 
@@ -376,4 +412,37 @@ exfiltration tests over prompts, logs, metrics and report JSON.
   don't log payloads.
 - Re-run `pytest` + `python -m evals` + `python -m evals --security`
   before any change to prompts, tools, or network code.
-- Treat R1–R7 as open items for a production readiness review.
+- Treat R1–R8 as open items for a production readiness review.
+
+---
+
+## 10. Persistence, deletion and secure erasure (Phase 4D)
+
+**What is persisted where:**
+
+| File | Contents | Lifetime |
+|---|---|---|
+| `data/app.db` (+ `-wal`/`-shm`) | Sessions, questions, answers, review status, sources, sequenced progress events, run diagnostics | Until deleted; rows cascade with their session |
+| `data/checkpoints.db` (+ `-wal`/`-shm`) | LangGraph checkpoints (full node state, including prompt-derived content) for resumable runs | Checkpoints are **pruned when a run reaches a terminal state**; only interrupted runs keep one (and it is deleted when the resumed run finishes) |
+| `data/app_token.txt` | The local API bearer token | Until deleted (then a new one is bootstrapped) |
+
+**Deletion is not secure erasure.** Deleting these files (or a
+session row) removes them from the filesystem/logic path but does
+**not** guarantee the bytes are gone: SQLite pages survive in free
+pages and WAL journals until overwritten, SSD wear-levelling and
+journaling file systems keep stale copies, and page-level
+backups/snapshots may hold any of it. The data is treated as
+**sensitive at rest by policy**: `data/` is git-ignored, files are
+created owner-readable where the OS supports it (POSIX), and no
+plaintext secrets are ever written to them (credentials are redacted
+before state is stored; the API token is the one deliberate secret,
+kept in its own file rather than in the database). Where erasure
+must be cryptographically guaranteed, use an encrypted volume and
+destroy the key — file deletion alone is documented here as
+insufficient.
+
+**API-side invariants** (enforced by tests): configuration secrets
+and the bearer token never appear in any response, event stream or
+SQLite byte range; provider exceptions surface as type + category
+only; answers are credential-redacted before persistence; progress
+events are whitelisted and content-free.

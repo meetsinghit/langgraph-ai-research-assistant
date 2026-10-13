@@ -85,10 +85,18 @@ class GraphState(TypedDict, total=False):
     tokens_in: int
     tokens_out: int
     estimated_cost_usd: float
-    #: the run's shared global execution budget (an
-    #: agent.deadline.RunDeadline), stamped once per invocation by
-    #: the graph's ``start`` node — every node and retry consults it
-    deadline: Any
-    #: True once a guard/loop observed the global deadline expired;
-    #: routing uses it to terminate instead of starting new work
+    #: the run's global execution budget in SECONDS, stamped once
+    #: per invocation by the graph's ``start`` node as a
+    #: serializable primitive (Phase 4D). The LIVE budget/cancel
+    #: object (agent.deadline.RunDeadline) travels in the
+    #: runtime-only RunContext — never in state, so checkpoints
+    #: contain only JSON-safe values.
+    deadline_total_seconds: float | None
+    #: True once a guard/loop observed the global deadline expired
+    #: OR a cooperative cancellation; routing uses it to terminate
+    #: instead of starting new work
     deadline_exceeded: bool
+    #: server-derived conversation summary from earlier runs of the
+    #: session (follow-up context, Phase 4D): ADVISORY text only —
+    #: never evidence, never citable; empty for a first turn
+    conversation_context: str

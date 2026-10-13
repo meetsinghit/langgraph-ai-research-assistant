@@ -26,7 +26,9 @@ class ScriptedChatModel(BaseChatModel):
 
     responses: list[AIMessage] = Field(default_factory=list)
     structured_outputs: list[Any] = Field(default_factory=list)
-    raise_on_call: dict[int, Exception] = Field(default_factory=dict)
+    #: BaseException (not just Exception) so tests can script an
+    #: escaped "process death" that nothing in the graph catches
+    raise_on_call: dict[int, BaseException] = Field(default_factory=dict)
     #: structured (plan/review) invokes at these indices raise —
     #: mirrors ``raise_on_call`` for the ``with_structured_output``
     #: path so provider failures on structured nodes are testable.

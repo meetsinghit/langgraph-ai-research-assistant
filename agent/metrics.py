@@ -41,7 +41,8 @@ __all__ = [
 
 #: Outcome taxonomy for a completed run (WS-F). Computed by the
 #: graph's terminal nodes, never guessed from partial data:
-#: COMPLETED, COMPLETED_WITH_WARNINGS, INCOMPLETE, TIMED_OUT, FAILED
+#: COMPLETED, COMPLETED_WITH_WARNINGS, INCOMPLETE, TIMED_OUT,
+#: CANCELLED (cooperative cancel, Phase 4D), FAILED
 #: (+ UNSPECIFIED when no terminal node ran — e.g. the caller never
 #: let the graph finish).
 RunOutcome = (
@@ -49,6 +50,7 @@ RunOutcome = (
     "COMPLETED_WITH_WARNINGS",
     "INCOMPLETE",
     "TIMED_OUT",
+    "CANCELLED",
     "FAILED",
     "UNSPECIFIED",
 )

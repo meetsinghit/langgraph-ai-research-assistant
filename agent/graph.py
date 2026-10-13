@@ -105,6 +105,11 @@ from agent.routing import (
     route_after_research,
     route_after_review,
 )
+from agent.runtime import (
+    RunContext,
+    current_deadline,
+    get_run_context,
+)
 from agent.state import Finding, GraphState, ReviewStatus
 from agent.tools import (
     PolicyRefusal,
@@ -552,10 +557,40 @@ def _out_of_phase_message(name: str, allowed: frozenset[str]) -> str:
     return f"{name} is not available in this step (allowed: {', '.join(sorted(allowed))})."
 
 
+#: Hard cap on follow-up context injected into a prompt (defense in
+#: depth — the API layer bounds it further before it reaches state).
+_CONVERSATION_CONTEXT_MAX_CHARS = 2000
+
+
+def _conversation_block(state: GraphState) -> str | None:
+    """Server-derived follow-up context (Phase 4D), clearly fenced.
+
+    ``conversation_context`` is application-generated (earlier turns
+    of the SAME session, already credential-redacted) and is advisory
+    background for a follow-up question. It is labeled NON-EVIDENCE
+    so it can never satisfy a verification gate and must never be
+    cited: citations are validated against THIS run's findings only.
+    """
+    context = (state.get("conversation_context") or "").strip()
+    if not context:
+        return None
+    if len(context) > _CONVERSATION_CONTEXT_MAX_CHARS:
+        context = context[:_CONVERSATION_CONTEXT_MAX_CHARS].rstrip()
+    return (
+        "Prior conversation (context only — background for this "
+        "follow-up, NOT evidence and NOT citable; base the answer "
+        "only on findings gathered by THIS run's tools):\n"
+        + context
+    )
+
+
 def _research_prompt(
     state: GraphState, max_chars: int = 6000
 ) -> str:
     parts = [f"Question: {state['question']}"]
+    conversation = _conversation_block(state)
+    if conversation:
+        parts.append(conversation)
     if requests_official_sources(state["question"]):
         # Deterministic steering: repeated searches restricted to
         # legacy documentation domains waste the search budget on
@@ -608,9 +643,14 @@ def _research_prompt(
 def _retry_kwargs(settings: Settings, state: GraphState) -> dict[str, Any]:
     """Retry-policy context every node passes to
     :func:`_invoke_with_retry`: the run's shared global deadline plus
-    the bounded, configurable attempt/backoff budget (WS-C / WS-D)."""
+    the bounded, configurable attempt/backoff budget (WS-C / WS-D).
+
+    The deadline comes from the runtime-only ``RunContext`` (Phase
+    4D) — never from state, which only carries the serializable
+    budget primitive.
+    """
     return {
-        "deadline": state.get("deadline"),
+        "deadline": current_deadline(),
         "max_retries": settings.llm_max_retries,
         "backoff_max": settings.retry_backoff_max_seconds,
     }
@@ -800,9 +840,13 @@ def make_plan_node(
 
     def plan_node(state: GraphState) -> dict[str, Any]:
         question = state["question"]
+        human = question
+        conversation = _conversation_block(state)
+        if conversation:
+            human = f"{human}\n\n{conversation}"
         messages = [
             SystemMessage(content=_PLAN_SYSTEM),
-            HumanMessage(content=question),
+            HumanMessage(content=human),
         ]
         try:
             result = _invoke_with_retry(
@@ -1049,13 +1093,16 @@ def make_research_node(
     verify_required = settings.min_retrieved_sources > 0
 
     def research_node(state: GraphState) -> dict[str, Any]:
-        deadline = state.get("deadline")
+        context = get_run_context()
+        deadline = context.deadline if context is not None else None
         if deadline is not None and deadline.expired():
             # WS-C: no new work starts after the global deadline — a
             # controlled skip whose error the routers act on (route
             # short-circuits on the flag, so no further pass runs).
             message = (
-                "global execution deadline expired before research "
+                "run cancelled before research could start"
+                if deadline.cancelled
+                else "global execution deadline expired before research "
                 "could start"
             )
             logger.warning(message)
@@ -1095,6 +1142,57 @@ def make_research_node(
             node="research",
             sensitive_values=_sensitive_values(settings),
         )
+
+        def _execute_with_events(tool_call: dict[str, Any]) -> ToolResult:
+            """Execute a tool call and emit content-free progress events.
+
+            Events carry ONLY whitelisted fields (tool name, ok,
+            error CATEGORY, latency, discovered host/title) — never
+            arguments, page text, snippets or exception strings.
+            """
+            tool_name = str(tool_call.get("name") or "unknown")
+            if context is not None:
+                context.emit(
+                    {"type": "tool.started", "tool": tool_name}
+                )
+            tool_started = time.monotonic()
+            result = executor.execute(tool_call)
+            if context is not None:
+                event: dict[str, Any] = {
+                    "type": "tool.finished",
+                    "tool": str(result.get("tool") or tool_name),
+                    "ok": bool(result.get("ok")),
+                    "latency_ms": int(
+                        (time.monotonic() - tool_started) * 1000.0
+                    ),
+                }
+                if not result.get("ok"):
+                    event["error_category"] = str(
+                        result.get("error_category") or "unknown"
+                    )
+                context.emit(event)
+                if result.get("ok"):
+                    target = str(result.get("args", {}).get("url") or "")
+                    if result.get("tool") == "web_search":
+                        items = result.get("data") or []
+                        if isinstance(items, list):
+                            for item in items:
+                                if isinstance(item, dict) and item.get("url"):
+                                    context.emit(
+                                        {
+                                            "type": "source.discovered",
+                                            "url": str(item["url"]),
+                                            "title": str(
+                                                item.get("title") or ""
+                                            ),
+                                        }
+                                    )
+                    elif target:
+                        context.emit(
+                            {"type": "source.retrieved", "url": target}
+                        )
+            return result
+
         iteration = state.get("iteration", 0) + 1
         update: dict[str, Any] = {"iteration": iteration}
         if metrics is not None:
@@ -1220,7 +1318,9 @@ def make_research_node(
                     return
                 if deadline is not None and deadline.expired():
                     message = (
-                        "global execution deadline expired during "
+                        "run cancelled during verification"
+                        if deadline.cancelled
+                        else "global execution deadline expired during "
                         "verification"
                     )
                     logger.warning(message)
@@ -1234,7 +1334,7 @@ def make_research_node(
                     return
                 url = pending[0]
                 attempted_urls.add(url)
-                result = executor.execute(
+                result = _execute_with_events(
                     {
                         "name": "fetch_page",
                         "args": {"url": url},
@@ -1261,8 +1361,10 @@ def make_research_node(
                 break
             if deadline is not None and deadline.expired():
                 message = (
-                    "global execution deadline expired during research; "
-                    "stopping this pass"
+                    "run cancelled during research; stopping this pass"
+                    if deadline.cancelled
+                    else "global execution deadline expired during "
+                    "research; stopping this pass"
                 )
                 logger.warning(message)
                 update["errors"] = [message]
@@ -1296,8 +1398,11 @@ def make_research_node(
                     **_retry_kwargs(settings, state),
                 )
             except Exception as exc:
-                provider_error = f"LLM provider failed: {type(exc).__name__}: {exc}"
-                logger.error(provider_error)
+                # Raw exception text goes to the LOG only: state
+                # errors surface in API answers/responses (Phase 4D),
+                # which must never carry raw provider exceptions.
+                provider_error = f"LLM provider failed: {type(exc).__name__}"
+                logger.error("LLM provider failed: %s: %s", type(exc).__name__, exc)
                 break
 
             delta_in, delta_out = _usage_delta(response)
@@ -1343,7 +1448,9 @@ def make_research_node(
                     # global deadline; still answer the call so the
                     # provider transcript stays valid.
                     message = (
-                        "global execution deadline expired before a "
+                        "run cancelled before a scheduled tool call"
+                        if deadline.cancelled
+                        else "global execution deadline expired before a "
                         "scheduled tool call"
                     )
                     logger.warning(message)
@@ -1384,7 +1491,7 @@ def make_research_node(
                     )
                     executed_calls += 1
                     continue
-                result = executor.execute(tool_call)
+                result = _execute_with_events(tool_call)
                 signals = scan_result(result)
                 messages.append(
                     ToolMessage(
@@ -1463,6 +1570,9 @@ def make_synthesize_node(
             f"Question: {state['question']}",
             _verification_line(findings, settings.min_retrieved_sources),
         ]
+        conversation = _conversation_block(state)
+        if conversation:
+            prompt_parts.append(conversation)
         official_block = _official_sources_block(findings, state["question"])
         if official_block:
             prompt_parts.append(official_block)
@@ -1483,8 +1593,9 @@ def make_synthesize_node(
                 **_retry_kwargs(settings, state),
             )
         except Exception as exc:
-            error = f"synthesis failed: {type(exc).__name__}: {exc}"
-            logger.error(error)
+            # Type-only in state (reaches API answers); raw text logged.
+            error = f"synthesis failed: {type(exc).__name__}"
+            logger.error("synthesis failed: %s: %s", type(exc).__name__, exc)
             return {
                 "final_answer": f"Answer could not be generated: {error}",
                 "errors": [error],
@@ -1678,8 +1789,8 @@ def make_review_node(
             )
         except Exception as exc:
             # Fail-safe: a failed review must never silently restart research.
-            error = f"review failed: {type(exc).__name__}: {exc}"
-            logger.error(error)
+            error = f"review failed: {type(exc).__name__}"
+            logger.error("review failed: %s: %s", type(exc).__name__, exc)
             if metrics is not None:
                 metrics.set_quality(
                     **_quality_summary(
@@ -1749,18 +1860,25 @@ def make_review_node(
 
 
 def _run_outcome(
-    *, deadline_hit: bool, answer: bool, review: ReviewStatus | None
+    *, deadline_hit: bool, answer: bool, review: ReviewStatus | None,
+    cancelled: bool = False,
 ) -> str:
     """Deterministic run outcome (WS-F taxonomy).
 
-    TIMED_OUT outranks everything (the run stopped early — even if
-    an answer exists, it was not fully processed). FAILED covers no
-    answer / failed review. COMPLETED requires an approved verdict;
-    a budget-spent ``needs_more_research`` (answer labeled but the
-    gate was not satisfied) is INCOMPLETE. ``set_outcome`` upgrades
-    COMPLETED to COMPLETED_WITH_WARNINGS when observed warnings
-    (tool failures, provider retries, mixed token coverage) exist.
+    CANCELLED and TIMED_OUT outrank everything (the run stopped early
+    — even if an answer exists, it was not fully processed);
+    CANCELLED is distinguished from TIMED_OUT so a user-requested
+    stop is never mislabeled as a budget overrun (Phase 4D — the
+    cooperative cancel reuses the deadline machinery, so the flag
+    must be split at the outcome). FAILED covers no answer / failed
+    review. COMPLETED requires an approved verdict; a budget-spent
+    ``needs_more_research`` (answer labeled but the gate was not
+    satisfied) is INCOMPLETE. ``set_outcome`` upgrades COMPLETED to
+    COMPLETED_WITH_WARNINGS when observed warnings (tool failures,
+    provider retries, mixed token coverage) exist.
     """
+    if cancelled:
+        return "CANCELLED"
     if deadline_hit:
         return "TIMED_OUT"
     if not answer or review == ReviewStatus.FAILED:
@@ -1771,13 +1889,15 @@ def _run_outcome(
 
 
 def _partial_deadline_answer(
-    state: GraphState, findings: list[Finding]
+    state: GraphState, findings: list[Finding], *, cancelled: bool = False
 ) -> str:
     """Honest partial result after a global-deadline stop (WS-C).
 
-    Preserves the PROVENANCE gathered before the deadline without
+    Preserves the PROVENANCE gathered before the stop without
     synthesizing any claim: synthesis/review never ran, so this
-    lists sources only and says so explicitly.
+    lists sources only and says so explicitly. A cooperative
+    cancellation (Phase 4D) uses the same shape with honest
+    cancel wording — never "deadline" wording for a user stop.
     """
     sources = list(state.get("sources") or [])
     if not sources:
@@ -1787,20 +1907,27 @@ def _partial_deadline_answer(
             if url and url not in seen:
                 seen.add(url)
                 sources.append(url)
-    lines = [
-        "Research exceeded the global execution time budget and did "
-        "not complete a verified answer.",
-        "",
-        "Sources gathered before the deadline:",
-    ]
+    if cancelled:
+        opener = (
+            "Research was cancelled before a verified answer was "
+            "completed."
+        )
+        heading = "Sources gathered before cancellation:"
+    else:
+        opener = (
+            "Research exceeded the global execution time budget and "
+            "did not complete a verified answer."
+        )
+        heading = "Sources gathered before the deadline:"
+    lines = [opener, "", heading]
     lines.extend(f"- {url}" for url in sources)
     if not sources:
         lines.append("- none")
     lines.append("")
     lines.append(
         "This partial result lists provenance only. Synthesis and "
-        "quality review did not run before the deadline, so no "
-        "claims were generated."
+        "quality review did not complete, so no claims were "
+        "generated."
     )
     return "\n".join(lines)
 
@@ -1822,17 +1949,24 @@ def make_finalize_node(
 
     def finalize_node(state: GraphState) -> dict[str, Any]:
         deadline_hit = bool(state.get("deadline_exceeded"))
+        context = get_run_context()
+        cancelled = bool(
+            context is not None
+            and context.deadline is not None
+            and context.deadline.cancelled
+        )
         answer = state.get("final_answer", "")
         review = state.get("review_status")
         findings = state.get("findings") or []
         update: dict[str, Any] = {}
         if deadline_hit and not answer:
             update["final_answer"] = _partial_deadline_answer(
-                state, findings
+                state, findings, cancelled=cancelled
             )
             logger.warning(
-                "global deadline expired with %d finding(s) and no "
+                "run stopped early (%s) with %d finding(s) and no "
                 "answer; returning provenance only",
+                "cancelled" if cancelled else "global deadline",
                 len(findings),
             )
         # Exit-point credential filter (Phase 4C, defense in depth):
@@ -1861,6 +1995,7 @@ def make_finalize_node(
                     deadline_hit=deadline_hit,
                     answer=bool(answer or update.get("final_answer")),
                     review=review,
+                    cancelled=cancelled,
                 ),
                 warnings=warnings,
             )
@@ -1882,22 +2017,42 @@ def make_error_node(metrics: MetricsCollector | None = None) -> Node:
     """Controlled failure: a clear, readable error as the answer.
 
     Also stamps the terminal outcome (WS-F): a run that stopped
+    because the operator cancelled is CANCELLED, a run that stopped
     because the global deadline expired is TIMED_OUT, every other
     controlled failure is FAILED. ``handle_error`` routes straight
     to END, so this node is the only place that outcome can be
     recorded for error runs.
+
+    Phase 4D fix: this path bypasses ``finalize`` (the exit-point
+    credential filter), so the answer produced here — which embeds
+    state error strings that may quote provider exception text — is
+    passed through ``redact_credentials`` right here.
     """
 
     def error_node(state: GraphState) -> dict[str, Any]:
         errors = state.get("errors") or []
         detail = "; ".join(errors) if errors else "unknown error"
+        context = get_run_context()
+        cancelled = bool(
+            context is not None
+            and context.deadline is not None
+            and context.deadline.cancelled
+        )
+        answer, redactions = redact_credentials(
+            f"Research could not be completed: {detail}"
+        )
+        if redactions and metrics is not None:
+            metrics.record_answer_redactions(redactions)
         if metrics is not None:
-            metrics.set_outcome(
-                "TIMED_OUT" if state.get("deadline_exceeded") else "FAILED",
-                warnings=["state_errors"] if errors else [],
-            )
+            if cancelled:
+                metrics.set_outcome("CANCELLED", warnings=["state_errors"])
+            else:
+                metrics.set_outcome(
+                    "TIMED_OUT" if state.get("deadline_exceeded") else "FAILED",
+                    warnings=["state_errors"] if errors else [],
+                )
         return {
-            "final_answer": f"Research could not be completed: {detail}",
+            "final_answer": answer,
             "review_status": ReviewStatus.FAILED,
         }
 
@@ -1907,13 +2062,23 @@ def make_error_node(metrics: MetricsCollector | None = None) -> Node:
 def _timed_node(
     name: str, node: Node, metrics: MetricsCollector
 ) -> Node:
-    """Wrap a graph node to record its execution latency."""
+    """Wrap a graph node to record its latency and emit stage events.
+
+    The progress events (Phase 4D) are emitted through the runtime
+    ``RunContext`` sink — a no-op when no sink is attached (CLI,
+    evals, the pre-4D test-suite path).
+    """
 
     def timed_node(state: GraphState) -> dict[str, Any]:
         started = time.monotonic()
+        context = get_run_context()
+        if context is not None:
+            context.emit({"type": "stage.started", "node": name})
         try:
             return node(state)
         finally:
+            if context is not None:
+                context.emit({"type": "stage.finished", "node": name})
             metrics.record_node(
                 name, (time.monotonic() - started) * 1000.0
             )
@@ -1932,25 +2097,36 @@ def _deadline_guarded(
 
     A guard returns a small state update instead of raising: routing
     stays pure and deterministic, and the terminal nodes convert the
-    flag into an honest TIMED_OUT outcome. Nodes that legitimately
+    flag into an honest TIMED_OUT (or, when the stop was a
+    cooperative cancel, CANCELLED) outcome. Nodes that legitimately
     run after expiry (the finalize pass-through, handle_error) are
     deliberately NOT guarded.
     """
 
     def guarded(state: GraphState) -> dict[str, Any]:
-        deadline = state.get("deadline")
+        deadline = current_deadline()
         if deadline is not None and deadline.expired():
-            logger.warning(
-                "global execution deadline (%.0fs) expired before %s "
-                "could run; skipping",
-                getattr(deadline, "total_seconds", 0.0),
-                name,
-            )
+            cancel = deadline.cancelled
+            if cancel:
+                logger.warning(
+                    "run cancelled before %s could run; skipping", name
+                )
+            else:
+                logger.warning(
+                    "global execution deadline (%.0fs) expired before %s "
+                    "could run; skipping",
+                    deadline.total_seconds,
+                    name,
+                )
             if metrics is not None:
                 metrics.mark_deadline_exceeded()
             update: dict[str, Any] = {"deadline_exceeded": True}
             if extra:
                 update.update(extra)
+            if cancel and "errors" in (extra or {}):
+                # The configured extra text speaks of the TIME budget;
+                # a cancelled run must say so honestly instead.
+                update["errors"] = [f"run cancelled before {name} could run"]
             return update
         return node(state)
 
@@ -1960,24 +2136,28 @@ def _deadline_guarded(
 def make_start_node(
     settings: Settings,
     metrics: MetricsCollector | None = None,
-    clock: Callable[[], float] | None = None,
 ) -> Node:
-    """Stamp ONE run-level global deadline before any work (WS-C).
+    """Stamp the run-level budget PRIMITIVE before any work (WS-C).
 
-    ``start`` runs once per graph invocation (state is per-invocation),
-    so every node, retry, backoff sleep and tool call consults the
-    SAME monotonic expiry. The configured budget is mirrored into the
-    metrics report; ``clock`` is injectable so tests can drive a fake
-    clock deterministically.
+    The LIVE deadline (monotonic clock + cancel flag) travels in the
+    runtime-only ``RunContext`` and is never written to state
+    (Phase 4D: state must stay JSON-serializable for checkpointing).
+    The ``start`` node mirrors the configured budget into state as a
+    plain float for durability and diagnostics, and the metrics
+    report records it.
     """
 
     def start_node(state: GraphState) -> dict[str, Any]:
+        context = get_run_context()
+        total = (
+            context.deadline.total_seconds
+            if context is not None and context.deadline is not None
+            else settings.max_total_execution_seconds
+        )
         if metrics is not None:
-            metrics.record_deadline(settings.max_total_execution_seconds)
+            metrics.record_deadline(total)
         return {
-            "deadline": RunDeadline(
-                settings.max_total_execution_seconds, clock=clock
-            ),
+            "deadline_total_seconds": total,
             "deadline_exceeded": False,
         }
 
@@ -1992,7 +2172,8 @@ def build_research_graph(
     rate_limit_retry_delay: float = _RATE_LIMIT_RETRY_DELAY_SECONDS,
     metrics: MetricsCollector | None = None,
     clock: Callable[[], float] | None = None,
-) -> CompiledStateGraph:
+    checkpointer: Any | None = None,
+) -> "ResearchGraph":
     """Wire the research graph.
 
     Conditional edges use the deterministic routing layer —
@@ -2008,10 +2189,19 @@ def build_research_graph(
     When omitted, a throwaway collector is used so instrumentation
     is always uniform.
 
-    ``clock`` is the monotonic clock for the run's global deadline
-    (the ``start`` node stamps one deadline per invocation); tests
-    pass a fake clock so timeout paths are deterministic and never
-    sleep.
+    ``clock`` is the monotonic clock for the run's global deadline;
+    tests pass a fake clock so timeout paths are deterministic and
+    never sleep. The deadline object itself lives in the
+    runtime-only :class:`~agent.runtime.RunContext`, which this
+    function's :class:`ResearchGraph` wrapper creates fresh for
+    every invocation unless the caller supplies its own context
+    (the application layer does — with a cancel surface and a
+    progress sink).
+
+    ``checkpointer`` (Phase 4D) is handed to LangGraph's
+    ``compile()`` for durable execution (e.g. a shared
+    ``SqliteSaver``); ``None`` (the default) keeps the CLI/eval
+    behavior stateless, exactly as before.
     """
     if metrics is None:
         metrics = MetricsCollector()
@@ -2020,7 +2210,7 @@ def build_research_graph(
         "start",
         _timed_node(
             "start",
-            make_start_node(settings, metrics, clock=clock),
+            make_start_node(settings, metrics),
             metrics,
         ),
     )
@@ -2116,4 +2306,60 @@ def build_research_graph(
         {ROUTE_RESEARCH: "research", ROUTE_FINALIZE: "finalize"},
     )
 
-    return builder.compile()
+    compiled = builder.compile(checkpointer=checkpointer)
+
+    def default_context() -> RunContext:
+        """Fresh runtime context for one invocation (CLI/evals path)."""
+        return RunContext(
+            deadline=RunDeadline(
+                settings.max_total_execution_seconds, clock=clock
+            )
+        )
+
+    return ResearchGraph(compiled, default_context)
+
+
+class ResearchGraph:
+    """Thin delegate around the compiled LangGraph (Phase 4D).
+
+    Guarantees that EVERY invocation carries a runtime
+    :class:`~agent.runtime.RunContext`, created fresh per call when
+    the caller supplies none: a fresh monotonic deadline means the
+    CLI, the evals and every pre-4D test behave exactly as before
+    (one budget per invocation). The application layer passes its
+    own context to attach cooperative cancellation and the progress
+    sink.
+
+    Durable-state guarantee: the context is LangGraph runtime
+    context, not graph state — the checkpointer never sees it, so
+    checkpoints contain only JSON-safe primitives.
+
+    ``invoke``/``stream`` are the only call surfaces the codebase
+    uses; everything else delegates to the wrapped compiled graph.
+    """
+
+    def __init__(self, compiled: CompiledStateGraph, default_context_factory: Callable[[], RunContext]) -> None:
+        self._compiled = compiled
+        self._default_context_factory = default_context_factory
+
+    def _with_context(
+        self, context: RunContext | None
+    ) -> RunContext:
+        if isinstance(context, RunContext):
+            return context
+        return self._default_context_factory()
+
+    def invoke(self, input: Any, config: Any = None, *, context: Any = None, **kwargs: Any) -> Any:
+        return self._compiled.invoke(
+            input, config, context=self._with_context(context), **kwargs
+        )
+
+    def stream(self, input: Any, config: Any = None, *, context: Any = None, **kwargs: Any) -> Any:
+        return self._compiled.stream(
+            input, config, context=self._with_context(context), **kwargs
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything else (get_state, update_state, get_graph,
+        # ...) to the wrapped compiled graph.
+        return getattr(self._compiled, name)
