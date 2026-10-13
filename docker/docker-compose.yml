@@ -1,0 +1,63 @@
+# AI Research Assistant - local container stack (Phase 4D.3).
+#
+# STATUS: UNVERIFIED AT RUNTIME. Docker was not installed on the review
+# machine; this file is statically validated only. See docs/OPERATIONS.md.
+#
+# Usage (from the repository root):
+#   docker compose -f docker/docker-compose.yml up -d --build
+#   docker compose -f docker/docker-compose.yml down        (keeps your data)
+#
+# Posture:
+#   - ONE service (the server also serves the built UI; no proxy needed);
+#   - published on 127.0.0.1 only - never reachable from the network;
+#   - SQLite data persists in the named volume "assistant-data";
+#   - secrets come from ../.env at runtime - never baked into the image.
+#
+# Requires Docker Compose v2.24+ (for `env_file: required: false`).
+
+services:
+  research-assistant:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ai-research-assistant:local
+    container_name: research-assistant
+
+    ports:
+      # Loopback-only publish: the app is reachable only from this machine.
+      - "127.0.0.1:8000:8000"
+
+    environment:
+      # Container-internal bind (see Dockerfile comment); the host
+      # publish above remains 127.0.0.1.
+      API_HOST: 0.0.0.0
+      API_PORT: 8000
+      DATA_DIR: /app/data
+      # APP_TOKEN: optional. If unset, a secure token is bootstrapped
+      # once into the data volume (data/app_token.txt). Retrieve it
+      # with: docker compose exec research-assistant cat /app/data/app_token.txt
+
+    env_file:
+      # GEMINI_API_KEY etc. Optional: if ../.env is absent the app still
+      # starts, but research runs report a provider error until a key
+      # is provided (compose v2.24+; older versions need the file to exist).
+      - path: ../.env
+        required: false
+
+    volumes:
+      # SQLite databases + bootstrapped token survive restarts.
+      - assistant-data:/app/data
+
+    restart: unless-stopped
+    # `docker compose down` stops it; `up -d` starts it again; data stays.
+    # WARNING: `down -v` DELETES the volume (your saved research + token).
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  assistant-data:

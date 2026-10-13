@@ -157,6 +157,12 @@ class Settings(BaseSettings):
     data_dir: str = "data"
     # SSE keepalive interval for idle streams.
     sse_heartbeat_seconds: float = Field(default=15.0, gt=0)
+    # Built browser UI directory (Phase 4D.3). When it exists, the
+    # server serves the UI on the same origin as /api (no proxy, no
+    # CORS); when missing the API still works and the root path
+    # explains how to build the UI. Relative to the working directory
+    # (run from the repository root).
+    frontend_dist: str = "frontend/dist"
     # Follow-up context (server-derived from prior runs of the same
     # session; never client-supplied) bounds.
     followup_context_max_turns: int = Field(default=3, ge=0, le=10)

@@ -6,6 +6,9 @@ Security posture (single-user, LOCAL-ONLY):
   ``/api/health`` is exempt and it reveals nothing. The token comes
   from ``APP_TOKEN`` or is bootstrapped once into
   ``<data_dir>/app_token.txt`` (git-ignored; treat like a credential).
+- The built browser UI (``frontend/dist``, Phase 4D.3) is served on
+  the same origin WITHOUT auth — static files contain no secrets and
+  the token is never embedded in them (see ``app/ui.py``).
 - Binds ``127.0.0.1`` by default. Do not publish this service.
 - CORS allowlist for the Vite dev server only; no credentials mode
   (the token travels in an explicit Authorization header).
@@ -190,7 +193,11 @@ def create_app(
                     )
             except ValueError:
                 pass
-        if request.url.path != "/api/health":
+
+        # Only the API is Bearer-protected; the built UI (static
+        # files) is public -- it contains no secrets. Unmatched /api
+        # paths still 401 here before any routing.
+        if request.url.path.startswith("/api/") and request.url.path != "/api/health":
             provided = request.headers.get("authorization", "")
             if not secrets.compare_digest(provided, expected_header):
                 return _UNAUTHORIZED
@@ -200,6 +207,12 @@ def create_app(
         manager.recover_interrupted()
 
     app.include_router(router)
+
+    # Built browser UI (Phase 4D.3): served same-origin from
+    # ``frontend/dist`` when present — API-only otherwise.
+    from app.ui import register_ui
+
+    register_ui(app, Path(settings.frontend_dist))
     return app
 
 

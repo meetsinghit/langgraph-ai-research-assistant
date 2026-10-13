@@ -23,6 +23,13 @@ export function useTheme(): { theme: Theme; toggle: () => void } {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
+    // Persist the cosmetic preference so a reload keeps it (the
+    // access token is deliberately NOT stored - only the theme).
+    try {
+      window.localStorage.setItem(STORAGE_KEY, theme);
+    } catch {
+      /* storage unavailable: theme stays session-only */
+    }
   }, [theme]);
 
   const toggle = useCallback(() => {

@@ -18,6 +18,11 @@ dist/
 # ---- Testing & logs ----
 .pytest_cache/
 *.log
+logs/
+
+# ---- Playwright E2E artifacts (traces may contain the synthetic token) ----
+frontend/e2e/test-results/
+frontend/e2e/playwright-report/
 
 # ---- Evaluation reports (generated, not source) ----
 evals/report.json

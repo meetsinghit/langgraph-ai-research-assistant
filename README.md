@@ -6,6 +6,21 @@ practical Agentic AI engineering.
 
 ## Quick start
 
+**Browser app (recommended for daily research):**
+
+```powershell
+# from the project root (AI_POC) — no terminal needed afterwards
+.\start-research-assistant.bat
+```
+
+One click builds/serves everything locally and opens
+`http://127.0.0.1:8000/`. On first run the launcher offers to copy
+the access token to your clipboard for the connection dialog.
+Operations guide (stop/restart, backups, troubleshooting, Docker):
+`docs/OPERATIONS.md`.
+
+**CLI (unchanged):**
+
 ```powershell
 # from the project root (AI_POC)
 .\ai_poc\Scripts\Activate.ps1
@@ -135,13 +150,23 @@ in any response or event, no raw exception text (type + coarse
 category only), no public bind, no TLS/multi-user auth (loopback
 POC scope, residual risk R8).
 
-## Web UI (Phase 4D.2)
+## Web UI (Phase 4D.2 + 4D.3 packaging)
 
 A browser front-end for the same API — three-region responsive
 layout (session history · conversation · sources/diagnostics),
 live SSE progress with resume-after-drop, safe markdown rendering,
 light/dark themes. React + TypeScript + Vite + Tailwind v4 in
 `frontend/`; it talks to the unmodified Phase 4D.1 backend.
+
+**Production mode (Phase 4D.3): one process, one origin.**
+`start-research-assistant.bat` runs the FastAPI server, which also
+serves the built bundle from `frontend/dist` on the same origin —
+no dev server, no proxy, no second port. Static files are public
+(they contain no secrets; the token is never in the bundle) while
+every `/api` route stays Bearer-protected. Hashed `/assets/*` are
+cached immutably for a year; `index.html` is always revalidated so
+new builds load on the next refresh; UI responses carry a
+restrictive CSP, `nosniff` and `Referrer-Policy: no-referrer`.
 
 **Local development:**
 
@@ -189,15 +214,26 @@ Open http://127.0.0.1:5173 and paste the access token from
 
 - `npm run typecheck` — `tsc --noEmit`
 - `npm test` — Vitest + React Testing Library + an in-memory MSW
-  backend (79 tests: auth/connection, conversation lifecycle, SSE
+  backend (82 tests: auth/connection, conversation lifecycle, SSE
   dedup/reconnect/backoff, progress/cancel/outcome states, resume
-  gating, panels/citations, safe markdown, a11y + drawers)
+  gating, panels/citations, safe markdown, a11y + drawers,
+  theme persistence)
 - `npm run build` — production bundle into `frontend/dist`
   (serving it with the API is packaging scope = Phase 4D.3)
 - `python ..\frontend\scripts\dump_api_fixtures.py` — regenerate
   `frontend/src/test/fixtures/backend/*.json` from the real FastAPI
   app after a backend contract change (`schemaCompat.test.ts` then
   verifies the UI types still match reality)
+
+**Real-browser E2E** (Phase 4D.3; Windows, Microsoft Edge, no API
+keys, no network — the backend runs scripted fakes through the real
+auth/SSE/SQLite stack while the browser drives the production bundle):
+
+```powershell
+cd frontend          # npm run build   (once: creates dist/)
+cd e2e               # npm install     (once: installs Playwright)
+npx playwright test
+```
 
 ## Architecture
 
@@ -535,13 +571,29 @@ AI_POC/
 ├── main.py                  CLI entry point (+ --metrics JSON report)
 ├── requirements.txt
 ├── .env.example             config template (no secrets)
+├── start-research-assistant.bat      one-click production launch (4D.3)
+├── start-research-assistant-dev.bat  dev launch (Vite hot reload)
+├── stop-research-assistant.bat       stops only launcher-started processes
+├── scripts/
+│   └── launcher.ps1         launcher core logic + self-tests
+├── docker/                  4D.3 container packaging (STATIC REVIEW ONLY,
+│   │                        not runtime-verified — see docs/OPERATIONS.md)
+│   ├── Dockerfile           multi-stage: Node UI build → non-root Python
+│   └── docker-compose.yml   loopback-only publish, data volume, healthcheck
+├── e2e/
+│   └── server.py            real-server E2E harness (scripted fakes,
+│                            test-only shutdown endpoint; no network)
 ├── docs/
+│   ├── OPERATIONS.md        run/stop/backup/troubleshoot guide (4D.3)
 │   └── SECURITY.md          Phase 4C threat model (10 trust boundaries,
 │                            controls, residual risks) + Phase 4D
 │                            API surface (TB10) & erasure policy (§10)
 ├── app/                     Phase 4D FastAPI service
-│   ├── main.py              app factory, auth middleware, token bootstrap,
-│   │                        checkpointer wiring, `python -m app.main`
+│   ├── main.py              app factory, auth middleware (/api only; static
+│   │                        UI is public), token bootstrap, checkpointer
+│   │                        wiring, `python -m app.main`
+│   ├── ui.py                serves the built frontend/dist same-origin
+│   │                        (cache headers, CSP, SPA fallback, traversal-safe)
 │   ├── api.py               routers + SSE stream (Last-Event-ID replay)
 │   ├── runs.py              run lifecycle manager (threads, CAS state
 │   │                        transitions, cancel/resume, event sanitizing)
@@ -582,6 +634,8 @@ AI_POC/
 │   ├── src/state/           in-memory auth context + app store
 │   ├── src/components/      layout, conversation, panels, safe markdown
 │   ├── src/test/            Vitest + RTL + MSW suite + real-API fixtures
+│   ├── e2e/                 Playwright real-browser suite (system Edge;
+│   │                        drives e2e/server.py through the production path)
 │   └── scripts/             dump_api_fixtures.py (fixtures from real FastAPI)
 └── tests/                   mocked unit tests + opt-in live test
                              (tool schema, search recovery, deadline,

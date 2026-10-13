@@ -17,6 +17,31 @@ if (typeof window.matchMedia !== "function") {
   })) as unknown as typeof window.matchMedia;
 }
 
+// jsdom (this version) lacks window.localStorage — provide a small
+// in-memory one so persistence can be tested (theme preference only;
+// the access token is deliberately never stored anywhere).
+if (typeof window.localStorage === "undefined") {
+  const store = new Map<string, string>();
+  Object.defineProperty(window, "localStorage", {
+    configurable: true,
+    value: {
+      getItem: (key: string) =>
+        store.has(key) ? (store.get(key) as string) : null,
+      setItem: (key: string, value: string) => {
+        store.set(String(key), String(value));
+      },
+      removeItem: (key: string) => {
+        store.delete(key);
+      },
+      clear: () => store.clear(),
+      key: (index: number) => Array.from(store.keys())[index] ?? null,
+      get length() {
+        return store.size;
+      },
+    } satisfies Storage,
+  });
+}
+
 // jsdom lacks scrollIntoView (citation highlight).
 Element.prototype.scrollIntoView = Element.prototype.scrollIntoView ?? (() => undefined);
 
@@ -45,5 +70,8 @@ beforeAll(() => {
 afterEach(() => {
   cleanup();
   server.resetHandlers();
+  // theme tests mutate these; keep tests isolated
+  window.localStorage.clear();
+  document.documentElement.classList.remove("dark");
 });
 afterAll(() => server.close());

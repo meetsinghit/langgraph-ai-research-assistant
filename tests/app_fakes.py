@@ -21,6 +21,8 @@ def make_settings(tmp_path: Path, **overrides: object) -> Settings:
         "_env_file": None,
         "data_dir": str(tmp_path / "data"),
         "app_token": TEST_TOKEN,
+        # Tests never serve the real built UI; packaging tests opt in.
+        "frontend_dist": str(tmp_path / "no_ui_here"),
         "min_findings": 1,
         "max_research_iterations": 2,
         "max_tool_calls_per_research": 2,

@@ -1,0 +1,36 @@
+# Build-context exclusions for docker/Dockerfile (context = repo root).
+# Goal: smallest possible context and NO secrets/state in any layer.
+
+# Secrets and local state - never in an image
+.env
+.env.*
+!.env.example
+data/
+logs/
+
+# Local environment + VCS
+ai_poc/
+.venv/
+venv/
+.git/
+.gitignore
+
+# Host build artifacts (the image builds its own from source)
+frontend/dist/
+frontend/node_modules/
+
+# Not needed at runtime
+tests/
+scripts/
+docs/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+evals/report.json
+evals/security_report.json
+run_metrics*.json
+
+# OS junk
+.DS_Store
+Thumbs.db
