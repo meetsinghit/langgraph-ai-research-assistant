@@ -1,24 +1,24 @@
 {
   "session": {
-    "id": "bd370d45-ba31-4cbd-bc52-063f4eb86ec5",
+    "id": "4e0eccf6-8d0b-4f64-a733-19be138e6597",
     "title": "Fixture session",
-    "created_at": "2026-10-14T14:46:30.582114+00:00",
-    "updated_at": "2026-10-14T14:46:30.675964+00:00",
+    "created_at": "2026-10-14T16:14:22.994497+00:00",
+    "updated_at": "2026-10-14T16:14:23.108002+00:00",
     "run_count": 1
   },
   "runs": [
     {
-      "id": "350caacc-ab54-4321-b7a5-a6a76b43918d",
-      "session_id": "bd370d45-ba31-4cbd-bc52-063f4eb86ec5",
+      "id": "cbc22cd5-c7c4-42ea-b3ba-cb9416b66164",
+      "session_id": "4e0eccf6-8d0b-4f64-a733-19be138e6597",
       "question": "question",
       "status": "completed",
       "has_answer": true,
-      "created_at": "2026-10-14T14:46:30.673036+00:00",
-      "started_at": "2026-10-14T14:46:30.714393+00:00",
-      "finished_at": "2026-10-14T14:46:30.836099+00:00",
+      "created_at": "2026-10-14T16:14:23.092966+00:00",
+      "started_at": "2026-10-14T16:14:23.150441+00:00",
+      "finished_at": "2026-10-14T16:14:23.312475+00:00",
       "research_depth": "standard",
       "evidence_policy": "balanced",
-      "model_id": "gemini-3.8-flash",
+      "model_id": "gemini-3.5-flash-lite",
       "thinking_level": "medium"
     }
   ]

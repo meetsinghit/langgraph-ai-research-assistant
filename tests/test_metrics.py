@@ -27,6 +27,13 @@ class TestCategorizeError:
             ("tool arguments must be an object", "validation"),
             ("llm provider failed", "provider"),
             ("provider failed with 500", "provider"),
+            # 4E.3 review (item 4): refused model access gets its own
+            # clear category, never a generic provider/unknown one
+            ("Model access failed: ClientError", "model_access"),
+            (
+                "Model access failed: ClientError; synthesis failed: ValueError",
+                "model_access",
+            ),
             ("execution deadline of 180s exhausted", "deadline"),
             ("global execution deadline has expired", "deadline"),
             ("something inexplicable", "unknown"),

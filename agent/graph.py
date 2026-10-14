@@ -103,7 +103,12 @@ from agent.injection import (
     scan_search_results,
     security_note,
 )
-from agent.llm import classify_provider_error, content_to_text, estimate_cost
+from agent.llm import (
+    classify_provider_error,
+    content_to_text,
+    estimate_cost,
+    is_model_access_failure,
+)
 from agent.metrics import MetricsCollector, categorize_error
 from agent.routing import (
     ROUTE_ERROR,
@@ -1500,7 +1505,14 @@ def make_research_node(
                 # Raw exception text goes to the LOG only: state
                 # errors surface in API answers/responses (Phase 4D),
                 # which must never carry raw provider exceptions.
-                provider_error = f"LLM provider failed: {type(exc).__name__}"
+                # A refused model access (e.g. the project is not
+                # permitted to use the selected model) gets its own
+                # clear, fixed-vocabulary error — never a switch to
+                # another model.
+                if is_model_access_failure(exc):
+                    provider_error = f"Model access failed: {type(exc).__name__}"
+                else:
+                    provider_error = f"LLM provider failed: {type(exc).__name__}"
                 logger.error("LLM provider failed: %s: %s", type(exc).__name__, exc)
                 break
 
@@ -1716,7 +1728,12 @@ def make_synthesize_node(
             )
         except Exception as exc:
             # Type-only in state (reaches API answers); raw text logged.
-            error = f"synthesis failed: {type(exc).__name__}"
+            # Model-access refusals use the clear fixed wording so a
+            # 403/404 from the provider is never an opaque failure.
+            if is_model_access_failure(exc):
+                error = f"Model access failed: {type(exc).__name__}"
+            else:
+                error = f"synthesis failed: {type(exc).__name__}"
             logger.error("synthesis failed: %s: %s", type(exc).__name__, exc)
             return {
                 "final_answer": f"Answer could not be generated: {error}",
@@ -1944,7 +1961,10 @@ def make_review_node(
             )
         except Exception as exc:
             # Fail-safe: a failed review must never silently restart research.
-            error = f"review failed: {type(exc).__name__}"
+            if is_model_access_failure(exc):
+                error = f"Model access failed: {type(exc).__name__}"
+            else:
+                error = f"review failed: {type(exc).__name__}"
             logger.error("review failed: %s: %s", type(exc).__name__, exc)
             if metrics is not None:
                 metrics.set_quality(

@@ -86,7 +86,9 @@ def test_free_only_selector_excludes_everything_unverified():
             assert spec.model_id not in selectable_ids
         if spec.status in ("deprecated", "shutdown"):
             assert spec.model_id not in selectable_ids
-    # the configured default is always in the selector
+    # the restored configured default AND the previous default both
+    # stay in the selector (nothing became unselectable)
+    assert "gemini-3.5-flash-lite" in selectable_ids
     assert "gemini-3.8-flash" in selectable_ids
     assert all(s.free_tier == "eligible" for s in selectable_models())
 

@@ -20,7 +20,11 @@ from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.deadline import RunDeadline
 from agent.graph import _invoke_with_retry, _response_usage
-from agent.llm import PROVIDER_FAILURE_CATEGORIES, classify_provider_error
+from agent.llm import (
+    PROVIDER_FAILURE_CATEGORIES,
+    classify_provider_error,
+    is_model_access_failure,
+)
 from agent.metrics import MetricsCollector
 from tests.fakes import FakeClock, ScriptedChatModel
 
@@ -70,6 +74,46 @@ def test_retry_after_from_exception_attribute():
     exc.retry_after = 7.0  # type: ignore[attr-defined]
     failure = classify_provider_error(exc)
     assert failure.retry_after == pytest.approx(7.0)
+
+
+# -- model-access refusal (4E.3 review item 4) ----------------------------
+#
+# Google limits the 2.5 family to projects that have actively used
+# those models: a project without access gets 403 PERMISSION_DENIED
+# or 404 NOT_FOUND "no longer available to new users". Those must
+# surface as the clear, fixed "Model access failed" wording — and
+# never as a hint to run a different (paid or alternate) model.
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("403 PERMISSION_DENIED"),
+        RuntimeError(
+            "403 PERMISSION_DENIED: models/gemini-2.5-pro is not "
+            "available to new users"
+        ),
+        RuntimeError("404 NOT_FOUND: models/gemini-2.5-flash-lite "
+                     "is no longer available to new users"),
+        RuntimeError("PERMISSION_DENIED: model not allowed"),
+    ],
+)
+def test_access_refusals_are_recognized(exc):
+    assert is_model_access_failure(exc) is True
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        RuntimeError("429 Too Many Requests"),        # transient — retryable
+        RuntimeError("503 Service Unavailable"),      # transient — retryable
+        RuntimeError("400 invalid argument"),         # bad request, not access
+        RuntimeError("provider exploded"),            # unknown — not access
+        TimeoutError("request deadline exceeded"),
+    ],
+)
+def test_non_access_failures_are_not_mislabeled(exc):
+    assert is_model_access_failure(exc) is False
 
 
 # -- retry behaviour ------------------------------------------------------

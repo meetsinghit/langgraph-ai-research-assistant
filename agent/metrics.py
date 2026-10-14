@@ -71,6 +71,12 @@ def categorize_error(exc: BaseException | str) -> str:
     # never degrades to "unknown", and never implies a fallback.
     if "model unavailable" in text or "model_unavailable" in text:
         return "model_unavailable"
+    # 4E.3 review (item 4): the provider refused access to the
+    # SELECTED model/credentials (e.g. Google's 2.5-family restriction
+    # for new projects). Fixed vocabulary only — no raw provider text,
+    # and the run never retries on a different model.
+    if "model access failed" in text:
+        return "model_access"
     # 4E.3: invalid/contradictory run configuration (bad thinking
     # level for the model, missing provider configuration, ...).
     if "configurationerror" in text or "modelselectionerror" in text:

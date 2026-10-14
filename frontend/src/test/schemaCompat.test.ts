@@ -126,7 +126,7 @@ describe("FastAPI schema compatibility (real captured fixtures)", () => {
     ]);
     expect(RUN_STATUSES).toContain(runDetail.status);
     // this fixture run used the configured defaults (frozen, not null)
-    expect(runDetail.model_id).toBe("gemini-3.8-flash");
+    expect(runDetail.model_id).toBe("gemini-3.5-flash-lite");
     expect(runDetail.thinking_level).toBe("medium");
     expect(runDetail.research_depth).toBe("standard");
     expect(runDetail.evidence_policy).toBe("balanced");
@@ -184,7 +184,7 @@ describe("FastAPI schema compatibility (real captured fixtures)", () => {
       "research_depth",
       "evidence_policy",
     ]);
-    expect(diagnostics.run_config.model_id).toBe("gemini-3.8-flash");
+    expect(diagnostics.run_config.model_id).toBe("gemini-3.5-flash-lite");
     expect(diagnostics.run_config.thinking_level).toBe("medium");
     expectKeys(diagnostics.counts, [
       "searches",

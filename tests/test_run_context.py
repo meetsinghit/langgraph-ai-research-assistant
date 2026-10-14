@@ -281,3 +281,41 @@ def test_error_node_redacts_credentials_bypassing_finalize():
     assert FAKE_KEY not in backstop_answer
     assert "[REDACTED-CREDENTIAL]" in backstop_answer
     assert metrics.snapshot()["security"]["answer_redactions"] >= 1
+
+
+def test_model_access_refusal_surfaces_clear_error_without_fallback():
+    """4E.3 review item 4: a provider refusal of the selected model
+    (Google restricts the 2.5 family to projects that actively used
+    them → 403/404 for everyone else) produces the CLEAR, fixed
+    "Model access failed: <type>" wording — the raw provider text
+    never enters state, and the run fails instead of switching to
+    any other (paid or alternate) model."""
+    settings = _settings()
+    refusal = (
+        "403 PERMISSION_DENIED: models/gemini-2.5-pro is no longer "
+        "available to new users"
+    )
+    model = ScriptedChatModel(
+        responses=[AIMessage(content="never used")],
+        structured_outputs=[ResearchPlan(queries=["q"])],
+        raise_on_call={0: RuntimeError(refusal)},
+    )
+    graph = build_research_graph(settings, model, FakeTools())
+
+    result = graph.invoke({"question": "question"})
+
+    answer = result["final_answer"]
+    # clear, type-only wording — never the raw provider message
+    assert answer == (
+        "Research could not be completed: Model access failed: RuntimeError"
+    )
+    assert "no longer available to new users" not in answer
+    assert "403" not in answer
+    # the run FAILED on the single scripted model — exactly one plain
+    # invocation was attempted and no second model was involved
+    # (there is no substitution path in the graph)
+    assert model.call_index == 1
+    # and the state error categorizes as model_access, not generic
+    from agent.metrics import categorize_error
+
+    assert categorize_error("; ".join(result["errors"])) == "model_access"

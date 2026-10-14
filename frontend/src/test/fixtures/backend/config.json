@@ -1,6 +1,6 @@
 {
   "provider": "gemini",
-  "model": "gemini-3.8-flash",
+  "model": "gemini-3.5-flash-lite",
   "thinking_level": null,
   "max_total_execution_seconds": 180.0,
   "max_research_iterations": 2,

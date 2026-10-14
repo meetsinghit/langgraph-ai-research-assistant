@@ -86,11 +86,24 @@ export interface ModelOut {
   display_name: string;
   family: string;
   status: string;
+  /**
+   * DOCUMENTED free-tier eligibility from the official pricing page
+   * (maintained in the backend registry). This says nothing about
+   * whether THIS project can actually call the model — it must never
+   * be rendered as if access had been verified.
+   */
   free_tier: string;
   /** the ONLY authority for what the user may pick */
   selectable: boolean;
   exclusion_reason?: string | null;
   thinking?: ModelThinking | null;
+  /**
+   * Live access probe result: "not_checked" until the opt-in
+   * discovery has run (it is off by default), then "confirmed" /
+   * "not_listed" / "unknown". A registry entry with availability
+   * "not_checked" has NOT been proven reachable — the UI never
+   * implies otherwise.
+   */
   availability: string;
   /** when the registry entry was last verified against official docs */
   verified_on?: string | null;
@@ -100,8 +113,10 @@ export interface ModelOut {
 }
 
 export interface ModelDiscoveryOut {
+  /** "disabled" = discovery never ran (default) — no access was checked */
   status: "disabled" | "available" | "unavailable";
   checked_at?: string | null;
+  /** fixed vocabulary for a failed discovery call — never raw provider text */
   error_category?: string | null;
   model_count?: number | null;
 }

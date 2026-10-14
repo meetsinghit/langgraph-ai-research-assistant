@@ -41,7 +41,11 @@ class Settings(BaseSettings):
 
     # --- LLM backend (wired up in Phase 3) ---
     llm_provider: ProviderName = "gemini"
-    llm_model: str = "gemini-3.8-flash"
+    # Fallback used only when LLM_MODEL is not set by the
+    # environment/.env. Explicit configuration always wins.
+    # 4E.3 review: restored to gemini-3.5-flash-lite as the default
+    # for new runs (gemini-3.8-flash remains registry-selectable).
+    llm_model: str = "gemini-3.5-flash-lite"
     llm_base_url: str | None = None
 
     # Optional reasoning-depth override for normal research runs

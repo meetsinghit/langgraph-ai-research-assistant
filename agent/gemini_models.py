@@ -143,9 +143,10 @@ GEMINI_MODEL_REGISTRY: dict[str, ModelSpec] = {
             default_thinking="medium",
             docs_url=_DOCS_BASE + "gemini-3.8-flash",
             notes=(
-                "Default model. 'minimal' is NOT supported on this "
-                "model (the API rejects it); reasoning defaults to "
-                "medium. Free tier is quota-limited."
+                "'minimal' is NOT supported on this model (the API "
+                "rejects it); reasoning defaults to medium. Selectable "
+                "— it is no longer the default model (4E.3 review). "
+                "Free tier is quota-limited."
             ),
         ),
         _spec(
@@ -171,8 +172,10 @@ GEMINI_MODEL_REGISTRY: dict[str, ModelSpec] = {
             default_thinking="minimal",
             docs_url=_DOCS_BASE + "gemini-3.5-flash-lite",
             notes=(
-                "Cheapest eligible option; defaults to minimal "
-                "thinking. Free tier is quota-limited."
+                "Default model (LLM_MODEL fallback; explicit "
+                "configuration overrides it). Cheapest eligible "
+                "option; defaults to minimal thinking. Free tier is "
+                "quota-limited."
             ),
         ),
         _spec(
@@ -185,7 +188,12 @@ GEMINI_MODEL_REGISTRY: dict[str, ModelSpec] = {
             thinking_levels=("auto", "minimal", "low", "medium", "high"),
             default_thinking="minimal",
             docs_url=_DOCS_BASE + "gemini-3.1-flash-lite",
-            notes="Fast, low-cost. Free tier is quota-limited.",
+            notes=(
+                "Fast, low-cost. Compatibility verified against the "
+                "official model card (2026-10-14): function calling "
+                "Supported, structured outputs Supported, thinking "
+                "Supported (level control). Free tier is quota-limited."
+            ),
         ),
         _spec(
             model_id="gemini-3-flash-preview",
@@ -216,8 +224,11 @@ GEMINI_MODEL_REGISTRY: dict[str, ModelSpec] = {
             notes=(
                 "Budget-controlled family: levels map to token budgets "
                 "(minimal/low 1,024; medium 8,192; high 24,576). "
-                "Thinking cannot be fully disabled on Pro. Free tier "
-                "is quota-limited."
+                "Thinking cannot be fully disabled on Pro. Google "
+                "limits 2.5 access to projects that have actively "
+                "used these models — a project without access fails "
+                "with the clear 'model access' error (no fallback to "
+                "another model). Free tier is quota-limited."
             ),
         ),
         _spec(
@@ -233,7 +244,11 @@ GEMINI_MODEL_REGISTRY: dict[str, ModelSpec] = {
             notes=(
                 "Budget-controlled family: levels map to token budgets "
                 "(minimal/low 1,024; medium 8,192; high 24,576). "
-                "Free tier is quota-limited."
+                "Google limits 2.5 access to projects that have "
+                "actively used these models — a project without "
+                "access fails with the clear 'model access' error "
+                "(no fallback to another model). Free tier is "
+                "quota-limited."
             ),
         ),
         _spec(
@@ -248,7 +263,11 @@ GEMINI_MODEL_REGISTRY: dict[str, ModelSpec] = {
             docs_url=_DOCS_BASE + "gemini-2.5-flash-lite",
             notes=(
                 "Budget-controlled family; the model does not think "
-                "unless a budget is set. Free tier is quota-limited."
+                "unless a budget is set. Google limits 2.5 access to "
+                "projects that have actively used these models — a "
+                "project without access fails with the clear 'model "
+                "access' error (no fallback to another model). Free "
+                "tier is quota-limited."
             ),
         ),
         # -- NOT free-tier eligible (reported, never selectable) -----

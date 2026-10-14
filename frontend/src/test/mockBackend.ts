@@ -67,8 +67,10 @@ export const defaultConfig: ConfigOut = {
   resume_enabled: true,
 };
 
-/** Catalogue shaped like the real GET /api/models (4E.3): one
- *  level-controlled default, one budget-family model, and registry
+/** Catalogue shaped like the real GET /api/models (4E.3): the
+ *  configured default (gemini-3.5-flash-lite, restored per the 4E.3
+ *  review — mirroring defaultConfig.model), a budget-family model,
+ *  gemini-3.1-flash-lite (docs-verified, selectable), and registry
  *  entries that are listed but deliberately NOT selectable. */
 export function defaultCatalog(): ModelsOut {
   const registry = (
@@ -92,12 +94,38 @@ export function defaultCatalog(): ModelsOut {
     ...overrides,
   });
   return {
-    default_model_id: "gemini-3.8-flash",
+    default_model_id: "gemini-3.5-flash-lite",
     default_thinking_level: "medium",
     discovery: { status: "disabled", checked_at: null, error_category: null, model_count: null },
     models: [
+      registry({
+        model_id: "gemini-3.5-flash-lite",
+        display_name: "Gemini 3.5 Flash-Lite",
+        thinking: {
+          control: "level",
+          levels: ["auto", "minimal", "low", "medium", "high"],
+          default: "minimal",
+        },
+      }),
       registry({ model_id: "gemini-3.8-flash", display_name: "Gemini 3.8 Flash" }),
-      registry({ model_id: "gemini-3.6-flash", display_name: "Gemini 3.6 Flash" }),
+      registry({
+        model_id: "gemini-3.6-flash",
+        display_name: "Gemini 3.6 Flash",
+        thinking: {
+          control: "level",
+          levels: ["auto", "minimal", "low", "medium", "high"],
+          default: "medium",
+        },
+      }),
+      registry({
+        model_id: "gemini-3.1-flash-lite",
+        display_name: "Gemini 3.1 Flash-Lite",
+        thinking: {
+          control: "level",
+          levels: ["auto", "minimal", "low", "medium", "high"],
+          default: "minimal",
+        },
+      }),
       registry({
         model_id: "gemini-2.5-flash",
         display_name: "Gemini 2.5 Flash",

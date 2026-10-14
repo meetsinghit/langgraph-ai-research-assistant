@@ -29,17 +29,28 @@ describe("research settings composer", () => {
     await connectApp();
     const model = (await screen.findByLabelText("Model")) as HTMLSelectElement;
     const options = [...model.options].map((option) => option.value);
-    // default is the null option
+    // default is the null option — the restored 4E.3 default
     expect(options[0]).toBe("");
-    expect(model.options[0].textContent).toContain("Gemini 3.8 Flash");
-    // selectable alternatives are listed…
+    expect(model.options[0].textContent).toContain("Gemini 3.5 Flash-Lite");
+    // selectable alternatives are listed, including gemini-3.8-flash
+    // (still selectable after the default changed) and the
+    // docs-verified gemini-3.1-flash-lite…
+    expect(options).toContain("gemini-3.8-flash");
     expect(options).toContain("gemini-3.6-flash");
+    expect(options).toContain("gemini-3.1-flash-lite");
     expect(options).toContain("gemini-2.5-flash");
     // …and nothing else: paid, unknown-eligibility and retired
     // models never appear (the backend catalogue is the authority)
     expect(options).not.toContain("gemini-4-argon");
     expect(options).not.toContain("gemini-3.7-flash");
     expect(options).not.toContain("gemini-2.0-flash");
+    // Documented eligibility/access is NEVER rendered as if the
+    // model had been proven reachable (4E.3 review item 3): option
+    // labels are names only — no availability or eligibility claims.
+    const rendered = [...model.options]
+      .map((option) => option.textContent ?? "")
+      .join(" ");
+    expect(rendered).not.toMatch(/availab|eligible|confirmed|not_checked/i);
     // depth and evidence selectors exist with working defaults
     expect((screen.getByLabelText("Depth") as HTMLSelectElement).value).toBe(
       "standard",
@@ -56,17 +67,18 @@ describe("research settings composer", () => {
     )) as HTMLSelectElement;
     const model = screen.getByLabelText("Model") as HTMLSelectElement;
 
-    // default model (3.8-flash): auto/low/medium/high — no Minimal
+    // default model (3.5-flash-lite): minimal IS supported
     await waitFor(() => expect(thinking.disabled).toBe(false));
     expect([...thinking.options].map((o) => o.value)).toEqual([
       "",
       "auto",
+      "minimal",
       "low",
       "medium",
       "high",
     ]);
 
-    // budget-family model (2.5-flash): Minimal becomes available
+    // budget-family model (2.5-flash): same full level set
     await user.selectOptions(model, "gemini-2.5-flash");
     await waitFor(() =>
       expect([...thinking.options].map((o) => o.value)).toEqual([
@@ -79,8 +91,9 @@ describe("research settings composer", () => {
       ]),
     );
 
-    // a level-controlled model without minimal: Minimal disappears
-    await user.selectOptions(model, "gemini-3.6-flash");
+    // a level-controlled model without minimal (3.8-flash, per the
+    // official docs): Minimal disappears
+    await user.selectOptions(model, "gemini-3.8-flash");
     await waitFor(() =>
       expect(
         [...thinking.options].map((o) => o.value),
@@ -98,7 +111,7 @@ describe("research settings composer", () => {
     expect(thinking.value).toBe("minimal");
 
     // switching to a model without minimal resets to its default
-    await user.selectOptions(model, "gemini-3.6-flash");
+    await user.selectOptions(model, "gemini-3.8-flash");
     await waitFor(() => expect(thinking.value).toBe(""));
   });
 
@@ -154,7 +167,7 @@ describe("research settings composer", () => {
     });
     // null resolves to the configured default on the stored run
     const run = Object.values(backend.runs)[0];
-    expect(run.summary.model_id).toBe("gemini-3.8-flash");
+    expect(run.summary.model_id).toBe("gemini-3.5-flash-lite");
     expect(run.summary.thinking_level).toBe("medium");
   });
 
@@ -355,7 +368,9 @@ describe("diagnostics run configuration (WS-G)", () => {
       const rows = within(panel).getAllByText("Not recorded");
       expect(rows.length).toBeGreaterThanOrEqual(2); // model + thinking
     });
-    // never a fabricated default for an old run
+    // never a fabricated default for an old run (neither the current
+    // default nor the previous one)
+    expect(within(panel).queryByText("gemini-3.5-flash-lite")).toBeNull();
     expect(within(panel).queryByText("gemini-3.8-flash")).toBeNull();
   });
 

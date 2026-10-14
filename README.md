@@ -34,7 +34,7 @@ python main.py "What is LangGraph?"
 | Variable | Purpose | Default |
 | --- | --- | --- |
 | `LLM_PROVIDER` | `gemini` \| `openrouter` \| `openai` | `gemini` |
-| `LLM_MODEL` | model name | `gemini-3.8-flash` |
+| `LLM_MODEL` | model name | `gemini-3.5-flash-lite` |
 | `GEMINI_API_KEY` | free-tier key from aistudio.google.com/apikey | – |
 | `OPENROUTER_API_KEY` | key from openrouter.ai/keys (free models exist) | – |
 | `OPENAI_API_KEY` | paid key — only used with `ALLOW_PAID_PROVIDERS=true` | – |
@@ -445,13 +445,25 @@ frozen into the run row at creation, so history, resume and
 diagnostics keep exactly what the run used. The composer inherits
 a session's most recent run settings when you open it.
 
+The configured default model is **`gemini-3.5-flash-lite`**
+(`LLM_MODEL` fallback, restored per the 4E.3 review — an explicit
+`LLM_MODEL` in the environment always overrides it);
+`gemini-3.8-flash` and the other free-tier-eligible models stay
+selectable. Google limits the **2.5 family** to projects that have
+actively used those models: a project without access fails with
+the fixed `model_access` error ("no other model is used
+automatically") — never a silent switch to another model.
+
 - **Backend-managed catalogue** (WS-A), `GET /api/models`: a
   separately *maintained* registry (`agent/gemini_models.py`) maps
   canonical ids to friendly names, families, thinking capabilities
   (`level` / `budget` / `none` + supported levels) and **free-tier
-  eligibility** — the registry is the only authority for what is
-  selectable; a live listing (opt-in discovery, off by default)
-  can annotate `availability` but never selectability. Entries are
+  eligibility** — documented pricing status only, never a claim that
+  this project can actually reach the model (the UI does not render
+  eligibility or availability as though access were verified). The
+  registry is the only authority for what is selectable; a live
+  listing (opt-in discovery, off by default) can annotate
+  `availability` but never selectability. Entries are
   verified against official docs (`verified_on`), retired models
   remain as tombstones so a historical selection fails fast with
   `model_unavailable` — **no automatic substitution**, ever. Only

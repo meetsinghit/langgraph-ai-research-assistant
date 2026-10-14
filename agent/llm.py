@@ -415,6 +415,47 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
     return ProviderFailure("unknown", False)
 
 
+#: Markers for a model that the provider no longer serves TO THIS
+#: PROJECT (404/NOT_FOUND style — e.g. Google's restriction of the
+#: 2.5 family to projects that actively used them: those requests
+#: fail with 403 PERMISSION_DENIED or 404 NOT_FOUND "no longer
+#: available to new users"). Used only to pick the fixed error
+#: vocabulary; the raw message never leaves this function.
+_MODEL_GONE_MARKERS = (
+    "404",
+    "no longer available",
+    "not found",
+    "models/",
+)
+
+
+def is_model_access_failure(exc: BaseException) -> bool:
+    """True when the provider refused the MODEL or the credentials.
+
+    Covers the two permanent access failures (4E.3 review, item 4):
+
+    - ``auth`` — 401/403/permission-denied: bad key OR the project
+      is not permitted to use the model (Google's 2.5-family
+      restriction for new projects);
+    - ``invalid_request`` carrying a model-gone marker (404 NOT_FOUND
+      "no longer available to new users").
+
+    Callers use this to raise the CLEAR, fixed-vocabulary
+    ``Model access failed: <type name>`` state error instead of the
+    generic provider one. Retry behaviour is unchanged (both classes
+    were already permanent), and nothing here ever selects, switches
+    to, or falls back to another model — the run simply fails with
+    its frozen configuration intact.
+    """
+    failure = classify_provider_error(exc)
+    if failure.category == "auth":
+        return True
+    if failure.category != "invalid_request":
+        return False
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _MODEL_GONE_MARKERS)
+
+
 def verify_connection(
     settings: Settings,
     *,

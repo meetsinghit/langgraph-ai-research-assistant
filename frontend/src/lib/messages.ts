@@ -19,6 +19,12 @@ const CATEGORY_COPY: Record<string, string> = {
     "The model this run was started with is no longer available. " +
     "Pick a different model in the composer and start a new run — " +
     "this run is not retried on another model automatically.",
+  model_access:
+    "The selected model could not be accessed with this project's " +
+    "configuration — the model may not be available to this project, " +
+    "or the API key may be invalid. No other model is used " +
+    "automatically: fix the configuration or pick a different model, " +
+    "then start a new run.",
   configuration:
     "This run's saved model settings are no longer supported. " +
     "Pick a valid model and thinking level for a new run.",
@@ -124,6 +130,7 @@ export const ERROR_CATEGORY_LABELS: Record<string, string> = {
   provider: "Provider error",
   tool: "Tool failure",
   model_unavailable: "Model no longer available",
+  model_access: "Model access failed",
   configuration: "Configuration error",
   unknown: "Error",
 };

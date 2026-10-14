@@ -71,12 +71,12 @@ def test_discovery_is_disabled_by_default_and_never_fetches(tmp_path: Path):
 def test_snapshot_lists_registry_with_selectable_flags(tmp_path: Path):
     catalog = ModelCatalog(_settings(tmp_path), fetch=lambda: pytest.fail("no"))
     snapshot = catalog.snapshot()
-    assert snapshot.default_model_id == "gemini-3.8-flash"
+    assert snapshot.default_model_id == "gemini-3.5-flash-lite"
     assert snapshot.default_thinking_level == "medium"
     listed = {m.model_id: m for m in snapshot.models}
     assert set(GEMINI_MODEL_REGISTRY) <= set(listed)
     # default sorts first
-    assert snapshot.models[0].model_id == "gemini-3.8-flash"
+    assert snapshot.models[0].model_id == "gemini-3.5-flash-lite"
     # free-only selector: only confirmed-eligible, non-retired models
     assert listed["gemini-3.8-flash"].selectable is True
     assert listed["gemini-4-argon"].selectable is False

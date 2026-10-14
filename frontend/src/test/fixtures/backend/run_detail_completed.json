@@ -1,6 +1,6 @@
 {
-  "id": "350caacc-ab54-4321-b7a5-a6a76b43918d",
-  "session_id": "bd370d45-ba31-4cbd-bc52-063f4eb86ec5",
+  "id": "cbc22cd5-c7c4-42ea-b3ba-cb9416b66164",
+  "session_id": "4e0eccf6-8d0b-4f64-a733-19be138e6597",
   "question": "question",
   "status": "completed",
   "answer": "> \u26a0\ufe0f **CITATION QUALITY: INSUFFICIENTLY VERIFIED** \u2014 1 cited URL(s) are not among the recorded sources. This deterministic check compares cited URLs against recorded source provenance only; it does NOT verify that the sources factually support the claims.\n\nA cited answer [S1] with an unknown ref [S9].",
@@ -14,7 +14,7 @@
   "tokens_in": 0,
   "tokens_out": 0,
   "estimated_cost_usd": 0.0,
-  "total_execution_seconds": 0.115,
+  "total_execution_seconds": 0.152,
   "sources": [
     {
       "sid": "S1",
@@ -25,10 +25,10 @@
     }
   ],
   "diagnostics": {
-    "run_id": "3ca26c942c25",
-    "started_at": 1791989190.7203195,
-    "finished_at": 1791989190.835552,
-    "total_execution_seconds": 0.115,
+    "run_id": "2e17ce3a2d4d",
+    "started_at": 1791994463.1594067,
+    "finished_at": 1791994463.311897,
+    "total_execution_seconds": 0.152,
     "outcome": {
       "status": "INCOMPLETE",
       "warnings": [
@@ -41,7 +41,7 @@
     },
     "segments": 1,
     "run_config": {
-      "model_id": "gemini-3.8-flash",
+      "model_id": "gemini-3.5-flash-lite",
       "thinking_level": "medium",
       "research_depth": "standard",
       "evidence_policy": "balanced"
@@ -53,7 +53,7 @@
       "tool_calls": 2,
       "retries": 0,
       "prompt_chars": 22022,
-      "tool_latency_ms": 0.2
+      "tool_latency_ms": 0.3
     },
     "token_usage": {
       "input_tokens": 0,
@@ -76,7 +76,7 @@
         "output_tokens": 0,
         "usage_unavailable_calls": 1,
         "prompt_chars": 1368,
-        "latency_ms": 1.073
+        "latency_ms": 1.122
       },
       "research": {
         "calls": 3,
@@ -84,7 +84,7 @@
         "output_tokens": 0,
         "usage_unavailable_calls": 3,
         "prompt_chars": 5916,
-        "latency_ms": 13.406
+        "latency_ms": 15.649000000000001
       },
       "synthesize": {
         "calls": 2,
@@ -92,7 +92,7 @@
         "output_tokens": 0,
         "usage_unavailable_calls": 2,
         "prompt_chars": 5394,
-        "latency_ms": 1.486
+        "latency_ms": 2.021
       },
       "review": {
         "calls": 2,
@@ -100,7 +100,7 @@
         "output_tokens": 0,
         "usage_unavailable_calls": 2,
         "prompt_chars": 9344,
-        "latency_ms": 1.7429999999999999
+        "latency_ms": 2.235
       }
     },
     "model_calls": [
@@ -108,7 +108,7 @@
         "node": "plan",
         "iteration": null,
         "invocation": 1,
-        "latency_ms": 1.073,
+        "latency_ms": 1.122,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -120,7 +120,7 @@
         "node": "research",
         "iteration": 1,
         "invocation": 2,
-        "latency_ms": 11.707,
+        "latency_ms": 13.516,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -132,7 +132,7 @@
         "node": "research",
         "iteration": 1,
         "invocation": 3,
-        "latency_ms": 0.917,
+        "latency_ms": 1.115,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -144,7 +144,7 @@
         "node": "synthesize",
         "iteration": null,
         "invocation": 4,
-        "latency_ms": 0.733,
+        "latency_ms": 1.023,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -156,7 +156,7 @@
         "node": "review",
         "iteration": null,
         "invocation": 5,
-        "latency_ms": 0.773,
+        "latency_ms": 1.305,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -168,7 +168,7 @@
         "node": "research",
         "iteration": 2,
         "invocation": 6,
-        "latency_ms": 0.782,
+        "latency_ms": 1.018,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -180,7 +180,7 @@
         "node": "synthesize",
         "iteration": null,
         "invocation": 7,
-        "latency_ms": 0.753,
+        "latency_ms": 0.998,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -192,7 +192,7 @@
         "node": "review",
         "iteration": null,
         "invocation": 8,
-        "latency_ms": 0.97,
+        "latency_ms": 0.93,
         "input_tokens": null,
         "output_tokens": null,
         "thinking_tokens": null,
@@ -207,7 +207,7 @@
         "iteration": 1,
         "tool": "web_search",
         "ok": true,
-        "latency_ms": 0.133,
+        "latency_ms": 0.211,
         "result_chars": 68,
         "error_category": null
       },
@@ -216,7 +216,7 @@
         "iteration": 1,
         "tool": "fetch_page",
         "ok": true,
-        "latency_ms": 0.113,
+        "latency_ms": 0.126,
         "result_chars": 23,
         "error_category": null
       }
@@ -225,47 +225,47 @@
       {
         "node": "start",
         "iteration": null,
-        "latency_ms": 4.291
+        "latency_ms": 14.673
       },
       {
         "node": "plan",
         "iteration": null,
-        "latency_ms": 4.591
+        "latency_ms": 4.817
       },
       {
         "node": "research",
         "iteration": 1,
-        "latency_ms": 26.097
+        "latency_ms": 38.745
       },
       {
         "node": "synthesize",
         "iteration": null,
-        "latency_ms": 6.0
+        "latency_ms": 7.477
       },
       {
         "node": "review",
         "iteration": null,
-        "latency_ms": 6.986
+        "latency_ms": 7.777
       },
       {
         "node": "research",
         "iteration": 2,
-        "latency_ms": 4.813
+        "latency_ms": 5.872
       },
       {
         "node": "synthesize",
         "iteration": null,
-        "latency_ms": 4.776
+        "latency_ms": 5.786
       },
       {
         "node": "review",
         "iteration": null,
-        "latency_ms": 5.533
+        "latency_ms": 6.86
       },
       {
         "node": "finalize",
         "iteration": null,
-        "latency_ms": 2.99
+        "latency_ms": 3.267
       }
     ],
     "counts": {
@@ -301,10 +301,10 @@
   },
   "research_depth": "standard",
   "evidence_policy": "balanced",
-  "model_id": "gemini-3.8-flash",
+  "model_id": "gemini-3.5-flash-lite",
   "thinking_level": "medium",
-  "created_at": "2026-10-14T14:46:30.673036+00:00",
-  "started_at": "2026-10-14T14:46:30.714393+00:00",
-  "finished_at": "2026-10-14T14:46:30.836099+00:00",
-  "events_url": "/api/runs/350caacc-ab54-4321-b7a5-a6a76b43918d/events"
+  "created_at": "2026-10-14T16:14:23.092966+00:00",
+  "started_at": "2026-10-14T16:14:23.150441+00:00",
+  "finished_at": "2026-10-14T16:14:23.312475+00:00",
+  "events_url": "/api/runs/cbc22cd5-c7c4-42ea-b3ba-cb9416b66164/events"
 }

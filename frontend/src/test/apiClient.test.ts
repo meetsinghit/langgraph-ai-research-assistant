@@ -185,12 +185,12 @@ describe("ApiClient", () => {
 
   it("GET /api/models returns the catalogue", async () => {
     const catalog = {
-      default_model_id: "gemini-3.8-flash",
+      default_model_id: "gemini-3.5-flash-lite",
       default_thinking_level: "medium",
       discovery: { status: "disabled" },
       models: [
         {
-          model_id: "gemini-3.8-flash",
+          model_id: "gemini-3.5-flash-lite",
           display_name: "Gemini 3.8 Flash",
           selectable: true,
         },

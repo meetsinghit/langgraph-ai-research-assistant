@@ -41,7 +41,7 @@ def _settings(**overrides: Any) -> Settings:
 def test_gemini_uses_native_integration():
     model = build_chat_model(_settings())
     assert isinstance(model, ChatGoogleGenerativeAI)
-    assert model.model == "gemini-3.8-flash"  # updated default
+    assert model.model == "gemini-3.5-flash-lite"  # restored default
     assert model.temperature == 0.2
     assert model.timeout == 30.0
     assert model.max_retries == 1  # SDK retries disabled
@@ -266,6 +266,97 @@ def test_native_gemini_client_default_research_uses_medium_thinking(
     )
 
 
+def test_wire_budget_family_sends_thinking_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4E.3 review item 6: a selected level must reach the provider
+    as the EXACT request configuration — budget-controlled models
+    send thinking_budget token counts, not a displayed label."""
+    captured: dict[str, Any] = {}
+
+    def fake_generate_content(
+        self: Any, **request: Any
+    ) -> types.GenerateContentResponse:
+        captured.update(request)
+        return _mock_response("ok")
+
+    monkeypatch.setattr(
+        genai.models.Models, "generate_content", fake_generate_content
+    )
+
+    model = build_chat_model(
+        _settings(llm_model="gemini-2.5-flash", request_timeout_seconds=5.0)
+    )
+    model.invoke("Say ok")
+
+    config = captured["config"]
+    assert config.thinking_config is not None
+    assert config.thinking_config.thinking_budget == 8192
+    assert config.thinking_config.thinking_level is None
+
+
+def test_wire_auto_omits_thinking_config_entirely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4E.3 review item 6: "auto" means NO thinking parameter on
+    the wire — the request carries no thinking_config at all."""
+    captured: dict[str, Any] = {}
+
+    def fake_generate_content(
+        self: Any, **request: Any
+    ) -> types.GenerateContentResponse:
+        captured.update(request)
+        return _mock_response("ok")
+
+    monkeypatch.setattr(
+        genai.models.Models, "generate_content", fake_generate_content
+    )
+
+    model = build_chat_model(
+        _settings(
+            llm_model="gemini-3.6-flash",
+            llm_thinking_level="auto",
+            request_timeout_seconds=5.0,
+        )
+    )
+    model.invoke("Say ok")
+
+    assert captured["config"].thinking_config is None
+
+
+def test_wire_minimal_sent_only_to_models_that_support_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """4E.3 review item 6: "minimal" arrives as ThinkingLevel.MINIMAL
+    for a model that supports it (the registry rejects it on
+    gemini-3.8-flash BEFORE anything reaches the provider)."""
+    captured: dict[str, Any] = {}
+
+    def fake_generate_content(
+        self: Any, **request: Any
+    ) -> types.GenerateContentResponse:
+        captured.update(request)
+        return _mock_response("ok")
+
+    monkeypatch.setattr(
+        genai.models.Models, "generate_content", fake_generate_content
+    )
+
+    model = build_chat_model(
+        _settings(
+            llm_model="gemini-3.6-flash",
+            llm_thinking_level="minimal",
+            request_timeout_seconds=5.0,
+        )
+    )
+    model.invoke("Say ok")
+
+    config = captured["config"]
+    assert config.thinking_config.thinking_level == (
+        types.ThinkingLevel.MINIMAL
+    )
+
+
 # ---------- connection verification ----------
 
 
@@ -297,7 +388,7 @@ def test_verify_connection_success(monkeypatch: pytest.MonkeyPatch) -> None:
     )
     result = verify_connection(_settings(), deadline=5.0)
     assert result["ok"] is True
-    assert result["model"] == "gemini-3.8-flash"
+    assert result["model"] == "gemini-3.5-flash-lite"
     assert result["input_tokens"] == 3
     assert result["output_tokens"] == 2
 

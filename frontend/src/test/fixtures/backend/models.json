@@ -1,5 +1,5 @@
 {
-  "default_model_id": "gemini-3.8-flash",
+  "default_model_id": "gemini-3.5-flash-lite",
   "default_thinking_level": "medium",
   "discovery": {
     "status": "disabled",
@@ -9,8 +9,8 @@
   },
   "models": [
     {
-      "model_id": "gemini-3.8-flash",
-      "display_name": "Gemini 3.8 Flash",
+      "model_id": "gemini-3.5-flash-lite",
+      "display_name": "Gemini 3.5 Flash-Lite",
       "family": "gemini-3",
       "status": "stable",
       "free_tier": "eligible",
@@ -20,16 +20,17 @@
         "control": "level",
         "levels": [
           "auto",
+          "minimal",
           "low",
           "medium",
           "high"
         ],
-        "default": "medium"
+        "default": "minimal"
       },
       "availability": "not_checked",
       "verified_on": "2026-10-14",
-      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
-      "notes": "Default model. 'minimal' is NOT supported on this model (the API rejects it); reasoning defaults to medium. Free tier is quota-limited.",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
+      "notes": "Default model (LLM_MODEL fallback; explicit configuration overrides it). Cheapest eligible option; defaults to minimal thinking. Free tier is quota-limited.",
       "source": "registry"
     },
     {
@@ -54,7 +55,7 @@
       "availability": "not_checked",
       "verified_on": "2026-10-14",
       "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash",
-      "notes": "Budget-controlled family: levels map to token budgets (minimal/low 1,024; medium 8,192; high 24,576). Free tier is quota-limited.",
+      "notes": "Budget-controlled family: levels map to token budgets (minimal/low 1,024; medium 8,192; high 24,576). Google limits 2.5 access to projects that have actively used these models \u2014 a project without access fails with the clear 'model access' error (no fallback to another model). Free tier is quota-limited.",
       "source": "registry"
     },
     {
@@ -79,7 +80,7 @@
       "availability": "not_checked",
       "verified_on": "2026-10-14",
       "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
-      "notes": "Budget-controlled family; the model does not think unless a budget is set. Free tier is quota-limited.",
+      "notes": "Budget-controlled family; the model does not think unless a budget is set. Google limits 2.5 access to projects that have actively used these models \u2014 a project without access fails with the clear 'model access' error (no fallback to another model). Free tier is quota-limited.",
       "source": "registry"
     },
     {
@@ -104,7 +105,7 @@
       "availability": "not_checked",
       "verified_on": "2026-10-14",
       "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro",
-      "notes": "Budget-controlled family: levels map to token budgets (minimal/low 1,024; medium 8,192; high 24,576). Thinking cannot be fully disabled on Pro. Free tier is quota-limited.",
+      "notes": "Budget-controlled family: levels map to token budgets (minimal/low 1,024; medium 8,192; high 24,576). Thinking cannot be fully disabled on Pro. Google limits 2.5 access to projects that have actively used these models \u2014 a project without access fails with the clear 'model access' error (no fallback to another model). Free tier is quota-limited.",
       "source": "registry"
     },
     {
@@ -154,32 +155,7 @@
       "availability": "not_checked",
       "verified_on": "2026-10-14",
       "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite",
-      "notes": "Fast, low-cost. Free tier is quota-limited.",
-      "source": "registry"
-    },
-    {
-      "model_id": "gemini-3.5-flash-lite",
-      "display_name": "Gemini 3.5 Flash-Lite",
-      "family": "gemini-3",
-      "status": "stable",
-      "free_tier": "eligible",
-      "selectable": true,
-      "exclusion_reason": null,
-      "thinking": {
-        "control": "level",
-        "levels": [
-          "auto",
-          "minimal",
-          "low",
-          "medium",
-          "high"
-        ],
-        "default": "minimal"
-      },
-      "availability": "not_checked",
-      "verified_on": "2026-10-14",
-      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
-      "notes": "Cheapest eligible option; defaults to minimal thinking. Free tier is quota-limited.",
+      "notes": "Fast, low-cost. Compatibility verified against the official model card (2026-10-14): function calling Supported, structured outputs Supported, thinking Supported (level control). Free tier is quota-limited.",
       "source": "registry"
     },
     {
@@ -205,6 +181,30 @@
       "verified_on": "2026-10-14",
       "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash",
       "notes": "Previous-generation Flash. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.8-flash",
+      "display_name": "Gemini 3.8 Flash",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
+      "notes": "'minimal' is NOT supported on this model (the API rejects it); reasoning defaults to medium. Selectable \u2014 it is no longer the default model (4E.3 review). Free tier is quota-limited.",
       "source": "registry"
     },
     {

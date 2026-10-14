@@ -120,7 +120,7 @@ def test_run_factory_receives_frozen_model_settings(tmp_path: Path):
     assert run_settings.llm_thinking_level == "high"
     # ...on a per-run COPY, never mutating the shared settings
     assert run_settings is not app.state.settings
-    assert app.state.settings.llm_model == "gemini-3.8-flash"
+    assert app.state.settings.llm_model == "gemini-3.5-flash-lite"
 
     # history shows what was actually used
     detail = client.get(f"/api/runs/{run_id}", headers=AUTH).json()
@@ -153,7 +153,7 @@ def test_defaults_are_frozen_into_the_row(tmp_path: Path):
     app.state.manager.wait_idle()
     _wait_status(client, run_id, "completed")
     row = app.state.repo.get_run(run_id)
-    assert row["model_id"] == "gemini-3.8-flash"
+    assert row["model_id"] == "gemini-3.5-flash-lite"
     assert row["thinking_level"] == "medium"  # historical default
     app.state.manager.shutdown()
 
@@ -220,7 +220,7 @@ def test_concurrent_runs_use_isolated_model_settings(tmp_path: Path):
         selections
     )
     # the shared settings object was never mutated
-    assert app.state.settings.llm_model == "gemini-3.8-flash"
+    assert app.state.settings.llm_model == "gemini-3.5-flash-lite"
     assert app.state.settings.llm_thinking_level is None
     # and each historical run reports its own selection
     for run_id, (model_id, level) in zip(run_ids, selections, strict=True):

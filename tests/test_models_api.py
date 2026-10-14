@@ -69,7 +69,7 @@ def test_models_endpoint_shape_and_selector_rules(tmp_path: Path):
     body = response.json()
 
     # defaults mirror the configuration
-    assert body["default_model_id"] == "gemini-3.8-flash"
+    assert body["default_model_id"] == "gemini-3.5-flash-lite"
     assert body["default_thinking_level"] == "medium"
     # discovery is opt-in: reported as disabled, nothing was fetched
     assert body["discovery"]["status"] == "disabled"
@@ -79,18 +79,22 @@ def test_models_endpoint_shape_and_selector_rules(tmp_path: Path):
     models = body["models"]
     by_id = {m["model_id"]: m for m in models}
     # the configured default is listed first
-    assert models[0]["model_id"] == "gemini-3.8-flash"
+    assert models[0]["model_id"] == "gemini-3.5-flash-lite"
     # every free-tier-eligible, non-retired model is selectable...
-    default = by_id["gemini-3.8-flash"]
+    default = by_id["gemini-3.5-flash-lite"]
     assert default["selectable"] is True
     assert default["free_tier"] == "eligible"
     assert default["thinking"] == {
         "control": "level",
-        "levels": ["auto", "low", "medium", "high"],
-        "default": "medium",
+        "levels": ["auto", "minimal", "low", "medium", "high"],
+        "default": "minimal",
     }
     assert default["verified_on"] == "2026-10-14"
     assert default["docs_url"].startswith("https://ai.google.dev/")
+    # gemini-3.8-flash is no longer the default but STAYS selectable
+    assert by_id["gemini-3.8-flash"]["selectable"] is True
+    # gemini-3.1-flash-lite is present and selectable (docs-verified)
+    assert by_id["gemini-3.1-flash-lite"]["selectable"] is True
     # ...and nothing else is, always with a stated reason
     for model in models:
         if not model["selectable"]:
@@ -161,9 +165,66 @@ def test_empty_model_id_falls_back_to_the_configured_default(
     assert response.status_code == 202, response.text
     client.app.state.manager.wait_idle()
     row = client.app.state.repo.get_run(response.json()["run_id"])
-    assert row["model_id"] == "gemini-3.8-flash"
+    assert row["model_id"] == "gemini-3.5-flash-lite"
     client.__exit__(None, None, None)
     client.app.state.manager.shutdown()
+
+
+def test_model_access_failure_fails_clearly_and_never_switches_model(
+    tmp_path: Path,
+):
+    """4E.3 review item 4: a provider refusal of the SELECTED model
+    (Google limits the 2.5 family to projects that actively used
+    them → 403 PERMISSION_DENIED / 404 for everyone else) fails the
+    run with the fixed ``model_access`` category, keeps the frozen
+    model on the row, and never falls back to another model."""
+    scripts = happy_scripts()
+    models: list = []
+    app = create_app(
+        make_settings(tmp_path),
+        db_path=tmp_path / "app.db",
+        token=TEST_TOKEN,
+        checkpointer=None,
+        model_factory=model_factory(
+            models,
+            responses=scripts["responses"],
+            structured_outputs=scripts["structured_outputs"],
+            raise_on_call={
+                0: RuntimeError(
+                    "403 PERMISSION_DENIED: models/gemini-2.5-pro is "
+                    "no longer available to new users"
+                )
+            },
+        ),
+        tools_factory=tools_factory(
+            [], search_results=SEARCH_RESULTS, pages=PAGES
+        ),
+    )
+    client = TestClient(app).__enter__()
+    client.app = app  # type: ignore[attr-defined]
+    session_id = _new_session(client)
+    run_id = client.post(
+        f"/api/sessions/{session_id}/runs",
+        json={"question": "question", "model_id": "gemini-2.5-pro"},
+        headers=AUTH,
+    ).json()["run_id"]
+    app.state.manager.wait_idle()
+
+    row = app.state.repo.get_run(run_id)
+    assert row["status"] == "failed"
+    # the FROZEN model row is untouched: no substitution happened
+    assert row["model_id"] == "gemini-2.5-pro"
+    assert row["error_category"] == "model_access"
+    # the surfaced answer is the fixed wording, never raw provider text
+    answer = row["answer"] or ""
+    assert "Model access failed" in answer
+    assert "no longer available to new users" not in answer
+    assert "403" not in answer
+    # exactly one model instance existed for this run — a failed
+    # access request never constructs or invokes a second model
+    assert len(models) == 1
+    client.__exit__(None, None, None)
+    app.state.manager.shutdown()
 
 
 # ---------- idempotency with changed settings ----------

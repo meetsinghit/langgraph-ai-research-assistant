@@ -157,6 +157,12 @@ production launcher, which does it for you).
 - Rate limits: the app retries transient 429/5xx automatically
   (`LLM_MAX_RETRIES`); persistent limits need a wait or another
   provider (`LLM_PROVIDER=openrouter` with `OPENROUTER_API_KEY`).
+- Model access refused (`model_access` category): Google limits the
+  2.5 models to projects that have actively used them, so a
+  project without access gets a 403/404 on those models. The run
+  fails with a fixed, non-sensitive message and its frozen model
+  stays on the record — fix the key/permissions or start a new run
+  with a different model. The app never switches models by itself.
 - Runs always end with a categorized error in the run card and
   Diagnostics — the raw provider error text is never shown or stored.
 
