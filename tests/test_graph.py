@@ -1054,6 +1054,100 @@ def test_missing_requested_topic_is_marked_and_drives_followup_research():
     assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
 
 
+# --- live-acceptance Problem C: a requested example must be runnable ----
+
+_EX_Q = (
+    "Explain how LangGraph conditional routing works and include a "
+    "practical working example."
+)
+
+_EX_INTRO = (
+    "LangGraph conditional routing picks the next edge at runtime: a "
+    "router function returns a key and add_conditional_edges maps that "
+    "key to the next node, so the graph branches based on state. See [S1].\n\n"
+)
+
+_EX_DRAFT_INCOMPLETE = _EX_INTRO + """```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START
+
+class S(TypedDict):
+    value: int
+
+def decide(state: S) -> str:
+    return "big" if state["value"] > 5 else "small"
+
+# g.add_node("decide", decide)
+# g.add_edge(START, "decide")
+# app = g.compile()
+g = StateGraph(S)
+```"""
+
+_EX_DRAFT_RUNNABLE = _EX_INTRO + """```python
+from typing import TypedDict
+from langgraph.graph import StateGraph, START, END
+
+class S(TypedDict):
+    value: int
+
+def decide(state: S) -> str:
+    return "big" if state["value"] > 5 else "small"
+
+g = StateGraph(S)
+g.add_conditional_edges(START, decide, {"big": END})
+app = g.compile()
+app.invoke({"value": 3})
+```"""
+
+
+def _example_graph(draft: str):
+    settings = _settings(max_tool_calls_per_research=2, max_research_iterations=2)
+    fake_tools = FakeTools(
+        search_results=[_search_result("LangGraph", "https://example.com/graphs")],
+        page_text="Conditional routing uses a router to pick the next node.",
+    )
+    model = ScriptedChatModel(
+        responses=[
+            _tool_call_response("c1"),
+            AIMessage(content="done"),
+            AIMessage(content=draft),
+        ],
+        structured_outputs=[
+            ResearchPlan(queries=["q"]),
+            ReviewVerdict(status="approved", reason="looks complete"),
+        ],
+    )
+    return build_research_graph(settings, model, fake_tools), model
+
+
+def test_incomplete_code_example_is_caught_even_when_reviewer_approves():
+    """The observed defect: node registrations commented out and no
+    graph entry path. The reviewer approves, but the deterministic
+    structural check overrides and sends it back."""
+    graph, model = _example_graph(_EX_DRAFT_INCOMPLETE)
+    result = graph.invoke({"question": _EX_Q})
+
+    assert "CODE EXAMPLE" in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.NEEDS_MORE_RESEARCH
+    # the follow-up research pass is told to target a runnable example
+    followup = [
+        str(batch[-1].content)
+        for batch in model.seen_messages
+        if batch and "Follow-up focus" in str(batch[-1].content)
+    ]
+    assert followup and "runnable code example" in followup[0]
+
+
+def test_runnable_code_example_is_not_flagged():
+    """A complete, invoked example passes the structural check and the
+    scripted approval stands."""
+    graph, model = _example_graph(_EX_DRAFT_RUNNABLE)
+    result = graph.invoke({"question": _EX_Q})
+
+    assert "CODE EXAMPLE" not in result["final_answer"]
+    assert result["review_status"] == ReviewStatus.APPROVED
+
+
 def test_official_source_cited_by_identifier_is_approved_unmarked():
     question = "LangGraph official documentation"
     third_party = "https://blog.example.com/langgraph-tutorial"

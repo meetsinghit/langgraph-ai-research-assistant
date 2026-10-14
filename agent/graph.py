@@ -84,8 +84,10 @@ from agent.citations import (
     validate_citations,
 )
 from agent.completeness import (
+    check_code_example,
     check_completeness,
     check_explanation_depth,
+    format_code_example_report,
     format_completeness_report,
     format_explanation_report,
 )
@@ -203,7 +205,18 @@ _SYNTHESIZE_SYSTEM = (
     "mark claims that rest only on [snippet] sources as unverified. "
     "Never claim a source was verified or accurately cited unless "
     "its finding is [retrieved]. If the findings are insufficient, "
-    "say so explicitly. Never fabricate sources or facts."
+    "say so explicitly. Never fabricate sources or facts. "
+    # Live-acceptance Problem C: a requested practical example must be
+    # complete and runnable, not commented-out scaffolding.
+    "When the question explicitly asks for a practical, working or "
+    "runnable code example, prefer COMPLETE, executable code: include "
+    "the required imports, define every node or function you reference "
+    "(never comment out registrations or wiring), connect the pieces, "
+    "and show a minimal invocation or entry point so the example "
+    "actually runs. Distinguish runnable code from illustrative "
+    "pseudocode by labeling pseudocode as such. Never invent APIs or "
+    "unsupported implementation details — ground uncertain details in "
+    "the cited findings and cite the official documentation for them."
 ) + _TRUST_BOUNDARY
 _REVIEW_SYSTEM = (
     "You are a quality reviewer. Decide whether the collected "
@@ -225,6 +238,19 @@ _REVIEW_SYSTEM = (
     "topic, or gestures at it without substance, is inadequate. For "
     "questions asking for official documentation, check that the "
     "official source is cited and actually supports the answer. "
+    # Live-acceptance Problem C: a requested practical example must be
+    # structurally complete — checked deterministically and semantically.
+    "When the question explicitly requests a practical working example, "
+    "check the example is complete and runnable: the required imports "
+    "are present, every referenced node or function is defined (not "
+    "commented out), the pieces are wired together, and there is a "
+    "minimal invocation or entry point. A block that defines things but "
+    "never runs them, or whose registrations are commented out, is "
+    "illustrative rather than runnable — treat that as incomplete. Do "
+    "not demand proof of execution: judge structural completeness "
+    "(imports, definitions, wiring, invocation) rather than whether you "
+    "personally ran it, and require citations to the official "
+    "documentation for API details. "
     "Reply approved or needs_more_research with a short reason."
 ) + _TRUST_BOUNDARY
 
@@ -463,6 +489,26 @@ def _superficial_topics_note(shallow: list[str]) -> str:
         "or defines them without explaining how they work: "
         + ", ".join(shallow)
         + ". Retrieved evidence was available to explain them."
+    )
+
+
+def _incomplete_example_note(reasons: list[str]) -> str:
+    """Deterministic label for a requested example that is not runnable.
+
+    Live-acceptance Problem C: a draft can READ like an example while
+    commenting out the required wiring and never invoking anything. The
+    label names the structural gap (never source text), and
+    ``strip_marked_notes`` removes it — plus the other ``> ⚠️`` notes —
+    before the review node re-validates, so the app's own annotation
+    never fakes coverage. It is honestly structural: it never claims
+    the code was executed or is API-correct.
+    """
+    return (
+        "> ⚠️ **CODE EXAMPLE: INCOMPLETE** — the question explicitly "
+        "requested a practical example, but the draft's code looks "
+        "illustrative rather than runnable: "
+        + "; ".join(reasons)
+        + ". (This is a structural check — it does not prove execution.)"
     )
 
 
@@ -811,6 +857,51 @@ def _invoke_with_retry(
             prompt_chars=_prompt_chars(messages),
         )
     return response
+
+
+#: Fixed, human-readable phrases for the retryable provider failure
+#: categories. Chosen to be unambiguous (they are matched verbatim by
+#: :func:`agent.metrics.categorize_error`) and to carry NO provider
+#: message text — only the classification result the retry layer
+#: already computed. Auth / invalid-request / unknown keep the plain
+#: generic wording: access failures take the dedicated
+#: ``Model access failed`` path, and an unknown error must not be
+#: dressed up as a diagnosis we did not make.
+_PROVIDER_PHRASES: dict[str, str] = {
+    "rate_limit": "rate limited",
+    "unavailable": "service temporarily unavailable",
+    "internal": "provider internal error",
+    "timeout": "request timed out",
+    "network": "network error",
+}
+
+
+def provider_failure_suffix(exc: BaseException) -> str:
+    """``" (service temporarily unavailable)"`` for a RETRYABLE failure.
+
+    The observed live defect (Phase 4E.3 acceptance, Problem A): the
+    state error was only ``LLM provider failed: GoogleAPIError``, so
+    ``categorize_error`` could not tell a transient 5xx — already
+    retried and worth retrying — from a permanent fault, and every
+    one of them surfaced as the same generic "provider error".
+
+    This returns the fixed-vocabulary classification the retry layer
+    already computed (``classify_provider_error``) as a readable
+    parenthetical, so the run-level ``error_category`` becomes
+    specific, plus the bare HTTP status code when one is discernible
+    (safe structured metadata — an integer, never a message). It
+    NEVER includes the exception's message, provider details or
+    credentials — only the category phrase, or the empty string for a
+    category we cannot responsibly name (auth, invalid_request,
+    unknown).
+    """
+    failure = classify_provider_error(exc)
+    phrase = _PROVIDER_PHRASES.get(failure.category)
+    if phrase is None:
+        return ""
+    if failure.http_status is not None:
+        return f" ({phrase}, HTTP {failure.http_status})"
+    return f" ({phrase})"
 
 
 def _usage_delta(response: AIMessage) -> tuple[int, int]:
@@ -1512,7 +1603,10 @@ def make_research_node(
                 if is_model_access_failure(exc):
                     provider_error = f"Model access failed: {type(exc).__name__}"
                 else:
-                    provider_error = f"LLM provider failed: {type(exc).__name__}"
+                    provider_error = (
+                        f"LLM provider failed{provider_failure_suffix(exc)}: "
+                        f"{type(exc).__name__}"
+                    )
                 logger.error("LLM provider failed: %s: %s", type(exc).__name__, exc)
                 break
 
@@ -1733,7 +1827,10 @@ def make_synthesize_node(
             if is_model_access_failure(exc):
                 error = f"Model access failed: {type(exc).__name__}"
             else:
-                error = f"synthesis failed: {type(exc).__name__}"
+                error = (
+                    f"synthesis failed{provider_failure_suffix(exc)}: "
+                    f"{type(exc).__name__}"
+                )
             logger.error("synthesis failed: %s: %s", type(exc).__name__, exc)
             return {
                 "final_answer": f"Answer could not be generated: {error}",
@@ -1765,6 +1862,10 @@ def make_synthesize_node(
         citation_report = validate_citations(
             answer, findings, state["question"], policy=evidence_policy
         )
+        # Live-acceptance Problem C: a requested practical example must
+        # be structurally complete (imports, definitions, invocation),
+        # not commented-out scaffolding. Deterministic + structural.
+        code_example = check_code_example(state["question"], answer)
         notes: list[str] = []
         if not verified:
             # Deterministic honesty: verification did not complete,
@@ -1806,6 +1907,15 @@ def make_synthesize_node(
                 "; ".join(citation_report.reasons),
             )
             notes.append(citation_note(citation_report))
+        if not code_example.ok:
+            # Live-acceptance Problem C: a requested example that is
+            # commented-out scaffolding with no invocation — labeled,
+            # and the review gate sends it back for a complete one.
+            logger.warning(
+                "drafted code example is incomplete/illustrative: %s",
+                "; ".join(code_example.reasons),
+            )
+            notes.append(_incomplete_example_note(list(code_example.reasons)))
         official_status = official_source_status(
             findings, state["question"]
         )
@@ -1832,11 +1942,18 @@ def make_synthesize_node(
             )
         # Shallow terms join the missing ones so the NEXT research
         # pass (if the review gate sends one back) is told to target
-        # topics that were named but never explained.
+        # topics that were named but never explained. An incomplete
+        # requested example likewise sends research back for official
+        # material showing a complete, runnable version.
         missing_topics: list[str] = list(completeness.missing)
         for term in explanation.shallow:
             if term not in missing_topics:
                 missing_topics.append(term)
+        if (
+            not code_example.ok
+            and "a complete runnable code example" not in missing_topics
+        ):
+            missing_topics.append("a complete runnable code example")
         update: dict[str, Any] = {
             "final_answer": answer,
             "missing_topics": missing_topics,
@@ -1931,6 +2048,11 @@ def make_review_node(
         explanation = check_explanation_depth(
             state["question"], answer, findings
         )
+        # Live-acceptance Problem C: re-validate the (note-stripped)
+        # draft's requested example structurally, alongside the other
+        # deterministic checks — so an approved verdict can never wave
+        # through commented-out scaffolding.
+        code_example = check_code_example(state["question"], answer)
         official_status = official_source_status(
             findings, state["question"]
         )
@@ -1944,6 +2066,7 @@ def make_review_node(
                     f"{format_citation_report(report)}\n\n"
                     f"{format_completeness_report(completeness)}\n\n"
                     f"{format_explanation_report(explanation)}\n\n"
+                    f"{format_code_example_report(code_example)}\n\n"
                     f"{review_depth_expectation(policy)}\n\n"
                     f"Findings:\n{_evidence_blocks(findings, policy.max_evidence_chars)}\n\n"
                     f"Draft answer: {answer}"
@@ -1964,7 +2087,10 @@ def make_review_node(
             if is_model_access_failure(exc):
                 error = f"Model access failed: {type(exc).__name__}"
             else:
-                error = f"review failed: {type(exc).__name__}"
+                error = (
+                    f"review failed{provider_failure_suffix(exc)}: "
+                    f"{type(exc).__name__}"
+                )
             logger.error("review failed: %s: %s", type(exc).__name__, exc)
             if metrics is not None:
                 metrics.set_quality(
@@ -2013,6 +2139,11 @@ def make_review_node(
             # topic that is merely named while retrieved evidence
             # was available to explain it.
             failed_checks.append("explanation depth")
+        if not code_example.ok:
+            # Live-acceptance Problem C: an approved verdict can never
+            # wave through a requested example that is illustrative
+            # rather than runnable (commented-out wiring / no entry).
+            failed_checks.append("code example completeness")
         if official_status in (
             OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY,
             OfficialSourceStatus.NO_OFFICIAL_SOURCE,

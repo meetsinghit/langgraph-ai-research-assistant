@@ -14,6 +14,11 @@ const CATEGORY_COPY: Record<string, string> = {
   deadline: "The run exceeded its time budget before finishing.",
   validation: "The model produced an action that was refused by validation.",
   provider: "The AI provider had an error before the answer was finished.",
+  provider_transient:
+    "The AI provider had a temporary problem (it was busy or " +
+    "unreachable) and the answer was not finished. The research " +
+    "can be tried again — this is not a problem with your " +
+    "question or the selected model.",
   tool: "A research tool failed while gathering sources.",
   model_unavailable:
     "The model this run was started with is no longer available. " +
@@ -128,6 +133,7 @@ export const ERROR_CATEGORY_LABELS: Record<string, string> = {
   deadline: "Time budget exhausted",
   validation: "Validation refusal",
   provider: "Provider error",
+  provider_transient: "Temporary provider problem",
   tool: "Tool failure",
   model_unavailable: "Model no longer available",
   model_access: "Model access failed",

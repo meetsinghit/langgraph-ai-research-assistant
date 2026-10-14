@@ -89,6 +89,24 @@ def categorize_error(exc: BaseException | str) -> str:
         return "deadline"
     if "unknown tool" in text or "invalid arguments" in text or "must be an object" in text:
         return "validation"
+    # Live-acceptance (Problem A): the graph now stamps the CLASSIFIED
+    # provider category into the state error as a fixed-vocabulary
+    # phrase (see ``provider_failure_suffix``). A transient, already-
+    # retried provider fault must NOT read like a permanent failure —
+    # these are checked before the generic "provider" bucket below,
+    # which would otherwise swallow every "LLM provider failed (...)"
+    # string. No provider message text is ever involved: only the
+    # fixed phrases the classifier itself produced.
+    if any(
+        phrase in text
+        for phrase in (
+            "service temporarily unavailable",
+            "provider internal error",
+            "request timed out",
+            "network error",
+        )
+    ):
+        return "provider_transient"
     if "llm provider" in text or "provider failed" in text:
         return "provider"
     if "tool" in text:

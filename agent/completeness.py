@@ -19,10 +19,13 @@ from dataclasses import dataclass
 from typing import Any
 
 __all__ = [
+    "CodeExampleReport",
     "CompletenessReport",
     "ExplanationReport",
+    "check_code_example",
     "check_completeness",
     "check_explanation_depth",
+    "format_code_example_report",
     "format_completeness_report",
     "format_explanation_report",
 ]
@@ -56,6 +59,33 @@ _QUESTION_STOPWORDS = frozenset(
     }
 )
 
+#: Instruction / framing verbs: they say what the assistant must DO,
+#: never what the answer must COVER. "Include a practical example"
+#: asks for a deliverable — "include" is not a topic, and treating it
+#: as one produced the observed false "missing topic: include". This
+#: is a generalizable CLASS (imperative request verbs), deliberately
+#: not a single patched word, and it is distinct from the
+#: question-framing stopwords above.
+_INSTRUCTION_VERBS = frozenset(
+    {
+        "include", "includes", "including", "included",
+        "provide", "provides", "providing", "provided",
+        "add", "adds", "adding", "added",
+        "show", "shows", "showing", "shown",
+        "cover", "covers", "covering", "covered",
+        "discuss", "discusses", "discussing", "discussed",
+        "write", "writes", "writing", "written",
+        "create", "creates", "creating", "created",
+        "demonstrate", "demonstrates", "demonstrating", "demonstrated",
+        "illustrate", "illustrates", "illustrating", "illustrated",
+        "ensure", "ensures", "ensuring",
+        "outline", "outlines", "outlining",
+        "summarize", "summarizes", "summarizing", "summarized",
+        "specify", "specifies", "specifying",
+        "detail", "details", "detailed",
+    }
+)
+
 #: Phrasings that disclaim rather than explain. A requested term
 #: that appears only in sentences containing one of these does not
 #: count as covered — "conditional routing details were not
@@ -86,6 +116,172 @@ _DISCLAIMER_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+# --- requested deliverables (live-acceptance Problem B) -------------------
+#
+# The observed question asked for "a practical example, implementation
+# considerations, and citations to official documentation" — three
+# DELIVERABLES, not three ordinary topics. Matching them as isolated
+# keywords ("practical", "example", "citation") both flagged answers
+# that DID deliver them and said nothing about whether the deliverable
+# was substantively present. A deliverable is therefore recognised in
+# the question and verified structurally in the answer (a code fence
+# for an example, citation markers for references, consideration
+# vocabulary for trade-offs) — never by the bare presence of the word.
+
+
+@dataclass(frozen=True)
+class _Deliverable:
+    """A requested deliverable: detected in the question, verified in
+    the answer, and absorbed out of the ordinary topic terms."""
+
+    key: str
+    label: str
+    #: matches the REQUEST in the question (the deliverable was asked
+    #: for)
+    request: re.Pattern[str]
+    #: normalised question words that belong to the request and must
+    #: NOT be treated as required topics (they are checked structurally
+    #: instead)
+    absorb: frozenset[str]
+    #: matches SUBSTANTIVE presence in the answer
+    present: re.Pattern[str]
+
+
+_DELIVERABLES: tuple[_Deliverable, ...] = (
+    _Deliverable(
+        key="example",
+        label="a requested example",
+        request=re.compile(
+            r"\b(?:examples?|samples?|snippets?|demos?|for\s+example|e\.g\.?)\b",
+            re.IGNORECASE,
+        ),
+        # "practical"/"working" describe the example, not a topic
+        absorb=frozenset({"example", "sample", "snippet", "demo", "practical"}),
+        present=re.compile(
+            # a real code block (runnable example), or inline code, or
+            # an explicit example/instance/scenario construction
+            r"```|`[^`\n]+`"
+            r"|\bfor\s+example\b|\be\.g\.?|\bfor\s+instance\b"
+            r"|\bsuch\s+as\b|\bsuch\s+an?\s+example\b|\binstance\b"
+            r"|\bimagine\b|\bsuppose\b|\bscenario\b|\bwalk[- ]through\b"
+            r"|\bstep\s+\d",
+            re.IGNORECASE,
+        ),
+    ),
+    _Deliverable(
+        key="considerations",
+        label="requested implementation considerations",
+        request=re.compile(r"\b(?:considerations?|caveats?)\b", re.IGNORECASE),
+        # "implementation" scopes WHICH considerations are requested —
+        # it belongs to the deliverable, not to the topic terms (its
+        # substance is verified by ``present`` below instead).
+        absorb=frozenset({"consideration", "caveat", "implementation"}),
+        present=re.compile(
+            r"\bconsider\w*|\bcaveat\w*|\btrade-?off\w*|\blimitation\w*"
+            r"|\bpitfall\w*|\bshould\b|\bmust\b|\bimportant\b|\bnote\s+that\b"
+            r"|\bbe\s+careful\b|\bprefer\b|\bavoid\b|\bkeep\s+in\s+mind\b"
+            r"|\bensure\b|\bin\s+practice\b|\bwatch\s+out\b|\bworth\s+(?:noting|keeping)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    _Deliverable(
+        key="citations",
+        label="requested citations to sources",
+        request=re.compile(
+            r"\b(?:citations?|cited?|references?|sources?|links?)\b",
+            re.IGNORECASE,
+        ),
+        absorb=frozenset({"citation", "cite", "cited"}),
+        present=re.compile(
+            # [S1]/[1] markers, a URL, or an attributive phrase
+            r"\[\s*S?\d+\s*\]|\[S\d+\]|https?://|www\."
+            r"|\(\d{4}\)|according\s+to|\bas\s+cited\b|\bcited\s+in\b",
+            re.IGNORECASE,
+        ),
+    ),
+)
+
+
+def _detect_deliverables(question: str) -> list[_Deliverable]:
+    """Deliverables this question explicitly asks for (order-stable)."""
+    text = question or ""
+    return [d for d in _DELIVERABLES if d.request.search(text)]
+
+
+def _absorb_words(deliverables: list[_Deliverable]) -> frozenset[str]:
+    words: set[str] = set()
+    for deliverable in deliverables:
+        words |= deliverable.absorb
+    return frozenset(words)
+
+
+def _content_term(raw: str, absorb: frozenset[str]) -> str | None:
+    """Normalised topic term for a question token, or ``None``.
+
+    Applies the same rules as :func:`_requested_terms` (length,
+    stopwords, plural stripping, must contain a letter) plus the two
+    Problem-B exclusions: instruction verbs and deliverable-absorbed
+    words are never ordinary topics.
+    """
+    term = raw[:-1] if len(raw) >= 6 and raw.endswith("s") else raw
+    if len(term) < 4:
+        return None
+    if term in _QUESTION_STOPWORDS or term in _INSTRUCTION_VERBS:
+        return None
+    if term in absorb:
+        return None
+    if not any(ch.isalpha() for ch in term):
+        return None
+    return term
+
+
+def _topic_runs(question: str, absorb: frozenset[str]) -> list[tuple[str, ...]]:
+    """Maximal runs of ADJACENT content words in the question.
+
+    A run is a compound technical phrase as written — "state
+    management", "conditional routing" — recognised as ONE unit rather
+    than isolated tokens (the observed false "missing: management").
+    Stopwords, short tokens, instruction verbs and deliverable words
+    all break a run, AND so do punctuation boundaries (commas,
+    semicolons, sentence terminators): "streaming, checkpointing and
+    memory sharing" lists DISTINCT topics, so a comma separates them —
+    merging list items into one phrase would let a genuinely absent
+    topic hide behind a sibling that is present.
+    """
+    runs: list[tuple[str, ...]] = []
+    current: list[str] = []
+    for clause in re.split(r"[.?!;,]", (question or "").lower()):
+        for raw in _TOKEN_RE.findall(clause):
+            term = _content_term(raw, absorb)
+            if term is None:
+                if current:
+                    runs.append(tuple(current))
+                    current = []
+                continue
+            if term not in current:
+                current.append(term)
+        # a clause/punctuation boundary ends the current phrase run
+        if current:
+            runs.append(tuple(current))
+            current = []
+    if current:
+        runs.append(tuple(current))
+    return runs
+
+
+def _topic_terms(question: str) -> tuple[str, ...]:
+    """Distinct topic terms (first-appearance order) — the phrase runs
+    flattened. This is what completeness reports as requested."""
+    deliverables = _detect_deliverables(question)
+    absorb = _absorb_words(deliverables)
+    terms: list[str] = []
+    for run in _topic_runs(question, absorb):
+        for term in run:
+            if term not in terms:
+                terms.append(term)
+    return tuple(terms)
 
 
 @dataclass(frozen=True)
@@ -129,25 +325,69 @@ def _substantive_sentences(answer: str) -> list[str]:
 
 
 def check_completeness(question: str, answer: str) -> CompletenessReport:
-    """Flag requested terms the answer never mentions substantively.
+    """Flag requested topics the answer never mentions substantively.
 
-    A term counts as covered only when it appears (word-prefix,
-    case-insensitive) in at least one sentence WITHOUT a known
-    disclaimer phrasing. Mentions that merely disclaim availability
-    do not count. This is still lexical — it makes no claim that
-    the explanation is correct or adequate.
+    Problem-B correction (generalizable, not word-specific):
+
+    - a compound technical PHRASE ("state management", "conditional
+      routing") is a single unit — it counts as covered when all but
+      one of its adjacent content words appear, so an answer that
+      explains the concept without echoing every isolated token is not
+      falsely flagged, while a run whose words are almost entirely
+      absent (the existing "conditional routing" regressions) still is;
+    - instruction verbs ("include", "provide", …) are never topics;
+    - requested DELIVERABLES (example, considerations, citations) are
+      verified structurally — a code fence, citation markers or
+      consideration vocabulary — not by the bare word.
+
+    A single content word with no neighbour stays strictly required
+    (unchanged behaviour), and every mention must be outside a known
+    disclaimer. This is still lexical: it makes no claim that a covered
+    topic is correct or adequate.
     """
-    terms = _requested_terms(question)
+    deliverables = _detect_deliverables(question)
+    absorb = _absorb_words(deliverables)
+    runs = _topic_runs(question, absorb)
+    requested: list[str] = []
+    for run in runs:
+        for term in run:
+            if term not in requested:
+                requested.append(term)
+
     substantive = _substantive_sentences(answer or "")
-    missing = tuple(
-        term
-        for term in terms
-        if not any(
-            re.search(rf"\b{re.escape(term)}", sentence, re.IGNORECASE)
-            for sentence in substantive
-        )
+    missing: list[str] = []
+    for run in runs:
+        # A phrase is covered when all but at most ONE of its content
+        # words is present: "state management" is addressed if the
+        # answer substantively discusses "state" even without the
+        # literal token "management". A lone word needs itself.
+        need = max(1, len(run) - 1)
+        present = [
+            term
+            for term in run
+            if any(
+                re.search(rf"\b{re.escape(term)}", sentence, re.IGNORECASE)
+                for sentence in substantive
+            )
+        ]
+        if len(present) < need:
+            for term in run:
+                if term not in present and term not in missing:
+                    missing.append(term)
+
+    # Requested deliverables: verified structurally in the whole answer
+    # (a code fence is not a "sentence", and citation markers live
+    # wherever the answer put them).
+    answer_text = answer or ""
+    for deliverable in deliverables:
+        if not deliverable.present.search(answer_text) and (
+            deliverable.label not in missing
+        ):
+            missing.append(deliverable.label)
+
+    return CompletenessReport(
+        requested_terms=tuple(requested), missing=tuple(missing)
     )
-    return CompletenessReport(requested_terms=terms, missing=missing)
 
 
 def format_completeness_report(report: CompletenessReport) -> str:
@@ -155,24 +395,24 @@ def format_completeness_report(report: CompletenessReport) -> str:
     coverage-is-not-adequacy disclaimer."""
     requested = ", ".join(report.requested_terms) or "(none)"
     missing = ", ".join(report.missing) or "(none)"
-    return "\n".join(
-        [
-            "Topic-coverage check (deterministic LEXICAL matching only — a "
-            "term counts as covered only when it appears outside known "
-            "unavailability disclaimers; this does NOT verify that any "
-            "explanation is correct, substantive or adequate — semantic "
-            "adequacy is the reviewer's judgement):",
-            f"- explicitly requested topic term(s): {requested}",
-            f"- missing from the draft: {missing}",
-            "result: "
-            + (
-                "PASS"
-                if report.ok
-                else "FAIL — the draft does not substantively address: "
-                + missing
-            ),
-        ]
-    )
+    lines = [
+        "Topic-coverage check (deterministic LEXICAL matching only — a "
+        "term counts as covered only when it appears outside known "
+        "unavailability disclaimers; compound phrases are matched as "
+        "units and requested deliverables structurally; this does NOT "
+        "verify that any explanation is correct, substantive or "
+        "adequate — semantic adequacy is the reviewer's judgement):",
+        f"- explicitly requested topic term(s): {requested}",
+        f"- missing from the draft: {missing}",
+        "result: "
+        + (
+            "PASS"
+            if report.ok
+            else "FAIL — the draft does not substantively address: "
+            + missing
+        ),
+    ]
+    return "\n".join(lines)
 
 
 # --- explanation depth (Phase 4E.1, WS-B) -------------------------------
@@ -342,6 +582,200 @@ def format_explanation_report(report: ExplanationReport) -> str:
                 if report.ok
                 else "FAIL — the draft names these topics without "
                 "explaining how they work: " + shallow
+            ),
+        ]
+    )
+
+
+# --- code-example completeness (live-acceptance Problem C) ---------------
+#
+# The observed defect: a question asked for a practical working example
+# and the drafted LangGraph code commented out the required node
+# registrations and never established a complete graph entry path — it
+# READ like an example but could not run. This check reports what the
+# code text structurally contains (definitions, commented-out
+# statements, invocation) so a misleadingly incomplete example is
+# flagged. It is a STRUCTURAL heuristic, deliberately: it never claims
+# the code was executed or is API-correct — semantic adequacy and API
+# correctness stay with the reviewer and the cited documentation.
+
+_EXEC_METHOD_RE = re.compile(
+    r"\.(?:invoke|stream|run|execute|predict|process|apply|start)\s*\("
+)
+_MAIN_GUARD_RE = re.compile(r"if\s+__name__")
+_BARE_CALL_RE = re.compile(r"^\s*[A-Za-z_]\w*\([^=]*\)\s*$")
+_DEFINED_NAME_RE = re.compile(r"^\s*(?:def|class)\s+([A-Za-z_]\w*)")
+_IMPORT_RE = re.compile(r"^\s*(?:import|from)\s+\w")
+
+
+def _code_blocks(answer: str) -> list[str]:
+    """Contents of every fenced code block (language tag stripped)."""
+    return re.findall(r"```[^\n`]*\n(.*?)```", answer or "", re.DOTALL)
+
+
+def _is_stmt_comment(line: str) -> bool:
+    """True when a comment line looks like commented-out CODE.
+
+    A descriptive comment ("# build the graph") is prose; a commented-out
+    statement ("# graph.add_node('a', a)") is suppressed code. We
+    distinguish them by whether the comment body STARTS like a statement.
+    """
+    body = line.strip().lstrip("#").strip()
+    if not body:
+        return False
+    return (
+        re.match(
+            r"(?:def|class|import|from|return|if|elif|else|for|while|with|"
+            r"try|except|raise|yield|pass)\b"
+            r"|[\w.]+\s*=|[\w.]+\s*\(|\.[\w]+\s*\(",
+            body,
+        )
+        is not None
+    )
+
+
+@dataclass(frozen=True)
+class CodeExampleReport:
+    """Structural verdict on a requested, code-bearing example."""
+
+    requested: bool
+    blocks: int
+    has_import: bool
+    has_definition: bool
+    has_invocation: bool
+    commented_out: bool
+    reasons: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return not self.reasons
+
+
+def check_code_example(question: str, answer: str) -> CodeExampleReport:
+    """Flag a requested example that is illustrative rather than runnable.
+
+    Runs only when the question explicitly requested an example AND the
+    answer actually contains a code block (an absent example is the
+    completeness deliverable's job, not this one). Signals, aggregated
+    across every block so usage in a later block counts:
+
+    - definitions (``def`` / ``class``) present;
+    - an INVOCATION — a known run method (``.invoke``/``.stream``/…), a
+      ``main()``/``__main__`` guard, a bare call statement, or a call to a
+      name defined in the block (``total = add(1, 2)`` after ``def add``);
+      construction of an EXTERNAL class (``g = StateGraph(S)``) is
+      deliberately NOT an invocation;
+    - commented-out statements (suppressed definitions / wiring).
+
+    A requested example is flagged when it has NO invocation yet either
+    defines code (dead definitions) or has commented-out structure — the
+    exact shape of the observed defect.
+    """
+    example_requested = any(d.key == "example" for d in _detect_deliverables(question))
+    blocks = _code_blocks(answer)
+    if not example_requested or not blocks:
+        return CodeExampleReport(
+            requested=example_requested,
+            blocks=len(blocks),
+            has_import=False,
+            has_definition=False,
+            has_invocation=False,
+            commented_out=False,
+            reasons=(),
+        )
+
+    active: list[str] = []
+    comments: list[str] = []
+    for block in blocks:
+        for line in block.splitlines():
+            if not line.strip():
+                continue
+            if line.strip().startswith("#"):
+                comments.append(line)
+            else:
+                active.append(line)
+
+    defined = {
+        match.group(1)
+        for block in blocks
+        for match in (
+            _DEFINED_NAME_RE.match(line) for line in block.splitlines()
+        )
+        if match
+    }
+
+    has_import = any(_IMPORT_RE.match(line) for line in active)
+    has_definition = bool(defined)
+    commented_out = any(_is_stmt_comment(line) for line in comments)
+
+    def _is_invocation(line: str) -> bool:
+        if line.lstrip().startswith(("def ", "class ")):
+            return False
+        if _EXEC_METHOD_RE.search(line) or _MAIN_GUARD_RE.search(line):
+            return True
+        if _BARE_CALL_RE.match(line):
+            return True
+        return any(
+            re.search(rf"\b{re.escape(name)}\s*\(", line) for name in defined
+        )
+
+    has_invocation = any(_is_invocation(line) for line in active)
+
+    reasons: list[str] = []
+    if not has_invocation and commented_out:
+        reasons.append(
+            "definitions or wiring are commented out and there is no "
+            "invocation, so the example is illustrative rather than runnable"
+        )
+    elif not has_invocation and has_definition:
+        reasons.append(
+            "the example defines functions/classes but never invokes them, "
+            "so there is no entry point that actually runs"
+        )
+
+    return CodeExampleReport(
+        requested=example_requested,
+        blocks=len(blocks),
+        has_import=has_import,
+        has_definition=has_definition,
+        has_invocation=has_invocation,
+        commented_out=commented_out,
+        reasons=tuple(reasons),
+    )
+
+
+def format_code_example_report(report: CodeExampleReport) -> str:
+    """LLM-readable report for the review prompt."""
+    if not report.requested:
+        return "Code-example check: (no example requested)"
+    if not report.blocks:
+        return (
+            "Code-example check: an example was requested but the draft "
+            "contains no code block (see the topic-coverage check)."
+        )
+    flags = ", ".join(
+        sorted(
+            {
+                "imports" if report.has_import else None,
+                "definitions" if report.has_definition else None,
+                "invocation" if report.has_invocation else None,
+                "commented-out code" if report.commented_out else None,
+            }
+            - {None}
+        )
+    ) or "nothing substantive"
+    return "\n".join(
+        [
+            "Code-example check (deterministic STRUCTURAL heuristic — it "
+            "reports what the code text contains; it does NOT prove the "
+            "code executes or is API-correct):",
+            f"- code block(s): {report.blocks}; present: {flags}",
+            "result: "
+            + (
+                "PASS"
+                if report.ok
+                else "FAIL — requested example looks incomplete: "
+                + "; ".join(report.reasons)
             ),
         ]
     )

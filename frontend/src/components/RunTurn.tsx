@@ -114,9 +114,22 @@ export function RunTurn({
             onReconnect={onReconnect}
           />
         ) : run.status === "completed" ? (
-          <p className="rounded-lg border border-success/40 bg-success/10 px-3 py-2 text-sm text-success">
-            Research completed
-          </p>
+          detail?.outcome_status === "INCOMPLETE" ||
+          detail?.review_status === "needs_more_research" ? (
+            // Live-acceptance Problem D: the graph FINISHED but quality
+            // validation did not pass. "Research completed" (green)
+            // next to an Incomplete/Needs-more-research badge read as a
+            // contradiction — so the header says what actually happened.
+            // Backend outcome semantics are unchanged; the answer's own
+            // warning badges and outcome message still show below.
+            <p className="rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-sm text-warning">
+              Research finished — answer incomplete.
+            </p>
+          ) : (
+            <p className="rounded-lg border border-success/40 bg-success/10 px-3 py-2 text-sm text-success">
+              Research completed
+            </p>
+          )
         ) : run.status === "failed" ? (
           <p className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
             Research failed

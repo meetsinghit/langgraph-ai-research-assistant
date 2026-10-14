@@ -259,12 +259,17 @@ def estimate_cost(
 @dataclass(frozen=True)
 class ProviderFailure:
     """A classified provider error: fixed-vocabulary ``category``,
-    whether it is safe to retry, and the provider's ``Retry-After``
-    hint in seconds when observable (never the raw error text)."""
+    whether it is safe to retry, the provider's ``Retry-After``
+    hint in seconds when observable, and the HTTP status code when
+    one is discernible — never the raw error text or message."""
 
     category: str
     retryable: bool
     retry_after: float | None = None
+    #: HTTP status code (401/403/429/503/...) when the exception or
+    #: its message exposes one. A bare integer — safe structured
+    #: metadata, never a credential or a provider message body.
+    http_status: int | None = None
 
 
 #: Fixed vocabulary for provider failures (WS-D). Metrics record the
@@ -283,6 +288,34 @@ PROVIDER_FAILURE_CATEGORIES = (
 _RETRY_AFTER_RE = re.compile(
     r"retry[- ]after[^0-9]{0,40}(\d+(?:\.\d+)?)", re.IGNORECASE
 )
+
+#: A leading HTTP status code in a provider message
+#: ("403 PERMISSION_DENIED. {...}", "[429] ..."). Only codes in the
+#: documented 4xx/5xx range are ever treated as a status, so a
+#: coincidental number inside a longer message is not misread.
+_HTTP_STATUS_RE = re.compile(r"(?<![\d.])([45]\d{2})(?![\d.])")
+
+
+def _http_status_from(exc: BaseException, text: str) -> int | None:
+    """Best-effort HTTP status code, or ``None``.
+
+    Prefer the SDK's structured ``code`` attribute (``google.genai``
+    sets it on every ``APIError``); fall back to a leading status
+    marker in the message. Returns ``None`` when neither is present —
+    it is never guessed from unrelated digits.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and 400 <= code <= 599:
+        return code
+    # Fall back to the FIRST standalone 4xx/5xx number anywhere in the
+    # message. langchain re-raises ClientError as a plain string
+    # (``... (RESOURCE_EXHAUSTED): 429 RESOURCE_EXHAUSTED. {...}``),
+    # so the code is mid-text; the boundary guards keep it from
+    # matching digits inside version numbers (``3.8``) or decimals.
+    match = _HTTP_STATUS_RE.search(text)
+    if match:
+        return int(match.group(1))
+    return None
 
 
 def _retry_after_seconds(
@@ -319,9 +352,15 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
 
     Combined with SDK retries being disabled at construction
     (``max_retries=1``), exactly ONE layer performs retries.
+
+    The returned ``http_status`` (when discernible) is safe structured
+    metadata — a bare integer, never the provider's message — so
+    callers can surface *why* a permanent failure happened without
+    leaking anything sensitive.
     """
     name = type(exc).__name__.lower()
     text = f"{type(exc).__name__}: {exc}".lower()
+    status = _http_status_from(exc, text)
 
     if any(
         marker in text
@@ -338,7 +377,7 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
             "invalid authentication",
         )
     ):
-        return ProviderFailure("auth", False)
+        return ProviderFailure("auth", False, http_status=status)
     if any(
         marker in text
         for marker in (
@@ -354,7 +393,7 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
             "unsupported",
         )
     ):
-        return ProviderFailure("invalid_request", False)
+        return ProviderFailure("invalid_request", False, http_status=status)
     if any(
         marker in text
         for marker in (
@@ -367,7 +406,7 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
         )
     ):
         return ProviderFailure(
-            "rate_limit", True, _retry_after_seconds(exc, text)
+            "rate_limit", True, _retry_after_seconds(exc, text), status
         )
     if any(
         marker in text
@@ -379,14 +418,14 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
         )
     ):
         return ProviderFailure(
-            "unavailable", True, _retry_after_seconds(exc, text)
+            "unavailable", True, _retry_after_seconds(exc, text), status
         )
     if any(
         marker in text
         for marker in ("500", "502", "504", "internal error", "internal server")
     ):
         return ProviderFailure(
-            "internal", True, _retry_after_seconds(exc, text)
+            "internal", True, _retry_after_seconds(exc, text), status
         )
     if (
         "timeout" in name
@@ -395,7 +434,7 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
         or "deadline" in text
     ):
         return ProviderFailure(
-            "timeout", True, _retry_after_seconds(exc, text)
+            "timeout", True, _retry_after_seconds(exc, text), status
         )
     if any(
         marker in text
@@ -410,9 +449,9 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
         )
     ):
         return ProviderFailure(
-            "network", True, _retry_after_seconds(exc, text)
+            "network", True, _retry_after_seconds(exc, text), status
         )
-    return ProviderFailure("unknown", False)
+    return ProviderFailure("unknown", False, http_status=status)
 
 
 #: Markers for a model that the provider no longer serves TO THIS

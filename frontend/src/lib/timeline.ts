@@ -176,7 +176,7 @@ export function deriveTimeline(
       kind: outcome === "INCOMPLETE" ? "incomplete" : "completed",
       label:
         outcome === "INCOMPLETE"
-          ? "Completed with incomplete research"
+          ? "Research finished — answer incomplete"
           : "Research completed",
       outcome: reviewStatus ? `${outcome ?? "COMPLETED"} · ${reviewStatus}` : outcome,
     };
@@ -196,7 +196,7 @@ export function deriveTimeline(
   } else if (outcome === "INCOMPLETE" && terminalStatus === null) {
     terminal = {
       kind: "incomplete",
-      label: "Completed with incomplete research",
+      label: "Research finished — answer incomplete",
       outcome,
     };
   }

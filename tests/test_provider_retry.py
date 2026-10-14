@@ -19,13 +19,13 @@ import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
 from agent.deadline import RunDeadline
-from agent.graph import _invoke_with_retry, _response_usage
+from agent.graph import _invoke_with_retry, _response_usage, provider_failure_suffix
 from agent.llm import (
     PROVIDER_FAILURE_CATEGORIES,
     classify_provider_error,
     is_model_access_failure,
 )
-from agent.metrics import MetricsCollector
+from agent.metrics import MetricsCollector, categorize_error
 from tests.fakes import FakeClock, ScriptedChatModel
 
 _MESSAGES = [HumanMessage(content="hello")]
@@ -386,3 +386,104 @@ def test_response_usage_absent_is_none_not_zero():
         },
     )
     assert _response_usage(thinking_message) == (10, 25, 15)
+
+
+# -- live-acceptance Problem A: classified, non-sensitive failure text ----
+#
+# The observed defect: a browser run showed only
+# "LLM provider failed: GoogleAPIError". The exception TYPE alone
+# cannot distinguish a transient 5xx (already retried, worth retrying)
+# from quota exhaustion or a permanent fault — so every failure looked
+# like the same generic "provider error" and the run-level
+# error_category degraded to "provider".
+#
+# These fixtures are the REAL langchain-google-genai error classes,
+# built the same way the integration builds them, so we reproduce the
+# exact shapes the live failure produced — no live API call.
+
+
+def _server_error_fixture(code: int, status: str, message: str):
+    """``GoogleAPIError`` exactly as langchain builds it from a 5xx."""
+    from google.genai.errors import ServerError
+    from langchain_google_genai.chat_models import GoogleAPIError
+
+    raw = ServerError(
+        code, {"error": {"code": code, "message": message, "status": status}}
+    )
+    return GoogleAPIError(
+        code=raw.code, response_json=raw.details, response=raw.response
+    )
+
+
+def _client_error_fixture(cls, code: int, status: str, message: str):
+    """A langchain ClientError re-raise: a plain string exception."""
+    from google.genai.errors import ClientError
+
+    raw = ClientError(
+        code, {"error": {"code": code, "message": message, "status": status}}
+    )
+    return cls(f"Error calling model 'gemini-3.8-flash' ({raw.status}): {raw}")
+
+
+def test_transient_5xx_gets_classified_suffix_and_category():
+    exc = _server_error_fixture(
+        503, "UNAVAILABLE", "The model is overloaded. Please try again later."
+    )
+    # the classified category + bare HTTP status — never the message
+    suffix = provider_failure_suffix(exc)
+    assert "service temporarily unavailable" in suffix
+    assert "HTTP 503" in suffix
+    assert "overloaded" not in suffix  # no raw provider text
+
+    state_error = f"LLM provider failed{suffix}: {type(exc).__name__}"
+    assert categorize_error(state_error) == "provider_transient"
+    # still NOT a model-access failure (that path is for 403/404 only)
+    assert is_model_access_failure(exc) is False
+
+
+def test_rate_limit_surfaces_as_rate_limit_not_generic_provider():
+    from langchain_google_genai.chat_models import GoogleRateLimitError
+
+    exc = _client_error_fixture(
+        GoogleRateLimitError, 429, "RESOURCE_EXHAUSTED",
+        "Resource has been exhausted (e.g. check quota).",
+    )
+    suffix = provider_failure_suffix(exc)
+    state_error = f"LLM provider failed{suffix}: {type(exc).__name__}"
+    assert categorize_error(state_error) == "rate_limit"
+    assert "HTTP 429" in suffix
+    assert "exhausted" not in state_error  # raw message never surfaces
+
+
+def test_unknown_failure_keeps_generic_wording_without_invented_diagnosis():
+    exc = RuntimeError("something odd happened")
+    # no category phrase: an unknown error must not be dressed up as a
+    # diagnosis we did not make
+    assert provider_failure_suffix(exc) == ""
+    state_error = f"LLM provider failed{type(exc).__name__}"
+    assert categorize_error(state_error) == "provider"
+
+
+def test_http_status_is_safe_structured_metadata_only():
+    """http_status is a bare 4xx/5xx integer — never a message body."""
+    exc = _server_error_fixture(500, "INTERNAL", "Internal error encountered.")
+    failure = classify_provider_error(exc)
+    assert failure.category == "internal"
+    assert failure.http_status == 500
+    # not derived for an exception with no discernible status
+    assert classify_provider_error(RuntimeError("odd")).http_status is None
+
+
+def test_graph_research_error_carries_classification_and_redacts():
+    """Graph-level: the research node's state error names the category
+    and HTTP status but never the raw provider message/credential."""
+    from langchain_google_genai.chat_models import GooglePermissionDeniedError
+
+    secret = "API key not valid. Please pass a valid API key. sk-abc123"
+    exc = _client_error_fixture(
+        GooglePermissionDeniedError, 403, "PERMISSION_DENIED", secret
+    )
+    assert is_model_access_failure(exc) is True  # -> dedicated path
+    state_error = f"Model access failed: {type(exc).__name__}"
+    assert "sk-abc123" not in state_error and secret not in state_error
+    assert categorize_error(state_error) == "model_access"

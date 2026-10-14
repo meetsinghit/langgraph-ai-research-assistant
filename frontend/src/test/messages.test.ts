@@ -14,6 +14,19 @@ describe("run error categories", () => {
     expect(ERROR_CATEGORY_LABELS.model_access).toBe("Model access failed");
   });
 
+  it("marks a transient provider fault as retryable, not permanent", () => {
+    const message = categoryMessage("provider_transient");
+    expect(message).toContain("temporary");
+    expect(message).toContain("tried again");
+    // never blames the user's question or model selection
+    expect(message).toContain("not a problem with your");
+    expect(ERROR_CATEGORY_LABELS.provider_transient).toBe(
+      "Temporary provider problem",
+    );
+    // and it stays distinct from the generic permanent wording
+    expect(message).not.toBe(categoryMessage("provider"));
+  });
+
   it("keeps every category on fixed, non-technical copy", () => {
     for (const category of Object.keys(ERROR_CATEGORY_LABELS)) {
       expect(categoryMessage(category)).toBeTruthy();

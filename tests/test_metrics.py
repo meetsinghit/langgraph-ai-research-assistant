@@ -27,6 +27,37 @@ class TestCategorizeError:
             ("tool arguments must be an object", "validation"),
             ("llm provider failed", "provider"),
             ("provider failed with 500", "provider"),
+            # Live-acceptance (Problem A): the graph stamps the
+            # CLASSIFIED provider category into the state error, so a
+            # transient fault is no longer an indistinguishable generic
+            # "provider" failure.
+            (
+                "LLM provider failed (service temporarily unavailable, "
+                "HTTP 503): GoogleAPIError",
+                "provider_transient",
+            ),
+            (
+                "LLM provider failed (provider internal error, "
+                "HTTP 500): GoogleAPIError",
+                "provider_transient",
+            ),
+            (
+                "synthesis failed (request timed out, HTTP 504): "
+                "GoogleAPIError",
+                "provider_transient",
+            ),
+            (
+                "review failed (network error): ConnectionError",
+                "provider_transient",
+            ),
+            (
+                "LLM provider failed (rate limited, HTTP 429): "
+                "GoogleRateLimitError",
+                "rate_limit",
+            ),
+            # an unknown category keeps the generic bucket — no
+            # invented diagnosis
+            ("LLM provider failed: RuntimeError", "provider"),
             # 4E.3 review (item 4): refused model access gets its own
             # clear category, never a generic provider/unknown one
             ("Model access failed: ClientError", "model_access"),
