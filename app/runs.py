@@ -42,6 +42,10 @@ from agent.citations import assign_source_ids
 from agent.config import Settings
 from agent.deadline import RunDeadline
 from agent.depth import resolve_depth, resolve_evidence_policy
+from agent.gemini_models import (
+    assert_runnable,
+    resolve_run_model_config,
+)
 from agent.graph import build_research_graph
 from agent.llm import build_chat_model
 from agent.metrics import MetricsCollector, categorize_error
@@ -107,6 +111,16 @@ class ResumeUnavailable(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class IdempotencyConflict(Exception):
+    """An Idempotency-Key was replayed with a DIFFERENT request.
+
+    Same key + same question + same frozen settings replays the
+    original run (unchanged safeguard); same key + anything else is
+    a 409 — never a silent second run and never a silent replay of a
+    run that would have used different settings.
+    """
 
 
 def _strip_controls(value: str) -> str:
@@ -289,6 +303,8 @@ class RunManager:
         idempotency_key: str | None = None,
         research_depth: str = "standard",
         evidence_policy: str = "balanced",
+        model_id: str | None = None,
+        thinking_level: str | None = None,
     ) -> dict[str, Any]:
         """Create a run (idempotently) and schedule its execution.
 
@@ -296,14 +312,38 @@ class RunManager:
         normalized here as defense in depth (the API already
         validates them as Literals) and persisted as run metadata so
         history keeps the settings each run actually used.
+
+        ``model_id`` / ``thinking_level`` (Phase 4E.3) are validated
+        against the backend model registry BEFORE anything is
+        written — an invalid selection never creates a row — and the
+        RESOLVED values are frozen into the row, so resume and
+        history always use what was actually chosen. Concurrent runs
+        each persist their own configuration; there is no shared
+        mutable model state.
         """
         if self._repo.get_session(session_id) is None:
             raise NotFoundError(f"session {session_id} not found")
+        run_config = resolve_run_model_config(
+            model_id,
+            thinking_level,
+            default_model_id=self._settings.llm_model,
+            default_thinking_level=self._settings.llm_thinking_level,
+            explicit_selection=model_id is not None,
+        )
+        resolved_depth = resolve_depth(research_depth)
+        resolved_policy = resolve_evidence_policy(evidence_policy)
         if idempotency_key:
             existing = self._repo.find_run_by_idempotency_key(
                 session_id, idempotency_key
             )
             if existing is not None:
+                self._ensure_idempotent(
+                    existing,
+                    question=question,
+                    research_depth=resolved_depth,
+                    evidence_policy=resolved_policy,
+                    run_config=run_config,
+                )
                 return existing
         context = self.derive_context(session_id)
         try:
@@ -312,25 +352,113 @@ class RunManager:
                 question=question,
                 conversation_context=context,
                 idempotency_key=idempotency_key or None,
-                research_depth=resolve_depth(research_depth),
-                evidence_policy=resolve_evidence_policy(
-                    evidence_policy
-                ),
+                research_depth=resolved_depth,
+                evidence_policy=resolved_policy,
+                model_id=run_config.model_id,
+                thinking_level=run_config.thinking_level,
             )
         except sqlite3.IntegrityError:
             # Concurrent double-POST with the same key: the unique
-            # index decided the winner; return that run.
+            # index decided the winner; verify that run still matches
+            # this request, then return it.
             if idempotency_key:
                 existing = self._repo.find_run_by_idempotency_key(
                     session_id, idempotency_key
                 )
                 if existing is not None:
+                    self._ensure_idempotent(
+                        existing,
+                        question=question,
+                        research_depth=resolved_depth,
+                        evidence_policy=resolved_policy,
+                        run_config=run_config,
+                    )
                     return existing
             raise
         self._repo.touch_session(session_id)
         self._publish(run["id"], "status.changed", {"status": RUN_STATUS_QUEUED})
         self._executor.submit(self._execute, run["id"])
         return run
+
+    def _ensure_idempotent(
+        self,
+        existing: dict[str, Any],
+        *,
+        question: str,
+        research_depth: str,
+        evidence_policy: str,
+        run_config: Any,
+    ) -> None:
+        """Replay only an IDENTICAL request; conflict on any change.
+
+        Legacy pre-4E.3 rows (NULL model/thinking) are compared
+        against the values they would have resolved to, so old
+        clients keep replaying cleanly.
+        """
+        default_thinking = self._settings.llm_thinking_level or "medium"
+
+        def _effective(key: str, default: Any) -> Any:
+            value = existing.get(key)
+            return value if value is not None else default
+
+        matches = (
+            existing["question"] == question
+            and str(existing.get("research_depth") or "standard")
+            == research_depth
+            and str(existing.get("evidence_policy") or "balanced")
+            == evidence_policy
+            and _effective("model_id", self._settings.llm_model)
+            == run_config.model_id
+            and _effective("thinking_level", default_thinking)
+            == run_config.thinking_level
+        )
+        if not matches:
+            raise IdempotencyConflict(
+                "idempotency key already used with different "
+                "question or research settings"
+            )
+
+    def _run_settings(self, row: dict[str, Any]) -> Settings:
+        """Per-run settings view carrying the run's frozen model config.
+
+        Legacy rows (NULL model/thinking — created before 4E.3) return
+        the configured settings untouched, preserving pre-4E.3
+        behavior exactly. Stored selections are RE-VALIDATED here for
+        both fresh runs and resumes:
+
+        - a retired (tombstoned) model raises ``ModelUnavailableError``
+          with a clear message — there is deliberately NO fallback to
+          a different model;
+        - an unsupported thinking level for that model raises
+          ``ModelSelectionError`` (category ``configuration``) instead
+          of reaching the provider as a 400.
+
+        The returned object is a fresh immutable view per run
+        (``model_copy``), so concurrent runs with different
+        configurations never share state.
+        """
+        stored_model = row.get("model_id")
+        stored_thinking = row.get("thinking_level")
+        if stored_model is None and stored_thinking is None:
+            return self._settings
+        effective_model = stored_model or self._settings.llm_model
+        assert_runnable(effective_model)  # ModelUnavailableError
+        effective_thinking = (
+            stored_thinking or self._settings.llm_thinking_level or "medium"
+        )
+        config = resolve_run_model_config(
+            effective_model,
+            effective_thinking,
+            default_model_id=self._settings.llm_model,
+            default_thinking_level=self._settings.llm_thinking_level,
+            explicit_selection=False,
+        )
+        return self._settings.model_copy(
+            update={
+                "llm_model": config.model_id,
+                "llm_thinking_level": config.thinking_level,
+            }
+        )
 
     # -- execution -------------------------------------------------------
 
@@ -360,10 +488,22 @@ class RunManager:
         terminal_status: str | None = None
         try:
             metrics.begin_run()
-            model = self._model_factory(self._settings)
+            # Frozen per-run configuration (4E.3): the model factory
+            # and the graph BOTH receive a per-run settings view, so
+            # concurrent runs can use different models/thinking with
+            # no shared mutable state — and cost estimation inside
+            # the graph reports the model this run actually used.
+            run_settings = self._run_settings(row)
+            metrics.set_run_config(
+                model_id=row.get("model_id"),
+                thinking_level=row.get("thinking_level"),
+                research_depth=row.get("research_depth"),
+                evidence_policy=row.get("evidence_policy"),
+            )
+            model = self._model_factory(run_settings)
             tools = self._tools_factory(self._settings)
             graph = self._graph_factory(
-                self._settings, model, tools, metrics=metrics
+                run_settings, model, tools, metrics=metrics
             )
             # A RESUME passes input=None — LangGraph's contract for
             # "continue this thread from its checkpoint". Passing the

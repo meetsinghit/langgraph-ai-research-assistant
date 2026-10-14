@@ -795,13 +795,14 @@ def _invoke_with_retry(
             # restart the clock so the successful retry's latency
             # is not inflated by the failed attempt + backoff
             started = time.monotonic()
-    delta_in, delta_out = _response_usage(response)
+    delta_in, delta_out, delta_thinking = _response_usage(response)
     if metrics is not None:
         metrics.record_model_call(
             node,
             latency_ms=(time.monotonic() - started) * 1000.0,
             input_tokens=delta_in,
             output_tokens=delta_out,
+            thinking_tokens=delta_thinking,
             prompt_chars=_prompt_chars(messages),
         )
     return response
@@ -814,23 +815,34 @@ def _usage_delta(response: AIMessage) -> tuple[int, int]:
     return usage.get("input_tokens") or 0, usage.get("output_tokens") or 0
 
 
-def _response_usage(response: Any) -> tuple[int | None, int | None]:
+def _response_usage(
+    response: Any,
+) -> tuple[int | None, int | None, int | None]:
     """Provider-reported usage, honest about absence.
 
     Handles plain messages and ``include_raw`` structured results
-    (WS-E): returns ``(None, None)`` when no usage was reported —
+    (WS-E): returns ``(None, None, None)`` when no usage was reported —
     the metrics collector then records ``null`` with
     ``usage_source: "unavailable"`` instead of a fake zero. A usage
     block that exists but omits a field is a measured zero.
+
+    Thinking tokens (4E.3 WS-G) come from the provider's reasoning
+    breakdown (``output_token_details.reasoning`` — Gemini
+    ``thoughts_token_count``): ``None`` when the provider reported no
+    thinking breakdown, never fabricated as zero.
     """
     message = response
     if isinstance(response, dict):
         message = response.get("raw")
     usage = getattr(message, "usage_metadata", None)
     if not usage:
-        return None, None
-    return int(usage.get("input_tokens") or 0), int(
-        usage.get("output_tokens") or 0
+        return None, None, None
+    details = usage.get("output_token_details") or {}
+    thinking = details.get("reasoning")
+    return (
+        int(usage.get("input_tokens") or 0),
+        int(usage.get("output_tokens") or 0),
+        int(thinking) if thinking is not None else None,
     )
 
 

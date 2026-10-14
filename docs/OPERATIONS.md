@@ -59,17 +59,32 @@ Automation knobs (also useful for scripted smoke tests):
 - **Ask**: type a question in the composer; `Enter` submits,
   `Shift+Enter` adds a line. Progress streams live into the timeline;
   `Stop research` cancels cooperatively.
+- **Research settings**: above the question box, four selectors are
+  frozen into each run when it starts — **Model** (free-tier
+  catalogue from the backend registry; *Default* = the configured
+  `LLM_MODEL`), **Thinking** (Auto/Minimal/Low/Medium/High — only
+  levels the selected model supports are offered), **Depth**
+  (Quick/Standard/Deep) and **Evidence** (Balanced/Verified, see
+  §3 of the README for what each does). Opening a session inherits
+  its most recent run's settings. If the model list cannot load,
+  the composer keeps working with the configured default.
 - **Citations**: `[S#]` chips in answers are buttons — clicking one
   highlights that source in the right panel. Sources are badged
   **Verified** (page fetched, evidence inspected) or **Discovered**
   (search snippet only).
 - **Diagnostics**: the right panel's Diagnostics tab shows duration,
-  iterations, model/tool calls, token usage and coverage, retrieval
-  counts, provider retries and the security summary.
+  iterations, model/tool calls, token usage (including
+  provider-reported **thinking tokens**, or an honest *Not
+  reported*), coverage, retrieval counts, provider retries, the
+  security summary and **Run configuration** — the model, thinking
+  level, depth and evidence policy the run actually used (older
+  runs created before model selection show *Not recorded*).
 - **History**: sessions are stored in SQLite (`data/app.db`). The
   left sidebar lists them; clicking one reopens the stored answer —
   never a re-run. Follow-up questions run in the same session;
-  `Start a new research session` begins a new one. Deleting asks for
+  `Start a new research session` begins a new one. Each session
+  has a pencil button for inline **renaming** (1–120 characters;
+  renaming never touches run history). Deleting asks for
   confirmation.
 - **Interrupted runs**: if the server restarted mid-run, the run card
   offers `Resume research` with its caveat: the interrupted step is

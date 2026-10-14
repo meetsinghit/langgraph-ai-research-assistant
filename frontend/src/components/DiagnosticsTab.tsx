@@ -51,6 +51,12 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
+/** Fixed-vocabulary setting label: "standard" -> "Standard". */
+function settingLabel(value?: string | null): string {
+  if (!value) return "—";
+  return value.charAt(0).toUpperCase() + value.slice(1).replace(/_/g, " ");
+}
+
 export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
   const diagnostics: DiagnosticsSnapshot | null | undefined =
     run.diagnostics;
@@ -69,6 +75,12 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
     coverageParts.push(`${usage.estimated_calls} estimated`);
     if (usage.unavailable_calls > 0) {
       coverageParts.push(`${usage.unavailable_calls} unavailable`);
+    }
+    if (
+      usage.thinking_tokens != null &&
+      usage.thinking_reported_calls != null
+    ) {
+      coverageParts.push(`${usage.thinking_reported_calls} with thinking`);
     }
   }
 
@@ -133,6 +145,41 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
         )}
       </Section>
 
+      <Section title="Run configuration">
+        <dl>
+          <Row
+            label="Model"
+            value={run.model_id ?? "Not recorded"}
+            hint={
+              run.model_id
+                ? "Frozen when the run was created"
+                : "Runs created before model selection existed do not record their model"
+            }
+          />
+          <Row
+            label="Thinking"
+            value={
+              run.thinking_level
+                ? settingLabel(run.thinking_level)
+                : "Not recorded"
+            }
+            hint="Frozen when the run was created"
+          />
+          <Row
+            label="Research depth"
+            value={settingLabel(run.research_depth)}
+          />
+          <Row
+            label="Evidence policy"
+            value={settingLabel(run.evidence_policy)}
+          />
+        </dl>
+        <p className="pt-1 text-[11px] text-ink-muted">
+          These settings were frozen when the run was created — later
+          changes in the composer never alter a finished run.
+        </p>
+      </Section>
+
       <Section title="Execution">
         <dl>
           <Row label="Duration" value={formatDuration(run.total_execution_seconds)} />
@@ -171,6 +218,15 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
           <dl>
             <Row label="Input tokens" value={formatNumber(run.tokens_in)} />
             <Row label="Output tokens" value={formatNumber(run.tokens_out)} />
+            <Row
+              label="Thinking tokens"
+              value={
+                usage?.thinking_tokens != null
+                  ? formatNumber(usage.thinking_tokens)
+                  : "Not reported"
+              }
+              hint="Reasoning tokens the provider reported (counted within output tokens); never fabricated"
+            />
             <Row
               label="Measurement coverage"
               value={

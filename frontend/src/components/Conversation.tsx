@@ -8,6 +8,7 @@ import { useStore } from "../state/store";
 import { useAuth } from "../state/auth";
 import { RunTurn } from "./RunTurn";
 import { QuestionInput } from "./QuestionInput";
+import { ResearchControls } from "./ResearchControls";
 
 export function Conversation() {
   const store = useStore();
@@ -132,6 +133,7 @@ export function Conversation() {
           <QuestionInput
             onSubmit={(question) => void store.submitQuestion(question)}
             busy={store.busy}
+            controls={<ResearchControls disabled={store.busy} />}
           />
         </div>
       </footer>

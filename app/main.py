@@ -43,6 +43,7 @@ from agent.config import Settings, get_settings
 from agent.logging_config import setup_logging
 from app.api import router
 from app.db import Database
+from app.model_discovery import ModelCatalog
 from app.repository import Repository
 from app.runs import RunManager
 
@@ -158,12 +159,15 @@ def create_app(
     app.state.repo = repo
     app.state.manager = manager
     app.state.checkpointer = resolved_checkpointer
+    # Model catalogue for GET /api/models (4E.3): registry-backed,
+    # discovery disabled by default — no external calls at startup.
+    app.state.model_catalog = ModelCatalog(settings)
 
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origin_list,
         allow_credentials=False,  # token travels in a header, not cookies
-        allow_methods=["GET", "POST", "DELETE"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
         allow_headers=[
             "Authorization",
             "Content-Type",

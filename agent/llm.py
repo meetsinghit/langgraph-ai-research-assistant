@@ -22,14 +22,18 @@ minutes (the observed verification hang). Retries are controlled in
 exactly one place: the graph's ``_invoke_with_retry`` (one retry after
 a rate-limit error).
 
-Thinking policy: thinking configuration is MODEL-AWARE. Gemini 3
-models (e.g. gemini-3.8-flash) support ``thinking_level`` values
-low|medium|high — "minimal" is NOT supported and the API rejects it
-with 400 INVALID_ARGUMENT. Gemini 2.5 models use ``thinking_budget``
-(an integer token count; 0 disables thinking). Older models have no
-thinking controls. Normal research runs default to "medium" reasoning
-(Gemini 3) unless configured otherwise; connectivity verification
-always uses "low".
+Thinking policy: thinking configuration is MODEL-AWARE and registry
+driven (``agent.gemini_models`` — per-model capabilities verified
+against the official Gemini thinking docs). Gemini 3+ models use
+``thinking_level`` low|medium|high (``minimal`` is rejected with 400
+INVALID_ARGUMENT on e.g. gemini-3.8-flash); Gemini 2.5 models use
+``thinking_budget`` token counts (minimal/low 1,024; medium 8,192;
+high 24,576) and reject ``thinking_level``; ``auto`` sends NO
+thinking parameter (model default) — minimal thinking is never
+conflated with disabled thinking. The two parameters are never sent
+together. Normal research runs default to "medium" reasoning (Gemini
+3) unless configured otherwise; connectivity verification always uses
+the cheapest supported config ("low" level / budget 0).
 """
 from __future__ import annotations
 
@@ -44,6 +48,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_openai import ChatOpenAI
 
 from agent.config import Settings
+from agent.gemini_models import GEMINI_MODEL_REGISTRY, thinking_kwargs
 
 logger = logging.getLogger("agent")
 
@@ -55,19 +60,19 @@ class ConfigurationError(RuntimeError):
 # Models with a free tier: estimated cost is $0.00 while within quota.
 # Beyond the free quota, list prices apply — verify current pricing
 # with the provider before relying on cost estimates in production.
+# Single source of truth: the documented eligibility registry (4E.3),
+# verified against the official pricing page — NOT the model listing.
 _FREE_TIER_MODELS = {
-    "gemini-3.8-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
+    spec.model_id
+    for spec in GEMINI_MODEL_REGISTRY.values()
+    if spec.free_tier == "eligible"
 }
 
 _OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Gemini model families and the thinking controls they support.
-_GEMINI_3_PREFIX = "gemini-3"
-_GEMINI_2_5_PREFIX = "gemini-2.5"
-
-ThinkingLevel = Literal["low", "medium", "high"]
+#: Full thinking selector vocabulary (see agent.gemini_models: the
+#: registry decides which values a given model actually accepts).
+ThinkingLevel = Literal["auto", "minimal", "low", "medium", "high"]
 
 
 def content_to_text(content: Any) -> str:
@@ -111,26 +116,23 @@ def content_to_text(content: Any) -> str:
 
 
 def _thinking_kwargs(
-    model: str, *, level: ThinkingLevel
+    model: str, *, level: ThinkingLevel, verification: bool = False
 ) -> dict[str, Any]:
-    """Model-aware thinking configuration.
+    """Model-aware thinking configuration (registry-driven, 4E.3).
 
-    Maps the requested reasoning depth to the control the model
-    actually supports, so we never send an enum value the API
-    rejects (e.g. "minimal" is invalid for gemini-3.8-flash).
-    Unknown models get no thinking configuration — the provider
-    default applies.
+    Delegates to :func:`agent.gemini_models.thinking_kwargs`, the
+    single source of truth mapping a selector level to the parameter
+    the model actually accepts: ``thinking_level`` for Gemini 3+
+    (validated against the per-model supported set — e.g. "minimal"
+    is a 400 on gemini-3.8-flash), ``thinking_budget`` token counts
+    for Gemini 2.5 (minimal/low 1,024; medium 8,192; high 24,576),
+    nothing for ``auto`` or models without thinking controls. The
+    verification path keeps thinking cheap (level "low"; budget 0 on
+    budget models — a verification-only constraint, never a research
+    mapping). ``thinking_level`` and ``thinking_budget`` are never
+    returned together.
     """
-    model_name = model.removeprefix("models/")
-    if model_name.startswith(_GEMINI_3_PREFIX):
-        # Gemini 3: thinking_level low|medium|high
-        return {"thinking_level": level}
-    if model_name.startswith(_GEMINI_2_5_PREFIX):
-        # Gemini 2.5: thinking_budget in tokens. "low" maps to
-        # "disabled" (0) for fast verification; any other depth
-        # keeps the model's default budget.
-        return {"thinking_budget": 0} if level == "low" else {}
-    return {}
+    return thinking_kwargs(model, level=level, verification=verification)
 
 
 def build_chat_model(
@@ -165,23 +167,29 @@ def build_chat_model(
             "timeout": settings.request_timeout_seconds,
             "max_retries": 1,  # disables SDK retries (see module docstring)
         }
-        # Default research depth: medium reasoning (Gemini 3),
-        # unless configured otherwise.
-        thinking_level: ThinkingLevel = (
-            settings.llm_thinking_level or "medium"
-        )
-        kwargs.update(
-            _thinking_kwargs(settings.llm_model, level=thinking_level)
-        )
         if verification:
-            # Connectivity check: lowest supported thinking level
-            # and a modest output budget — thinking tokens count
-            # toward max_output_tokens, so 64 was too tight.
+            # Connectivity check: cheapest supported thinking config
+            # (level "low"; budget 0 on budget-controlled models —
+            # thinking off, a verification-only constraint) and a
+            # modest output budget — thinking tokens count toward
+            # max_output_tokens, so 64 was too tight.
             kwargs.update(
-                _thinking_kwargs(settings.llm_model, level="low")
+                _thinking_kwargs(
+                    settings.llm_model, level="low", verification=True
+                )
             )
             kwargs["max_output_tokens"] = (
                 settings.connection_verify_max_output_tokens
+            )
+        else:
+            # Default research depth: medium reasoning (Gemini 3),
+            # unless configured otherwise. "auto" is a valid setting
+            # and sends no thinking parameter (model default).
+            thinking_level: ThinkingLevel = (
+                settings.llm_thinking_level or "medium"
+            )
+            kwargs.update(
+                _thinking_kwargs(settings.llm_model, level=thinking_level)
             )
         return ChatGoogleGenerativeAI(**kwargs)
 

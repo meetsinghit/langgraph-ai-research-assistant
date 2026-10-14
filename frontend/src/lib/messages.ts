@@ -15,8 +15,44 @@ const CATEGORY_COPY: Record<string, string> = {
   validation: "The model produced an action that was refused by validation.",
   provider: "The AI provider had an error before the answer was finished.",
   tool: "A research tool failed while gathering sources.",
+  model_unavailable:
+    "The model this run was started with is no longer available. " +
+    "Pick a different model in the composer and start a new run — " +
+    "this run is not retried on another model automatically.",
+  configuration:
+    "This run's saved model settings are no longer supported. " +
+    "Pick a valid model and thinking level for a new run.",
   unknown: "The research could not be completed due to an unexpected error.",
 };
+
+/**
+ * Friendly copy for run-submission (HTTP) errors about the user's
+ * model/thinking selection — shown in the composer notice, never a
+ * raw exception (the backend contract is category + fixed text).
+ */
+export function submissionMessage(category?: string | null): string | null {
+  switch (category) {
+    case "invalid_selection":
+      return (
+        "That model or thinking selection is no longer valid. " +
+        "Choose another option and start the run again."
+      );
+    case "model_unavailable":
+      return (
+        "The selected model is no longer available. " +
+        "Choose a different model and start the run again."
+      );
+    case "conflict":
+      return (
+        "This request was already submitted with different settings. " +
+        "Change the question or the settings to start a new run."
+      );
+    case "validation":
+      return "The run request was not valid — check the question and settings.";
+    default:
+      return null;
+  }
+}
 
 export function categoryMessage(category?: string | null): string {
   if (!category) {
@@ -87,5 +123,7 @@ export const ERROR_CATEGORY_LABELS: Record<string, string> = {
   validation: "Validation refusal",
   provider: "Provider error",
   tool: "Tool failure",
+  model_unavailable: "Model no longer available",
+  configuration: "Configuration error",
   unknown: "Error",
 };

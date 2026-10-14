@@ -1,6 +1,6 @@
 {
-  "id": "cf983b33-fc57-47ab-82b1-b4302442a398",
-  "session_id": "54dfb429-01c0-405c-ae7d-88419d0e4394",
+  "id": "350caacc-ab54-4321-b7a5-a6a76b43918d",
+  "session_id": "bd370d45-ba31-4cbd-bc52-063f4eb86ec5",
   "question": "question",
   "status": "completed",
   "answer": "> \u26a0\ufe0f **CITATION QUALITY: INSUFFICIENTLY VERIFIED** \u2014 1 cited URL(s) are not among the recorded sources. This deterministic check compares cited URLs against recorded source provenance only; it does NOT verify that the sources factually support the claims.\n\nA cited answer [S1] with an unknown ref [S9].",
@@ -14,7 +14,7 @@
   "tokens_in": 0,
   "tokens_out": 0,
   "estimated_cost_usd": 0.0,
-  "total_execution_seconds": 0.09,
+  "total_execution_seconds": 0.115,
   "sources": [
     {
       "sid": "S1",
@@ -25,10 +25,10 @@
     }
   ],
   "diagnostics": {
-    "run_id": "f0eb85254575",
-    "started_at": 1791919361.1211693,
-    "finished_at": 1791919361.210835,
-    "total_execution_seconds": 0.09,
+    "run_id": "3ca26c942c25",
+    "started_at": 1791989190.7203195,
+    "finished_at": 1791989190.835552,
+    "total_execution_seconds": 0.115,
     "outcome": {
       "status": "INCOMPLETE",
       "warnings": [
@@ -39,21 +39,32 @@
       "configured_seconds": 180.0,
       "exceeded": false
     },
+    "segments": 1,
+    "run_config": {
+      "model_id": "gemini-3.8-flash",
+      "thinking_level": "medium",
+      "research_depth": "standard",
+      "evidence_policy": "balanced"
+    },
     "totals": {
       "input_tokens": 0,
       "output_tokens": 0,
       "model_calls": 8,
       "tool_calls": 2,
       "retries": 0,
-      "prompt_chars": 17938
+      "prompt_chars": 22022,
+      "tool_latency_ms": 0.2
     },
     "token_usage": {
       "input_tokens": 0,
       "output_tokens": 0,
+      "scope": "whole_run",
       "provider_reported_calls": 0,
       "estimated_calls": 0,
       "unavailable_calls": 8,
       "coverage_ratio": 0.0,
+      "thinking_tokens": null,
+      "thinking_reported_calls": 0,
       "sources": {
         "unavailable": 8
       }
@@ -64,8 +75,8 @@
         "input_tokens": 0,
         "output_tokens": 0,
         "usage_unavailable_calls": 1,
-        "prompt_chars": 1258,
-        "latency_ms": 0.657
+        "prompt_chars": 1368,
+        "latency_ms": 1.073
       },
       "research": {
         "calls": 3,
@@ -73,23 +84,23 @@
         "output_tokens": 0,
         "usage_unavailable_calls": 3,
         "prompt_chars": 5916,
-        "latency_ms": 9.248
+        "latency_ms": 13.406
       },
       "synthesize": {
         "calls": 2,
         "input_tokens": 0,
         "output_tokens": 0,
         "usage_unavailable_calls": 2,
-        "prompt_chars": 3824,
-        "latency_ms": 0.888
+        "prompt_chars": 5394,
+        "latency_ms": 1.486
       },
       "review": {
         "calls": 2,
         "input_tokens": 0,
         "output_tokens": 0,
         "usage_unavailable_calls": 2,
-        "prompt_chars": 6940,
-        "latency_ms": 1.624
+        "prompt_chars": 9344,
+        "latency_ms": 1.7429999999999999
       }
     },
     "model_calls": [
@@ -97,10 +108,11 @@
         "node": "plan",
         "iteration": null,
         "invocation": 1,
-        "latency_ms": 0.657,
+        "latency_ms": 1.073,
         "input_tokens": null,
         "output_tokens": null,
-        "prompt_chars": 1258,
+        "thinking_tokens": null,
+        "prompt_chars": 1368,
         "usage_source": "unavailable",
         "error_category": null
       },
@@ -108,9 +120,10 @@
         "node": "research",
         "iteration": 1,
         "invocation": 2,
-        "latency_ms": 8.177,
+        "latency_ms": 11.707,
         "input_tokens": null,
         "output_tokens": null,
+        "thinking_tokens": null,
         "prompt_chars": 1784,
         "usage_source": "unavailable",
         "error_category": null
@@ -119,9 +132,10 @@
         "node": "research",
         "iteration": 1,
         "invocation": 3,
-        "latency_ms": 0.587,
+        "latency_ms": 0.917,
         "input_tokens": null,
         "output_tokens": null,
+        "thinking_tokens": null,
         "prompt_chars": 2162,
         "usage_source": "unavailable",
         "error_category": null
@@ -130,10 +144,11 @@
         "node": "synthesize",
         "iteration": null,
         "invocation": 4,
-        "latency_ms": 0.454,
+        "latency_ms": 0.733,
         "input_tokens": null,
         "output_tokens": null,
-        "prompt_chars": 1912,
+        "thinking_tokens": null,
+        "prompt_chars": 2697,
         "usage_source": "unavailable",
         "error_category": null
       },
@@ -141,10 +156,11 @@
         "node": "review",
         "iteration": null,
         "invocation": 5,
-        "latency_ms": 0.724,
+        "latency_ms": 0.773,
         "input_tokens": null,
         "output_tokens": null,
-        "prompt_chars": 3470,
+        "thinking_tokens": null,
+        "prompt_chars": 4672,
         "usage_source": "unavailable",
         "error_category": null
       },
@@ -152,9 +168,10 @@
         "node": "research",
         "iteration": 2,
         "invocation": 6,
-        "latency_ms": 0.484,
+        "latency_ms": 0.782,
         "input_tokens": null,
         "output_tokens": null,
+        "thinking_tokens": null,
         "prompt_chars": 1970,
         "usage_source": "unavailable",
         "error_category": null
@@ -163,10 +180,11 @@
         "node": "synthesize",
         "iteration": null,
         "invocation": 7,
-        "latency_ms": 0.434,
+        "latency_ms": 0.753,
         "input_tokens": null,
         "output_tokens": null,
-        "prompt_chars": 1912,
+        "thinking_tokens": null,
+        "prompt_chars": 2697,
         "usage_source": "unavailable",
         "error_category": null
       },
@@ -174,10 +192,11 @@
         "node": "review",
         "iteration": null,
         "invocation": 8,
-        "latency_ms": 0.9,
+        "latency_ms": 0.97,
         "input_tokens": null,
         "output_tokens": null,
-        "prompt_chars": 3470,
+        "thinking_tokens": null,
+        "prompt_chars": 4672,
         "usage_source": "unavailable",
         "error_category": null
       }
@@ -188,7 +207,7 @@
         "iteration": 1,
         "tool": "web_search",
         "ok": true,
-        "latency_ms": 0.128,
+        "latency_ms": 0.133,
         "result_chars": 68,
         "error_category": null
       },
@@ -197,7 +216,7 @@
         "iteration": 1,
         "tool": "fetch_page",
         "ok": true,
-        "latency_ms": 0.068,
+        "latency_ms": 0.113,
         "result_chars": 23,
         "error_category": null
       }
@@ -206,47 +225,47 @@
       {
         "node": "start",
         "iteration": null,
-        "latency_ms": 4.853
+        "latency_ms": 4.291
       },
       {
         "node": "plan",
         "iteration": null,
-        "latency_ms": 2.947
+        "latency_ms": 4.591
       },
       {
         "node": "research",
         "iteration": 1,
-        "latency_ms": 19.511
+        "latency_ms": 26.097
       },
       {
         "node": "synthesize",
         "iteration": null,
-        "latency_ms": 3.518
+        "latency_ms": 6.0
       },
       {
         "node": "review",
         "iteration": null,
-        "latency_ms": 5.295
+        "latency_ms": 6.986
       },
       {
         "node": "research",
         "iteration": 2,
-        "latency_ms": 3.12
+        "latency_ms": 4.813
       },
       {
         "node": "synthesize",
         "iteration": null,
-        "latency_ms": 3.376
+        "latency_ms": 4.776
       },
       {
         "node": "review",
         "iteration": null,
-        "latency_ms": 5.178
+        "latency_ms": 5.533
       },
       {
         "node": "finalize",
         "iteration": null,
-        "latency_ms": 2.239
+        "latency_ms": 2.99
       }
     ],
     "counts": {
@@ -257,6 +276,7 @@
       "search_success_rate": 1.0,
       "fetch_success_rate": 1.0,
       "failed_tool_calls": 0,
+      "search_cache_hits": 0,
       "tool_error_categories": {}
     },
     "security": {
@@ -279,8 +299,12 @@
     },
     "retries": []
   },
-  "created_at": "2026-10-13T19:22:41.080857+00:00",
-  "started_at": "2026-10-13T19:22:41.116049+00:00",
-  "finished_at": "2026-10-13T19:22:41.211130+00:00",
-  "events_url": "/api/runs/cf983b33-fc57-47ab-82b1-b4302442a398/events"
+  "research_depth": "standard",
+  "evidence_policy": "balanced",
+  "model_id": "gemini-3.8-flash",
+  "thinking_level": "medium",
+  "created_at": "2026-10-14T14:46:30.673036+00:00",
+  "started_at": "2026-10-14T14:46:30.714393+00:00",
+  "finished_at": "2026-10-14T14:46:30.836099+00:00",
+  "events_url": "/api/runs/350caacc-ab54-4321-b7a5-a6a76b43918d/events"
 }

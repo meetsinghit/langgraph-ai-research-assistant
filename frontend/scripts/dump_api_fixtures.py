@@ -70,6 +70,11 @@ def main() -> None:
             json.dumps(client.get("/api/health").json(), indent=2),
             encoding="utf-8",
         )
+        # 4E.3: registry-backed catalogue (discovery disabled by default)
+        (OUT_DIR / "models.json").write_text(
+            json.dumps(client.get("/api/models", headers=AUTH).json(), indent=2),
+            encoding="utf-8",
+        )
         session = client.post("/api/sessions", json={"title": "Fixture session"}, headers=AUTH)
         (OUT_DIR / "session_created.json").write_text(
             json.dumps(session.json(), indent=2), encoding="utf-8"
@@ -97,6 +102,19 @@ def main() -> None:
         )
         (OUT_DIR / "sessions_list.json").write_text(
             json.dumps(client.get("/api/sessions", headers=AUTH).json(), indent=2),
+            encoding="utf-8",
+        )
+        # 4E.3 WS-F: rename after the list/session captures so their
+        # titles stay stable; renaming does not touch updated_at.
+        (OUT_DIR / "session_renamed.json").write_text(
+            json.dumps(
+                client.patch(
+                    f"/api/sessions/{session_id}",
+                    json={"title": "Renamed fixture session"},
+                    headers=AUTH,
+                ).json(),
+                indent=2,
+            ),
             encoding="utf-8",
         )
         (OUT_DIR / "error_404.json").write_text(

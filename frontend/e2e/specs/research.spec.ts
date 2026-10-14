@@ -98,3 +98,41 @@ test("follow-up questions stay in the same session", async ({ page }) => {
   const sessions = page.getByRole("navigation", { name: "Research sessions" });
   await expect(sessions.getByText(/2 runs/)).toHaveCount(1);
 });
+
+test("model/thinking/depth/evidence selections are frozen into the run", async ({
+  page,
+}) => {
+  await connect(page);
+  // capability-aware catalogue: wait until the registry-backed model
+  // list has loaded before picking (discovery is off server-side)
+  const modelSelect = page.getByLabel("Model");
+  await expect(
+    modelSelect.locator('option[value="gemini-2.5-flash"]'),
+  ).toHaveCount(1, { timeout: 15_000 });
+  await modelSelect.selectOption("gemini-2.5-flash");
+  // 2.5-flash is a budget-family model: Minimal becomes available
+  const thinkingSelect = page.getByLabel("Thinking");
+  await expect(
+    thinkingSelect.locator('option[value="minimal"]'),
+  ).toHaveCount(1,
+  );
+  await thinkingSelect.selectOption("minimal");
+  await page.getByLabel("Depth").selectOption("deep");
+  await page.getByLabel("Evidence").selectOption("verified");
+
+  await submitQuestion(page, "Settings freeze: what is the capital of France?");
+  await expect(page.getByText("Paris is the capital of France")).toBeVisible({
+    timeout: 40_000,
+  });
+
+  // the diagnostics panel shows exactly what the run used
+  await page.getByRole("tab", { name: "Diagnostics" }).click();
+  const diag = page.getByLabel("Run diagnostics");
+  await expect(diag.getByText("Run configuration")).toBeVisible();
+  await expect(diag.getByText("gemini-2.5-flash")).toBeVisible();
+  await expect(diag.getByText("Minimal", { exact: true })).toBeVisible();
+  await expect(diag.getByText("Deep", { exact: true })).toBeVisible();
+  await expect(diag.getByText("Verified", { exact: true })).toBeVisible();
+  // thinking tokens: honest provider-reported value or "Not reported"
+  await expect(diag.getByText("Thinking tokens")).toBeVisible();
+});

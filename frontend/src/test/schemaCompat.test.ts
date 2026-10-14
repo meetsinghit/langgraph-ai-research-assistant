@@ -12,10 +12,12 @@ import config from "./fixtures/backend/config.json";
 import error404 from "./fixtures/backend/error_404.json";
 import errorResume404 from "./fixtures/backend/error_404_resume.json";
 import health from "./fixtures/backend/health.json";
+import models from "./fixtures/backend/models.json";
 import runAccepted from "./fixtures/backend/run_accepted.json";
 import runDetail from "./fixtures/backend/run_detail_completed.json";
 import sessionCreated from "./fixtures/backend/session_created.json";
 import sessionDetail from "./fixtures/backend/session_detail.json";
+import sessionRenamed from "./fixtures/backend/session_renamed.json";
 import sessionsList from "./fixtures/backend/sessions_list.json";
 
 const RUN_STATUSES = [
@@ -116,8 +118,18 @@ describe("FastAPI schema compatibility (real captured fixtures)", () => {
       "started_at",
       "finished_at",
       "events_url",
+      // 4E.1/4E.3: settings frozen at run creation
+      "research_depth",
+      "evidence_policy",
+      "model_id",
+      "thinking_level",
     ]);
     expect(RUN_STATUSES).toContain(runDetail.status);
+    // this fixture run used the configured defaults (frozen, not null)
+    expect(runDetail.model_id).toBe("gemini-3.8-flash");
+    expect(runDetail.thinking_level).toBe("medium");
+    expect(runDetail.research_depth).toBe("standard");
+    expect(runDetail.evidence_policy).toBe("balanced");
 
     // sources carry the per-run citation contract
     const source = runDetail.sources[0] as Record<string, unknown>;
@@ -160,7 +172,20 @@ describe("FastAPI schema compatibility (real captured fixtures)", () => {
       "unavailable_calls",
       "coverage_ratio",
       "sources",
+      // 4E.3: thinking tokens are provider-reported (null = absent)
+      "thinking_tokens",
+      "thinking_reported_calls",
     ]);
+    expect(diagnostics.token_usage.thinking_tokens).toBeNull();
+    // 4E.3: the frozen run configuration is stamped on the snapshot
+    expectKeys(diagnostics.run_config, [
+      "model_id",
+      "thinking_level",
+      "research_depth",
+      "evidence_policy",
+    ]);
+    expect(diagnostics.run_config.model_id).toBe("gemini-3.8-flash");
+    expect(diagnostics.run_config.thinking_level).toBe("medium");
     expectKeys(diagnostics.counts, [
       "searches",
       "fetches",
@@ -185,10 +210,57 @@ describe("FastAPI schema compatibility (real captured fixtures)", () => {
     ]);
     // the UI types allow null iterations — the backend actually sends them
     expect(diagnostics.model_calls[0]).toHaveProperty("iteration");
+    expect(diagnostics.model_calls[0]).toHaveProperty("thinking_tokens");
     expect(diagnostics.nodes[0]).toHaveProperty("iteration");
     // tokens_by_node is a nested object, not a bare number
     const firstNode = diagnostics.tokens_by_node[Object.keys(diagnostics.tokens_by_node)[0]];
     expectKeys(firstNode, ["calls", "input_tokens", "output_tokens", "prompt_chars"]);
+  });
+
+  it("GET /api/models matches the catalogue contract (4E.3)", () => {
+    expectKeys(models, [
+      "default_model_id",
+      "default_thinking_level",
+      "discovery",
+      "models",
+      "unregistered",
+    ]);
+    // discovery is opt-in: off by default, nothing was fetched
+    expect(models.discovery.status).toBe("disabled");
+    expect(models.discovery.checked_at).toBeNull();
+    expect(typeof models.default_model_id).toBe("string");
+    expect(models.models.length).toBeGreaterThan(0);
+    const entry = models.models[0] as Record<string, any>;
+    expectKeys(entry, [
+      "model_id",
+      "display_name",
+      "family",
+      "status",
+      "free_tier",
+      "selectable",
+      "thinking",
+      "availability",
+      "verified_on",
+      "docs_url",
+    ]);
+    expect(typeof entry.selectable).toBe("boolean");
+    // the configured default is selectable and listed first
+    expect(models.models[0].model_id).toBe(models.default_model_id);
+    expect(entry.selectable).toBe(true);
+    // thinking capabilities drive the capability-aware selector
+    expect(["level", "budget", "none"]).toContain(entry.thinking.control);
+    expect(Array.isArray(entry.thinking.levels)).toBe(true);
+    // excluded models always state why
+    for (const model of models.models as Record<string, any>[]) {
+      if (!model.selectable) expect(model.exclusion_reason).toBeTruthy();
+    }
+  });
+
+  it("PATCH /api/sessions/{id} matches SessionOut (4E.3 rename)", () => {
+    expectKeys(sessionRenamed, ["id", "title", "created_at", "updated_at"]);
+    expect(sessionRenamed.title).toBe("Renamed fixture session");
+    // renaming is metadata editing: it never rewrites created_at
+    expect(sessionRenamed.created_at).toBe(sessionCreated.created_at);
   });
 
   it("error bodies match the fixed {error:{category,message}} contract", () => {

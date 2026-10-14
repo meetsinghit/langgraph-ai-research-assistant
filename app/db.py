@@ -101,10 +101,12 @@ class Database:
         self.initialize()
 
     #: Additive column migrations for databases created before a
-    #: field existed (Phase 4E.1 run metadata). CREATE TABLE IF
-    #: NOT EXISTS never alters an existing table, so pre-4E.1
-    #: databases get the new columns here — existing rows keep the
-    #: documented defaults.
+    #: field existed (Phase 4E.1 run metadata; 4E.3 model/thinking
+    #: config). CREATE TABLE IF NOT EXISTS never alters an existing
+    #: table, so pre-4E.1 databases get the new columns here —
+    #: existing rows keep the documented defaults, and legacy runs
+    #: keep NULL model/thinking (displayed as "not recorded", never
+    #: back-filled with a guess).
     _MIGRATIONS: tuple[tuple[str, str], ...] = (
         (
             "research_depth",
@@ -115,6 +117,14 @@ class Database:
             "evidence_policy",
             "ALTER TABLE runs ADD COLUMN evidence_policy "
             "TEXT NOT NULL DEFAULT 'balanced'",
+        ),
+        (
+            "model_id",
+            "ALTER TABLE runs ADD COLUMN model_id TEXT",
+        ),
+        (
+            "thinking_level",
+            "ALTER TABLE runs ADD COLUMN thinking_level TEXT",
         ),
     )
 

@@ -70,6 +70,40 @@ test("a new session is created from the sidebar button", async ({ page }) => {
   );
 });
 
+test("sessions can be renamed inline and the title persists", async ({
+  page,
+}) => {
+  await connect(page);
+  await submitQuestion(page, "Rename me: what is the capital of France?");
+  await expect(page.getByText("Research completed").first()).toBeVisible({
+    timeout: 40_000,
+  });
+
+  const sessions = page.getByRole("navigation", { name: "Research sessions" });
+  const target = sessions
+    .locator("li")
+    .filter({ hasText: "Rename me:" })
+    .first();
+  await target
+    .getByRole("button", { name: /^Rename session:/ })
+    .click();
+
+  // inline edit: prefilled with the current title, saved with Enter
+  const input = target.locator("input[type='text']");
+  await expect(input).toBeVisible();
+  await input.fill("Renamed in E2E");
+  await input.press("Enter");
+  await expect(sessions.getByText("Renamed in E2E")).toBeVisible();
+
+  // the rename round-trips through the authenticated PATCH and is
+  // persisted in SQLite: a reload still shows the new title
+  await page.reload();
+  await connect(page);
+  await expect(
+    page.getByRole("navigation", { name: "Research sessions" }).getByText("Renamed in E2E"),
+  ).toBeVisible();
+});
+
 test("deleting a session asks for confirmation", async ({ page }) => {
   await connect(page);
   await submitQuestion(page, "Delete me: what is the capital of France?");

@@ -66,10 +66,25 @@ def test_configured_thinking_level_is_respected():
 
 def test_gemini_2_5_models_use_thinking_budget():
     """Gemini 2.5 models use thinking_budget (token count),
-    not thinking_level."""
+    not thinking_level.
+
+    4E.3 behavior change (documented): the default research level
+    ("medium") now maps to the OFFICIAL medium budget for the
+    budget-controlled family (8,192 tokens — the OpenAI-compat
+    mapping; 2.5 dynamic thinking defaults to the same ceiling)
+    instead of leaving the budget implicit. The assertion became
+    more specific (an actual wire value), not weaker.
+    """
     model = build_chat_model(_settings(llm_model="gemini-2.5-flash"))
     assert model.thinking_level is None
-    assert model.thinking_budget is None  # default budget for research
+    assert model.thinking_budget == 8192  # official medium budget
+
+    # "auto" selects the model default: NO thinking parameter.
+    auto = build_chat_model(
+        _settings(llm_model="gemini-2.5-flash", llm_thinking_level="auto")
+    )
+    assert auto.thinking_level is None
+    assert auto.thinking_budget is None
 
     verification = build_chat_model(
         _settings(llm_model="gemini-2.5-flash"), verification=True

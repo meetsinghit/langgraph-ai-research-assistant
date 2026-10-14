@@ -22,11 +22,12 @@ from fastapi import APIRouter, Header, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.events import RunEvent, _CLOSED
-from app.runs import NotFoundError, ResumeUnavailable
+from app.runs import IdempotencyConflict, NotFoundError, ResumeUnavailable
 from app.schemas import (
     CancelOut,
     ConfigOut,
     HealthOut,
+    ModelsOut,
     ResumeOut,
     RunAcceptedOut,
     RunCreate,
@@ -35,8 +36,10 @@ from app.schemas import (
     SessionCreate,
     SessionDetailOut,
     SessionOut,
+    SessionRename,
     SourceOut,
 )
+from agent.gemini_models import ModelSelectionError
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,8 @@ def _run_summary(row: dict[str, Any]) -> RunSummaryOut:
         finished_at=row.get("finished_at"),
         research_depth=row.get("research_depth") or "standard",
         evidence_policy=row.get("evidence_policy") or "balanced",
+        model_id=row.get("model_id"),
+        thinking_level=row.get("thinking_level"),
     )
 
 
@@ -110,6 +115,8 @@ def _run_detail(request: Request, row: dict[str, Any]) -> RunDetailOut:
         diagnostics=diagnostics,
         research_depth=row.get("research_depth") or "standard",
         evidence_policy=row.get("evidence_policy") or "balanced",
+        model_id=row.get("model_id"),
+        thinking_level=row.get("thinking_level"),
         created_at=row["created_at"],
         started_at=row.get("started_at"),
         finished_at=row.get("finished_at"),
@@ -183,6 +190,21 @@ def config(request: Request) -> ConfigOut:
     )
 
 
+@router.get("/models", response_model=ModelsOut)
+def list_models(request: Request) -> ModelsOut:
+    """Backend-managed model catalogue (4E.3 WS-A).
+
+    Served from the maintained capability/free-tier registry — the
+    ONLY authority for ``selectable``. Live ``models.list`` discovery
+    (opt-in via ``MODEL_DISCOVERY_ENABLED``, TTL-cached, single-flight, never
+    called by the automated test suite) only annotates ``availability``
+    and can never make an unvetted model selectable. No secrets, no
+    raw provider error text.
+    """
+    catalog = request.app.state.model_catalog
+    return catalog.snapshot()
+
+
 # -- sessions --------------------------------------------------------------
 
 
@@ -209,6 +231,28 @@ def get_session(session_id: str, request: Request) -> Any:
         session=SessionOut(**session),
         runs=[_run_summary(row) for row in runs],
     )
+
+
+@router.patch("/sessions/{session_id}", response_model=SessionOut)
+def rename_session(
+    session_id: str, body: SessionRename, request: Request
+) -> Any:
+    """Rename a session (4E.3 WS-F).
+
+    Title validation is identical to creation (1-120 chars, control
+    characters stripped) so a renamed title can never be
+    un-displayable. ``updated_at`` is deliberately untouched: renaming
+    is metadata editing, not research activity, so list order and
+    history are unaffected. Requires the Bearer token like every
+    other mutating route.
+    """
+    repo = request.app.state.repo
+    if repo.get_session(session_id) is None:
+        return _error("not_found", "session not found", 404)
+    renamed = repo.rename_session(session_id, body.title)
+    if renamed is None:
+        return _error("not_found", "session not found", 404)
+    return SessionOut(**renamed)
 
 
 @router.delete(
@@ -243,9 +287,22 @@ def create_run(
             idempotency_key=idempotency_key,
             research_depth=body.research_depth,
             evidence_policy=body.evidence_policy,
+            model_id=body.model_id,
+            thinking_level=body.thinking_level,
         )
     except NotFoundError:
         return _error("not_found", "session not found", 404)
+    except ModelSelectionError as exc:
+        # Fixed categories (never provider text): unknown_model |
+        # model_not_selectable | unsupported_thinking_level.
+        return _error(exc.category, str(exc), 400)
+    except IdempotencyConflict:
+        return _error(
+            "idempotency_conflict",
+            "idempotency key already used with different question "
+            "or research settings",
+            409,
+        )
     return RunAcceptedOut(
         run_id=run["id"],
         status=run["status"],

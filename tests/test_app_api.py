@@ -550,9 +550,17 @@ def test_pre_4e1_database_gains_the_run_metadata_columns(
         }
         assert "research_depth" in columns
         assert "evidence_policy" in columns
+        # 4E.3 model/thinking columns arrive as additive migrations
+        assert "model_id" in columns
+        assert "thinking_level" in columns
         row = cursor.execute(
-            "SELECT research_depth, evidence_policy FROM runs "
+            "SELECT research_depth, evidence_policy, model_id, "
+            "thinking_level FROM runs "
             "WHERE id = 'r1'"
         ).fetchone()
     assert row["research_depth"] == "standard"
     assert row["evidence_policy"] == "balanced"
+    # pre-4E.3 rows honestly keep NULLs — never back-filled with a
+    # guess about what configuration they used
+    assert row["model_id"] is None
+    assert row["thinking_level"] is None

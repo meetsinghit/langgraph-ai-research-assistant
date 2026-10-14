@@ -1,0 +1,351 @@
+{
+  "default_model_id": "gemini-3.8-flash",
+  "default_thinking_level": "medium",
+  "discovery": {
+    "status": "disabled",
+    "checked_at": null,
+    "error_category": null,
+    "model_count": null
+  },
+  "models": [
+    {
+      "model_id": "gemini-3.8-flash",
+      "display_name": "Gemini 3.8 Flash",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.8-flash",
+      "notes": "Default model. 'minimal' is NOT supported on this model (the API rejects it); reasoning defaults to medium. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-2.5-flash",
+      "display_name": "Gemini 2.5 Flash",
+      "family": "gemini-2.5",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "budget",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "auto"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash",
+      "notes": "Budget-controlled family: levels map to token budgets (minimal/low 1,024; medium 8,192; high 24,576). Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-2.5-flash-lite",
+      "display_name": "Gemini 2.5 Flash-Lite",
+      "family": "gemini-2.5",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "budget",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "auto"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-flash-lite",
+      "notes": "Budget-controlled family; the model does not think unless a budget is set. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-2.5-pro",
+      "display_name": "Gemini 2.5 Pro",
+      "family": "gemini-2.5",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "budget",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "auto"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.5-pro",
+      "notes": "Budget-controlled family: levels map to token budgets (minimal/low 1,024; medium 8,192; high 24,576). Thinking cannot be fully disabled on Pro. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3-flash-preview",
+      "display_name": "Gemini 3 Flash (preview)",
+      "family": "gemini-3",
+      "status": "preview",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3-flash-preview",
+      "notes": "PREVIEW: may change or be retired without notice and has more restrictive rate limits. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.1-flash-lite",
+      "display_name": "Gemini 3.1 Flash-Lite",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "minimal"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-flash-lite",
+      "notes": "Fast, low-cost. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.5-flash-lite",
+      "display_name": "Gemini 3.5 Flash-Lite",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "minimal"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash-lite",
+      "notes": "Cheapest eligible option; defaults to minimal thinking. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.6-flash",
+      "display_name": "Gemini 3.6 Flash",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "eligible",
+      "selectable": true,
+      "exclusion_reason": null,
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.6-flash",
+      "notes": "Previous-generation Flash. Free tier is quota-limited.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-2.0-flash",
+      "display_name": "Gemini 2.0 Flash (retired)",
+      "family": "gemini-2",
+      "status": "shutdown",
+      "free_tier": "unknown",
+      "selectable": false,
+      "exclusion_reason": "shutdown",
+      "thinking": {
+        "control": "none",
+        "levels": [
+          "auto"
+        ],
+        "default": "auto"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.0-flash",
+      "notes": "Deprecated and shut down on 2026-06-01. Kept only so old runs fail with a clear error instead of silently using a different model.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-2.0-flash-lite",
+      "display_name": "Gemini 2.0 Flash-Lite (retired)",
+      "family": "gemini-2",
+      "status": "shutdown",
+      "free_tier": "unknown",
+      "selectable": false,
+      "exclusion_reason": "shutdown",
+      "thinking": {
+        "control": "none",
+        "levels": [
+          "auto"
+        ],
+        "default": "auto"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-2.0-flash-lite",
+      "notes": "Deprecated and shut down on 2026-06-01. Kept only so old runs fail with a clear error instead of silently using a different model.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.1-pro-preview",
+      "display_name": "Gemini 3.1 Pro (preview)",
+      "family": "gemini-3",
+      "status": "preview",
+      "free_tier": "paid_only",
+      "selectable": false,
+      "exclusion_reason": "paid_tier",
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "high"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview",
+      "notes": "No free-tier entry in the official pricing table (paid only). Excluded from the free-only selector.",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.5-flash",
+      "display_name": "Gemini 3.5 Flash",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "unknown",
+      "selectable": false,
+      "exclusion_reason": "eligibility_unknown",
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "minimal",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.5-flash",
+      "notes": "Free-tier eligibility NOT confirmed in the official pricing table at the verification date \u2014 excluded from the selector until it is (never assumed free).",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-3.7-flash",
+      "display_name": "Gemini 3.7 Flash",
+      "family": "gemini-3",
+      "status": "stable",
+      "free_tier": "unknown",
+      "selectable": false,
+      "exclusion_reason": "eligibility_unknown",
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-3.7-flash",
+      "notes": "Free-tier eligibility NOT confirmed in the official pricing table at the verification date \u2014 excluded from the selector until it is (never assumed free).",
+      "source": "registry"
+    },
+    {
+      "model_id": "gemini-4-argon",
+      "display_name": "Gemini 4 Argon",
+      "family": "gemini-4",
+      "status": "stable",
+      "free_tier": "paid_only",
+      "selectable": false,
+      "exclusion_reason": "paid_tier",
+      "thinking": {
+        "control": "level",
+        "levels": [
+          "auto",
+          "low",
+          "medium",
+          "high"
+        ],
+        "default": "medium"
+      },
+      "availability": "not_checked",
+      "verified_on": "2026-10-14",
+      "docs_url": "https://ai.google.dev/gemini-api/docs/models/gemini-4-argon",
+      "notes": "Paid tier only \u2014 explicitly not available on the Free tier. Excluded from the free-only selector.",
+      "source": "registry"
+    }
+  ],
+  "unregistered": []
+}

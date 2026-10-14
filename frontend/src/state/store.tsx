@@ -27,12 +27,18 @@ import { ApiError } from "../api/client";
 import { RunStream, type StreamStatus } from "../api/sse";
 import {
   TERMINAL_STATUSES,
+  type EvidencePolicy,
+  type ModelOut,
+  type ModelsOut,
+  type ResearchDepth,
   type RunDetailOut,
   type RunEvent,
   type RunStatus,
   type RunSummaryOut,
   type SessionOut,
+  type ThinkingLevel,
 } from "../api/types";
+import { submissionMessage } from "../lib/messages";
 import { titleFromQuestion } from "../lib/format";
 import { useAuth } from "./auth";
 
@@ -45,6 +51,27 @@ export interface CitationSelection {
   runId: string;
   sid: string;
 }
+
+/**
+ * Composer research preferences (4E.1/4E.3). Each submit freezes the
+ * current values into the run — changing them later never alters
+ * existing runs. `modelId: null` means "configured default" (the
+ * request omits the model), `thinkingLevel: null` means the model's
+ * documented default.
+ */
+export interface RunPreferences {
+  modelId: string | null;
+  thinkingLevel: ThinkingLevel | null;
+  depth: ResearchDepth;
+  evidence: EvidencePolicy;
+}
+
+const DEFAULT_PREFERENCES: RunPreferences = {
+  modelId: null,
+  thinkingLevel: null,
+  depth: "standard",
+  evidence: "balanced",
+};
 
 interface StoreValue {
   ready: boolean;
@@ -59,12 +86,22 @@ interface StoreValue {
   notice: Notice | null;
   busy: boolean;
   citation: CitationSelection | null;
+  /** catalogue entries from GET /api/models (registry-backed) */
+  models: ModelOut[];
+  modelsStatus: "idle" | "loading" | "ready" | "failed";
+  discoveryStatus: ModelsOut["discovery"]["status"] | null;
+  defaultModelId: string | null;
+  defaultThinkingLevel: ThinkingLevel | null;
+  preferences: RunPreferences;
+  setPreference: (patch: Partial<RunPreferences>) => void;
   selectSession: (sessionId: string) => void;
   startNewResearch: () => void;
   submitQuestion: (question: string) => Promise<void>;
   cancelRun: (runId: string) => Promise<void>;
   resumeRun: (runId: string) => Promise<void>;
   deleteSession: (sessionId: string) => Promise<void>;
+  /** returns true on success (the caller leaves edit mode) */
+  renameSession: (sessionId: string, title: string) => Promise<boolean>;
   focusRun: (runId: string) => void;
   selectCitation: (runId: string, sid: string) => void;
   retryStream: () => void;
@@ -96,6 +133,14 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [citation, setCitation] = useState<CitationSelection | null>(null);
   const [streamNonce, setStreamNonce] = useState(0);
+  const [catalog, setCatalog] = useState<ModelsOut | null>(null);
+  const [modelsStatus, setModelsStatus] = useState<
+    "idle" | "loading" | "ready" | "failed"
+  >("idle");
+  const [preferences, setPreferences] = useState<RunPreferences>(
+    DEFAULT_PREFERENCES,
+  );
+  const models = catalog?.models ?? [];
 
   // --- helpers -------------------------------------------------------------
 
@@ -179,6 +224,23 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (connection === "connected") void refreshSessions();
   }, [connection, refreshSessions]);
+
+  // Model catalogue (4E.3): loaded once per connection. The backend
+  // serves it from its maintained registry — discovery is off by
+  // default, so this never triggers an external call. Failure is
+  // non-fatal: the composer keeps working with the default model and
+  // just cannot list alternatives.
+  useEffect(() => {
+    if (connection !== "connected") return;
+    setModelsStatus((status) => (status === "ready" ? status : "loading"));
+    client
+      .listModels()
+      .then((result) => {
+        setCatalog(result);
+        setModelsStatus("ready");
+      })
+      .catch(() => setModelsStatus("failed"));
+  }, [connection, client]);
 
   // --- run stream attachment ----------------------------------------------
 
@@ -280,6 +342,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     setActiveSessionId(null);
     setFocusedRunId(null);
     setCitation(null);
+    setPreferences(DEFAULT_PREFERENCES);
   }, []);
 
   const selectSession = useCallback(
@@ -292,11 +355,48 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         const runs = await loadRuns(sessionId);
         const last = runs[runs.length - 1];
         if (last) setFocusedRunId(last.id);
+        // Composer inherits this session's research settings from its
+        // most recent run (WS-D: standard default, per-session
+        // inheritance); a session without runs resets to defaults.
+        setPreferences({
+          modelId: last?.model_id ?? null,
+          thinkingLevel: (last?.thinking_level as ThinkingLevel) ?? null,
+          depth: (last?.research_depth as ResearchDepth) ?? "standard",
+          evidence: (last?.evidence_policy as EvidencePolicy) ?? "balanced",
+        });
       } catch (error) {
         reportError(error, "Could not load this session.");
       }
     },
     [loadRuns, reportError],
+  );
+
+  const setPreference = useCallback(
+    (patch: Partial<RunPreferences>) => {
+      setPreferences((prev) => {
+        const next = { ...prev, ...patch };
+        if ("modelId" in patch && next.thinkingLevel != null) {
+          // Capability guard (4E.3 WS-B): a model without thinking
+          // controls, or one that does not support the selected
+          // level, falls back to its documented default — the UI
+          // never offers a combination the backend must reject.
+          // With "configured default" selected, the default model's
+          // capabilities apply.
+          const specId = next.modelId ?? catalog?.default_model_id ?? "";
+          const spec = models.find((m) => m.model_id === specId);
+          const supported = spec?.thinking;
+          if (
+            !supported ||
+            supported.control === "none" ||
+            !supported.levels.includes(next.thinkingLevel)
+          ) {
+            next.thinkingLevel = null;
+          }
+        }
+        return next;
+      });
+    },
+    [models, catalog],
   );
 
   const submitQuestion = useCallback(
@@ -316,11 +416,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
           sessionId = session.id;
           setActiveSessionId(sessionId);
         }
-        const accepted = await client.createRun(
-          sessionId,
-          trimmed,
-          crypto.randomUUID(),
-        );
+        const accepted = await client.createRun(sessionId, trimmed, {
+          idempotencyKey: crypto.randomUUID(),
+          // Per-run settings frozen at creation (4E.1/4E.3): null
+          // model_id/thinking_level select the configured defaults.
+          settings: {
+            research_depth: preferences.depth,
+            evidence_policy: preferences.evidence,
+            model_id: preferences.modelId,
+            thinking_level: preferences.thinkingLevel,
+          },
+        });
         const placeholder: RunSummaryOut = {
           id: accepted.run_id,
           session_id: sessionId,
@@ -335,12 +441,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
         }));
         setFocusedRunId(accepted.run_id);
       } catch (error) {
-        reportError(error, "Could not start the research run.");
+        if (handleAuthError(error)) return;
+        // Model/thinking selection errors and idempotency conflicts
+        // get actionable copy (never raw exceptions — the backend
+        // contract is category + fixed text).
+        const friendly =
+          error instanceof ApiError ? submissionMessage(error.category) : null;
+        setNotice({
+          kind: "error",
+          message:
+            friendly ??
+            (error instanceof Error
+              ? error.message
+              : "Could not start the research run."),
+        });
       } finally {
         setBusy(false);
       }
     },
-    [activeSessionId, busy, client, reportError],
+    [activeSessionId, busy, client, handleAuthError, preferences],
   );
 
   const cancelRun = useCallback(
@@ -415,6 +534,25 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     [activeSessionId, client, reportError],
   );
 
+  const renameSession = useCallback(
+    async (sessionId: string, title: string): Promise<boolean> => {
+      try {
+        const updated = await client.renameSession(sessionId, title);
+        setSessions((prev) =>
+          prev.map((session) =>
+            session.id === sessionId ? { ...session, ...updated } : session,
+          ),
+        );
+        setNotice(null);
+        return true;
+      } catch (error) {
+        reportError(error, "Could not rename this session.");
+        return false;
+      }
+    },
+    [client, reportError],
+  );
+
   const focusRun = useCallback((runId: string) => {
     setFocusedRunId(runId);
   }, []);
@@ -445,12 +583,21 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       notice,
       busy,
       citation,
+      models,
+      modelsStatus,
+      discoveryStatus: catalog?.discovery.status ?? null,
+      defaultModelId: catalog?.default_model_id ?? null,
+      defaultThinkingLevel:
+        (catalog?.default_thinking_level as ThinkingLevel) ?? null,
+      preferences,
+      setPreference,
       selectSession: (sessionId: string) => void selectSession(sessionId),
       startNewResearch,
       submitQuestion,
       cancelRun,
       resumeRun,
       deleteSession,
+      renameSession,
       focusRun,
       selectCitation,
       retryStream,
@@ -469,12 +616,18 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       notice,
       busy,
       citation,
+      models,
+      modelsStatus,
+      catalog,
+      preferences,
+      setPreference,
       selectSession,
       startNewResearch,
       submitQuestion,
       cancelRun,
       resumeRun,
       deleteSession,
+      renameSession,
       focusRun,
       selectCitation,
       retryStream,

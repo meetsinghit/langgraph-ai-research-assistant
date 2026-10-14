@@ -66,6 +66,15 @@ def categorize_error(exc: BaseException | str) -> str:
     ).lower()
     if "429" in text or "rate limit" in text or "resource exhausted" in text:
         return "rate_limit"
+    # 4E.3: a run whose FROZEN model configuration is no longer usable
+    # (retired model) — checked before generic markers so the message
+    # never degrades to "unknown", and never implies a fallback.
+    if "model unavailable" in text or "model_unavailable" in text:
+        return "model_unavailable"
+    # 4E.3: invalid/contradictory run configuration (bad thinking
+    # level for the model, missing provider configuration, ...).
+    if "configurationerror" in text or "modelselectionerror" in text:
+        return "configuration"
     if any(marker in text for marker in ("certificate", "ssl", "tls")):
         return "tls"
     if "non-public" in text or "private" in text or "unsafe" in text:
@@ -110,6 +119,11 @@ class ModelCallMetrics:
     latency_ms: float
     input_tokens: int | None = None
     output_tokens: int | None = None
+    #: Provider-reported thinking/reasoning tokens for this call
+    #: (Gemini ``thoughts_token_count`` via ``output_token_details``
+    #: ``reasoning``). ``None`` = the provider did not report a
+    #: thinking breakdown — never fabricated as 0.
+    thinking_tokens: int | None = None
     prompt_chars: int = 0
     usage_source: str = "unavailable"
     error_category: str | None = None
@@ -201,6 +215,12 @@ class MetricsCollector:
     #: from the durable event log, but token usage only covers the
     #: final segment, which the snapshot labels explicitly).
     _segments: int = field(default=1, init=False)
+    # -- WS-G (Phase 4E.3) --------------------------------------------
+    #: The run's frozen configuration (model, thinking, depth,
+    #: evidence) as PERSISTED — ``None`` fields for pre-4E.3 runs,
+    #: never back-filled with a guess. Set by the run manager per
+    #: execution segment (same values on resume).
+    _run_config: dict[str, Any] | None = field(default=None, init=False)
 
     # -- lifecycle ------------------------------------------------
 
@@ -235,6 +255,28 @@ class MetricsCollector:
         self._answer_redactions = 0
         self._search_cache_hits = 0
         self._segments = 1
+        self._run_config = None
+
+    def set_run_config(
+        self,
+        *,
+        model_id: str | None,
+        thinking_level: str | None,
+        research_depth: str | None,
+        evidence_policy: str | None,
+    ) -> None:
+        """Stamp the run's frozen configuration into diagnostics (WS-G).
+
+        Values are what the run row PERSISTED: ``None`` for legacy
+        pre-4E.3 runs (displayed as "not recorded"), never
+        back-filled from current settings after the fact.
+        """
+        self._run_config = {
+            "model_id": model_id,
+            "thinking_level": thinking_level,
+            "research_depth": research_depth,
+            "evidence_policy": evidence_policy,
+        }
 
     def set_iteration(self, iteration: int | None) -> None:
         """Current research iteration (context for later events)."""
@@ -322,6 +364,7 @@ class MetricsCollector:
         latency_ms: float,
         input_tokens: int | None = None,
         output_tokens: int | None = None,
+        thinking_tokens: int | None = None,
         prompt_chars: int = 0,
         error_category: str | None = None,
         usage_source: str | None = None,
@@ -334,7 +377,8 @@ class MetricsCollector:
         Passing numbers without an explicit source means the provider
         reported them (``provider``); estimation must pass
         ``usage_source="estimated"`` so reports never confuse the
-        two.
+        two. ``thinking_tokens`` stays ``None`` unless the provider
+        genuinely reported a thinking breakdown.
         """
         measured = input_tokens is not None or output_tokens is not None
         self._model_calls.append(
@@ -345,6 +389,7 @@ class MetricsCollector:
                 latency_ms=round(latency_ms, 3),
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
+                thinking_tokens=thinking_tokens,
                 prompt_chars=prompt_chars,
                 usage_source=usage_source
                 or ("provider" if measured else "unavailable"),
@@ -493,6 +538,12 @@ class MetricsCollector:
         fetches = [c for c in self._tool_calls if c.tool == "fetch_page"]
         failed_searches = [c for c in searches if not c.ok]
         failed_fetches = [c for c in fetches if not c.ok]
+        # Thinking tokens: summed ONLY from calls where the provider
+        # reported a thinking breakdown; null when none did (never a
+        # fabricated zero).
+        thinking_reported = [
+            c for c in self._model_calls if c.thinking_tokens is not None
+        ]
 
         # Outcome: status + fully merged warning labels (explicit
         # state-derived ones and collector-observed ones were merged
@@ -522,6 +573,10 @@ class MetricsCollector:
             # cover the WHOLE run; token usage covers only the final
             # segment (see token_usage.scope).
             "segments": self._segments,
+            # Phase 4E.3 (WS-G): the configuration this run was
+            # created with — persisted values, so a legacy pre-4E.3
+            # run honestly reports nulls instead of today's defaults.
+            "run_config": self._run_config,
             "totals": {
                 "input_tokens": total_in,
                 "output_tokens": total_out,
@@ -555,6 +610,15 @@ class MetricsCollector:
                     if self._model_calls
                     else 0.0
                 ),
+                # Thinking tokens, honestly scoped (4E.3 WS-G): a sum
+                # over calls where the provider reported a thinking
+                # breakdown; null when NO call reported one.
+                "thinking_tokens": (
+                    sum(c.thinking_tokens or 0 for c in thinking_reported)
+                    if thinking_reported
+                    else None
+                ),
+                "thinking_reported_calls": len(thinking_reported),
                 "sources": _count_by(
                     call.usage_source for call in self._model_calls
                 ),
@@ -568,6 +632,7 @@ class MetricsCollector:
                     "latency_ms": c.latency_ms,
                     "input_tokens": c.input_tokens,
                     "output_tokens": c.output_tokens,
+                    "thinking_tokens": c.thinking_tokens,
                     "prompt_chars": c.prompt_chars,
                     "usage_source": c.usage_source,
                     "error_category": c.error_category,

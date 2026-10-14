@@ -44,6 +44,86 @@ export interface RunSummaryOut {
   created_at: string;
   started_at?: string | null;
   finished_at?: string | null;
+  /** research depth frozen at run creation (4E.1) */
+  research_depth?: string;
+  /** evidence policy frozen at run creation (4E.1) */
+  evidence_policy?: string;
+  /** model frozen at run creation; null on pre-4E.3 rows (not recorded) */
+  model_id?: string | null;
+  /** thinking level frozen at run creation; null on pre-4E.3 rows */
+  thinking_level?: string | null;
+}
+
+// ---- per-run research settings (Phase 4E.1/4E.3) --------------------------
+
+export type ResearchDepth = "quick" | "standard" | "deep";
+export type EvidencePolicy = "balanced" | "verified";
+export type ThinkingLevel = "auto" | "minimal" | "low" | "medium" | "high";
+
+export const RESEARCH_DEPTHS: readonly ResearchDepth[] = [
+  "quick",
+  "standard",
+  "deep",
+];
+export const EVIDENCE_POLICIES: readonly EvidencePolicy[] = [
+  "balanced",
+  "verified",
+];
+
+// ---- model catalogue (GET /api/models, Phase 4E.3 WS-A) -------------------
+
+/** Capability description of one model's thinking controls. */
+export interface ModelThinking {
+  control: "level" | "budget" | "none";
+  /** offered levels including "auto" (omit the parameter) */
+  levels: ThinkingLevel[];
+  /** the level used when the user does not pick one */
+  default: ThinkingLevel;
+}
+
+export interface ModelOut {
+  model_id: string;
+  display_name: string;
+  family: string;
+  status: string;
+  free_tier: string;
+  /** the ONLY authority for what the user may pick */
+  selectable: boolean;
+  exclusion_reason?: string | null;
+  thinking?: ModelThinking | null;
+  availability: string;
+  /** when the registry entry was last verified against official docs */
+  verified_on?: string | null;
+  docs_url?: string | null;
+  notes?: string;
+  source?: string;
+}
+
+export interface ModelDiscoveryOut {
+  status: "disabled" | "available" | "unavailable";
+  checked_at?: string | null;
+  error_category?: string | null;
+  model_count?: number | null;
+}
+
+export interface ModelsOut {
+  default_model_id: string;
+  default_thinking_level: string;
+  discovery: ModelDiscoveryOut;
+  models: ModelOut[];
+  /** listing-only observations — never selectable */
+  unregistered: ModelOut[];
+}
+
+/** Request body for POST /api/sessions/{id}/runs (4E.1/4E.3 fields). */
+export interface RunCreatePayload {
+  question: string;
+  research_depth?: ResearchDepth;
+  evidence_policy?: EvidencePolicy;
+  /** null/omitted = the configured default model */
+  model_id?: string | null;
+  /** null/omitted = the configured default thinking level */
+  thinking_level?: ThinkingLevel | null;
 }
 
 export interface SessionDetailOut {
@@ -80,6 +160,14 @@ export interface RunDetailOut {
   started_at?: string | null;
   finished_at?: string | null;
   events_url?: string | null;
+  /** research depth frozen at run creation (4E.1) */
+  research_depth?: string;
+  /** evidence policy frozen at run creation (4E.1) */
+  evidence_policy?: string;
+  /** model frozen at run creation; null on pre-4E.3 rows (not recorded) */
+  model_id?: string | null;
+  /** thinking level frozen at run creation; null on pre-4E.3 rows */
+  thinking_level?: string | null;
 }
 
 export interface RunAcceptedOut {
@@ -167,6 +255,12 @@ export interface ModelCallInfo {
   latency_ms: number;
   input_tokens?: number | null;
   output_tokens?: number | null;
+  /**
+   * Provider-reported reasoning tokens for this call (Gemini
+   * thoughts_token_count). null = the provider reported no thinking
+   * breakdown — never fabricated as zero.
+   */
+  thinking_tokens?: number | null;
   prompt_chars: number;
   usage_source?: string | null;
   error_category?: string | null;
@@ -205,6 +299,17 @@ export interface DiagnosticsSnapshot {
    * the event log; token usage covers only the final segment).
    */
   segments?: number;
+  /**
+   * The frozen per-run configuration this execution used (4E.3):
+   * model/thinking are the recorded values — null on legacy (pre-4E.3)
+   * runs, meaning "not recorded", never back-filled.
+   */
+  run_config?: {
+    model_id?: string | null;
+    thinking_level?: string | null;
+    research_depth?: string | null;
+    evidence_policy?: string | null;
+  } | null;
   token_usage?: {
     input_tokens: number;
     output_tokens: number;
@@ -215,6 +320,13 @@ export interface DiagnosticsSnapshot {
     sources?: Record<string, number>;
     /** "whole_run" (default) or "since_resume" after a crash+resume. */
     scope?: string;
+    /**
+     * Sum of provider-reported reasoning tokens. null = no call
+     * reported a thinking breakdown (never fabricated as zero).
+     */
+    thinking_tokens?: number | null;
+    /** calls that reported a thinking breakdown (when reported at all). */
+    thinking_reported_calls?: number;
   };
   tokens_by_node?: Record<
     string,

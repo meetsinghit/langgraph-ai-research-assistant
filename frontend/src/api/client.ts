@@ -12,8 +12,10 @@ import type {
   CancelOut,
   ConfigOut,
   HealthOut,
+  ModelsOut,
   ResumeOut,
   RunAcceptedOut,
+  RunCreatePayload,
   RunDetailOut,
   SessionDetailOut,
   SessionOut,
@@ -24,6 +26,8 @@ export type ApiErrorCategory =
   | "not_found"
   | "conflict"
   | "validation"
+  | "invalid_selection"
+  | "model_unavailable"
   | "backend_unreachable"
   | "http"
   | "network";
@@ -116,6 +120,12 @@ export class ApiClient {
     return this.request<ConfigOut>("/api/config");
   }
 
+  /** Backend-managed model catalogue (4E.3): registry-backed list of
+   *  free-tier-eligible models with per-model thinking capabilities. */
+  listModels(): Promise<ModelsOut> {
+    return this.request<ModelsOut>("/api/models");
+  }
+
   listSessions(): Promise<SessionOut[]> {
     return this.request<SessionOut[]>("/api/sessions");
   }
@@ -141,23 +151,43 @@ export class ApiClient {
     );
   }
 
+  /** Rename a session (4E.3 WS-F): same 1–120 char validation as
+   *  creation; renaming does not touch run history or ordering. */
+  renameSession(sessionId: string, title: string): Promise<SessionOut> {
+    return this.request<SessionOut>(
+      `/api/sessions/${encodeURIComponent(sessionId)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title }),
+      },
+    );
+  }
+
   createRun(
     sessionId: string,
     question: string,
-    idempotencyKey?: string,
+    options: {
+      idempotencyKey?: string;
+      /** Per-run settings frozen at creation (4E.1/4E.3). Omitted
+       *  fields fall back to the backend's configured defaults; a
+       *  null model_id means "use the configured default model". */
+      settings?: Omit<RunCreatePayload, "question">;
+    } = {},
   ): Promise<RunAcceptedOut> {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
     };
-    if (idempotencyKey) {
-      headers["Idempotency-Key"] = idempotencyKey;
+    if (options.idempotencyKey) {
+      headers["Idempotency-Key"] = options.idempotencyKey;
     }
+    const body: RunCreatePayload = { question, ...options.settings };
     return this.request<RunAcceptedOut>(
       `/api/sessions/${encodeURIComponent(sessionId)}/runs`,
       {
         method: "POST",
         headers,
-        body: JSON.stringify({ question }),
+        body: JSON.stringify(body),
       },
     );
   }
@@ -195,9 +225,18 @@ function mapErrorCategory(
     case "not_found":
       return "not_found";
     case "conflict":
+    // idempotency key reused with different settings (4E.3)
+    case "idempotency_conflict":
       return "conflict";
     case "validation":
       return "validation";
+    // model/thinking selection rejected against the registry (4E.3)
+    case "unknown_model":
+    case "model_not_selectable":
+    case "unsupported_thinking_level":
+      return "invalid_selection";
+    case "model_unavailable":
+      return "model_unavailable";
     default:
       break;
   }

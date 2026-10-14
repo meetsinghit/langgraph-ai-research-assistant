@@ -201,6 +201,11 @@ export const Icons = {
       <path d="M3.5 8.5l3 3 6-7" strokeLinecap="round" strokeLinejoin="round" />
     </svg>
   ),
+  pencil: (
+    <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.4">
+      <path d="M11.2 2.8a1.5 1.5 0 012.1 2.1L5.6 12.6 2.5 13.5l.9-3.1 7.8-7.6z" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ),
   copy: (
     <svg viewBox="0 0 16 16" className="h-4 w-4" fill="none" stroke="currentColor" strokeWidth="1.4">
       <rect x="5.5" y="5.5" width="7" height="8" rx="1.2" />

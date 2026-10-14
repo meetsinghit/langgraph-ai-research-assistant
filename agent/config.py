@@ -15,7 +15,11 @@ from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ProviderName = Literal["gemini", "openrouter", "openai"]
-ThinkingLevel = Literal["low", "medium", "high"]
+#: Thinking selector values (4E.3). ``auto`` = model default (sent as
+#: NO thinking parameter), ``minimal`` is a real level and is NOT the
+#: same as disabling thinking. Per-model support is enforced by
+#: :mod:`agent.gemini_models`, not by this vocabulary.
+ThinkingLevel = Literal["auto", "minimal", "low", "medium", "high"]
 
 _SECRET_FIELDS = (
     "gemini_api_key",
@@ -44,6 +48,20 @@ class Settings(BaseSettings):
     # (Gemini 3 models; unset = "medium"). Verification always
     # uses "low".
     llm_thinking_level: ThinkingLevel | None = None
+
+    # --- Model discovery (Phase 4E.3, WS-A) ---------------------------
+    # Live ``models.list`` verification via the official google-genai
+    # SDK. OFF by default: no external calls happen unless explicitly
+    # enabled (MODEL_DISCOVERY_ENABLED=true), so offline tests, launchers and
+    # air-gapped runs never touch the network. When enabled, calls
+    # are bounded — one per TTL, single-flight, failures backed off,
+    # response capped. Discovery only annotates AVAILABILITY; free
+    # tier eligibility always comes from the maintained registry
+    # (agent/gemini_models), never from a listing.
+    model_discovery_enabled: bool = False
+    model_discovery_ttl_seconds: float = Field(default=900.0, gt=0)
+    model_discovery_backoff_seconds: float = Field(default=300.0, gt=0)
+    model_discovery_timeout_seconds: float = Field(default=10.0, gt=0)
 
     # API keys: read from env/.env only, never logged (see redacted()).
     gemini_api_key: str | None = None

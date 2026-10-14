@@ -71,11 +71,12 @@ def _wait_until(predicate, timeout: float = 10.0, message: str = "condition"):
     raise AssertionError(f"timed out waiting for {message}")
 
 
-def _crash_first_app(tmp_path: Path):
+def _crash_first_app(tmp_path: Path, payload: dict | None = None):
     """Run a study to completion of research, crash in synthesize.
 
     Returns (app, client, session_id, run_id, tools) — the app has a
-    durable checkpoint and a NON-terminal run row.
+    durable checkpoint and a NON-terminal run row. ``payload`` lets a
+    test create the run with explicit per-run settings (4E.3).
     """
     models: list = []
     tools: list = []
@@ -105,7 +106,7 @@ def _crash_first_app(tmp_path: Path):
     session_id = _new_session(client)
     run_id = client.post(
         f"/api/sessions/{session_id}/runs",
-        json={"question": "question"},
+        json=payload or {"question": "question"},
         headers=AUTH,
     ).json()["run_id"]
     manager = app.state.manager

@@ -39,6 +39,8 @@ python main.py "What is LangGraph?"
 | `OPENROUTER_API_KEY` | key from openrouter.ai/keys (free models exist) | – |
 | `OPENAI_API_KEY` | paid key — only used with `ALLOW_PAID_PROVIDERS=true` | – |
 | `ALLOW_PAID_PROVIDERS` | explicit opt-in for paid providers | `false` |
+| `LLM_THINKING_LEVEL` | default thinking effort for runs that do not pick one: `auto` (provider decides) \| `minimal` \| `low` \| `medium` \| `high`; per-run overrides are capability-validated against the selected model's registry entry | unset (= `medium`) |
+| `MODEL_DISCOVERY_ENABLED` · `MODEL_DISCOVERY_TTL_SECONDS` · `MODEL_DISCOVERY_BACKOFF_SECONDS` · `MODEL_DISCOVERY_TIMEOUT_SECONDS` | opt-in live availability annotation for `GET /api/models` (Phase 4E.3): TTL-cached, single-flight, failure-backed-off, capped — **off by default** so nothing touches the network during tests/launches; discovery never changes what is selectable | `false` / `900` / `300` / `10` |
 | `REQUEST_TIMEOUT_SECONDS` | per-request timeout | `30` |
 | `SSL_CA_BUNDLE` | optional PEM CA bundle used to **verify** page-fetch certificates (e.g. enterprise TLS-inspection root); unset = OS trust store via `truststore`, then certifi — verification is never disabled | – |
 | `MAX_RESEARCH_ITERATIONS` | research passes (graph-level budget) | `3` |
@@ -118,10 +120,12 @@ erasure (see [docs/SECURITY.md §10](docs/SECURITY.md)).
 |---|---|
 | `GET /api/health` | liveness (unauthenticated) |
 | `GET /api/config` | content-free capabilities (e.g. `resume_enabled`), budgets — never secrets |
+| `GET /api/models` | backend-managed model catalogue (4E.3): free-tier registry with canonical ids, friendly names, thinking capabilities and per-model `selectable` flag, plus discovery status; discovery is opt-in and off by default |
 | `POST /api/sessions` · `GET /api/sessions` | create / list sessions |
 | `GET /api/sessions/{id}` | session + its runs (summary rows) |
+| `PATCH /api/sessions/{id}` | rename a session (required `title`, 1–120 chars, trimmed; metadata only — run history and `updated_at` untouched) |
 | `DELETE /api/sessions/{id}` | delete a session, its runs, sources, events and checkpoints (cascade) |
-| `POST /api/sessions/{id}/runs` | start a run; optional `research_depth` (`quick` / `standard` / `deep`, default `standard`) and `evidence_policy` (`balanced` / `verified`, default `balanced`) — 4E.1 per-run settings, persisted as run metadata and visible on `GET /api/runs/{id}`; optional `Idempotency-Key` header replays the same run instead of starting a duplicate (409 on key reuse with a different question) |
+| `POST /api/sessions/{id}/runs` | start a run; optional `research_depth` (`quick` / `standard` / `deep`, default `standard`), `evidence_policy` (`balanced` / `verified`, default `balanced`), `model_id` (registry-selectable; `null`/omitted = the configured default) and `thinking_level` (`auto` / `minimal` / `low` / `medium` / `high`, capability-validated per model) — 4E.1/4E.3 per-run settings, **frozen at creation**, persisted and visible on `GET /api/runs/{id}`; optional `Idempotency-Key` header replays the same run instead of starting a duplicate (409 `idempotency_conflict` on key reuse with a different question **or different settings**); invalid selections → 400 `unknown_model` / `model_not_selectable` / `unsupported_thinking_level` |
 | `GET /api/runs/{id}` | run detail: status, answer, review, sources, outcome, content-free diagnostics |
 | `POST /api/runs/{id}/cancel` | cooperative cancel (202); terminal runs → 409 |
 | `POST /api/runs/{id}/resume` | continue an interrupted run from its checkpoint (202), see below |
@@ -271,6 +275,10 @@ other nodes are deadline-guarded and degrade to a controlled
 - **LLM layer** (`agent/llm.py`): provider factory — Gemini (native
   `langchain-google-genai` integration, free tier), OpenRouter
   (OpenAI-compatible client), OpenAI (paid, disabled by default).
+  Model and thinking selection is driven by the maintained free-tier
+  registry (`agent/gemini_models.py`, Phase 4E.3): canonical ids,
+  capability-validated thinking levels, tombstoned retired models —
+  never a silent model substitution.
 - **Tools** (`agent/tools.py`): `web_search` (DuckDuckGo via
   the maintained `ddgs` package, free; an empty result set is
   a meaningful error, not silent success) and
@@ -428,6 +436,57 @@ could contradict the progress view after a crash+resume.
   never inferred from "anything else"). `totals.tool_latency_ms`
   adds combined search+fetch wall time ("Tool time") so latency
   can be read separately from model time.
+
+## Model & thinking selection (Phase 4E.3)
+
+Runs are configured from the UI (or API) with four settings —
+**model, thinking effort, research depth, evidence policy** — all
+frozen into the run row at creation, so history, resume and
+diagnostics keep exactly what the run used. The composer inherits
+a session's most recent run settings when you open it.
+
+- **Backend-managed catalogue** (WS-A), `GET /api/models`: a
+  separately *maintained* registry (`agent/gemini_models.py`) maps
+  canonical ids to friendly names, families, thinking capabilities
+  (`level` / `budget` / `none` + supported levels) and **free-tier
+  eligibility** — the registry is the only authority for what is
+  selectable; a live listing (opt-in discovery, off by default)
+  can annotate `availability` but never selectability. Entries are
+  verified against official docs (`verified_on`), retired models
+  remain as tombstones so a historical selection fails fast with
+  `model_unavailable` — **no automatic substitution**, ever. Only
+  free-tier-eligible models are offered; `unregistered` findings
+  are listing-only.
+- **Thinking effort** (WS-B): `Auto` (parameter omitted — the
+  provider decides), `Minimal`, `Low`, `Medium`, `High`,
+  capability-validated per model (3.x level models omit
+  `minimal`; 2.5-family models map to `thinking_budget` with
+  documented token values). The selector only offers levels the
+  selected model supports; unsupported combinations are rejected
+  (422/400), never coerced. Reasoning stays private — tokens are
+  reported as counts (`thinking_tokens`), never content.
+- **Per-run isolation** (WS-C): each run gets its own settings
+  object (`model_copy`) so concurrent runs with different models
+  or levels can never race; the configured default is submitted
+  as `null` (legacy rows created before 4E.3 show *Not recorded*,
+  never a back-filled guess). Resuming a run continues with its
+  **original** frozen configuration, or fails with a clear
+  configuration error if that configuration is no longer
+  supported. `Idempotency-Key` reuse is now checked against the
+  full setting set: identical → replay, different → 409
+  `idempotency_conflict`.
+- **Session rename** (WS-F): `PATCH /api/sessions/{id}` with a
+  required 1–120-char title (control characters stripped), via an
+  inline edit in the sidebar — metadata only, run history and
+  `updated_at` untouched.
+- **Presentation** (WS-G/H): the composer exposes the four
+  selectors (capability-aware, disabled while submitting); the
+  diagnostics panel gains a **Run configuration** section
+  (model / thinking / depth / evidence, *Not recorded* for legacy
+  rows) plus provider-reported **thinking tokens** with an honest
+  "Not reported" when the provider gave no breakdown; selection
+  and availability errors surface as friendly category copy, never
+  raw exceptions.
 
 ## Reliability (Phase 4B)
 
@@ -722,6 +781,8 @@ AI_POC/
 │   ├── events.py            durable sequenced event channel
 │   ├── repository.py        SQLite CRUD + status vocabulary
 │   ├── db.py                schema (sessions/runs/sources/events), WAL
+│   ├── model_discovery.py   opt-in model availability annotation (4E.3;
+│   │                        TTL/backoff/single-flight, off by default)
 │   ├── schemas.py           request/response contracts
 │   └── __init__.py
 ├── agent/
@@ -729,6 +790,8 @@ AI_POC/
 │   ├── state.py             GraphState + reducers
 │   ├── routing.py           deterministic conditional routing
 │   ├── depth.py             research depth + evidence policy (4E.1)
+│   ├── gemini_models.py     free-tier model registry + thinking mapping
+│   │                        (4E.3: selectability, validation, tombstones)
 │   ├── logging_config.py    JSON-lines logging + redaction
 │   ├── llm.py               provider factory + error taxonomy/retries
 │   ├── tools.py             web_search / fetch_page + SSRF protection,
@@ -767,5 +830,7 @@ AI_POC/
                              secrets, config, security evals;
                              Phase 4D app: auth, lifecycle, idempotency,
                              SSE replay/races, crash recovery/resume,
-                             cancellation, API redaction)
+                             cancellation, API redaction;
+                             Phase 4E.3: model registry, discovery,
+                             per-run model/thinking config, rename)
 ```

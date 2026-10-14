@@ -91,6 +91,21 @@ class Repository:
                 (utcnow(), session_id),
             )
 
+    def rename_session(self, session_id: str, title: str) -> dict[str, Any] | None:
+        """Update a session title (4E.3 WS-F); returns the row.
+
+        Deliberately does NOT touch ``updated_at``: renaming is
+        metadata editing, not new research activity, so the session
+        list keeps its existing order and history is unaffected.
+        """
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                "UPDATE sessions SET title = ? WHERE id = ?",
+                (title, session_id),
+            )
+            updated = cursor.rowcount == 1
+        return self.get_session(session_id) if updated else None
+
     def delete_session(self, session_id: str) -> list[str]:
         """Delete a session and its rows (cascade); returns run ids
         whose checkpoints the caller must prune."""
@@ -114,6 +129,8 @@ class Repository:
         parent_run_id: str | None = None,
         research_depth: str = "standard",
         evidence_policy: str = "balanced",
+        model_id: str | None = None,
+        thinking_level: str | None = None,
     ) -> dict[str, Any]:
         run_id = new_id()
         now = utcnow()
@@ -121,8 +138,9 @@ class Repository:
             cursor.execute(
                 "INSERT INTO runs (id, session_id, idempotency_key, "
                 "parent_run_id, question, conversation_context, status, "
-                "research_depth, evidence_policy, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "research_depth, evidence_policy, model_id, "
+                "thinking_level, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     session_id,
@@ -133,6 +151,8 @@ class Repository:
                     RUN_STATUS_QUEUED,
                     research_depth,
                     evidence_policy,
+                    model_id,
+                    thinking_level,
                     now,
                 ),
             )

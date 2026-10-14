@@ -317,9 +317,10 @@ def test_structured_include_raw_usage_is_captured():
 
 
 def test_response_usage_absent_is_none_not_zero():
-    # plain message without usage: (None, None), never (0, 0)
-    assert _response_usage(AIMessage(content="hi")) == (None, None)
-    # usage block present: measured values (zero is a real value)
+    # plain message without usage: (None, None, None), never (0, 0, 0)
+    assert _response_usage(AIMessage(content="hi")) == (None, None, None)
+    # usage block present: measured values (zero is a real value);
+    # no thinking breakdown reported -> thinking stays None (4E.3)
     message = AIMessage(
         content="hi",
         usage_metadata={
@@ -328,4 +329,16 @@ def test_response_usage_absent_is_none_not_zero():
             "total_tokens": 5,
         },
     )
-    assert _response_usage(message) == (0, 5)
+    assert _response_usage(message) == (0, 5, None)
+    # provider-reported thinking breakdown (Gemini thoughts_token_count
+    # via output_token_details.reasoning) is read honestly
+    thinking_message = AIMessage(
+        content="hi",
+        usage_metadata={
+            "input_tokens": 10,
+            "output_tokens": 25,
+            "total_tokens": 35,
+            "output_token_details": {"reasoning": 15},
+        },
+    )
+    assert _response_usage(thinking_message) == (10, 25, 15)

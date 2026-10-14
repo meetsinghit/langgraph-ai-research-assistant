@@ -13,9 +13,12 @@ import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import type {
   ConfigOut,
+  ModelOut,
+  ModelsOut,
   RunDetailOut,
   RunSummaryOut,
   SessionOut,
+  ThinkingLevel,
 } from "../api/types";
 
 export const TOKEN = "test-token-123";
@@ -38,7 +41,17 @@ export interface MockBackend {
   sessions: SessionOut[];
   runs: Record<string, MockRun>;
   /** Requests observed (path + method), for assertions. */
-  requests: Array<{ method: string; path: string; headers: Headers }>;
+  requests: Array<{ method: string; path: string; headers: Headers; body?: unknown }>;
+  /** GET /api/models payload (4E.3): registry-backed catalogue. */
+  catalog: ModelsOut;
+  /** Scripted failure for the next run creation (selection errors). */
+  rejectNextCreate?: {
+    status: number;
+    category: string;
+    message: string;
+  } | null;
+  /** Delay the next run creation (deterministic busy-state tests). */
+  delayNextCreateMs?: number;
 }
 
 export const defaultConfig: ConfigOut = {
@@ -54,12 +67,83 @@ export const defaultConfig: ConfigOut = {
   resume_enabled: true,
 };
 
+/** Catalogue shaped like the real GET /api/models (4E.3): one
+ *  level-controlled default, one budget-family model, and registry
+ *  entries that are listed but deliberately NOT selectable. */
+export function defaultCatalog(): ModelsOut {
+  const registry = (
+    overrides: Partial<ModelOut> & { model_id: string; display_name: string },
+  ): ModelOut => ({
+    family: "gemini-3",
+    status: "active",
+    free_tier: "eligible",
+    selectable: true,
+    exclusion_reason: null,
+    thinking: {
+      control: "level",
+      levels: ["auto", "low", "medium", "high"],
+      default: "medium",
+    },
+    availability: "not_checked",
+    verified_on: "2026-10-14",
+    docs_url: "https://ai.google.dev/gemini-api/docs",
+    notes: "",
+    source: "registry",
+    ...overrides,
+  });
+  return {
+    default_model_id: "gemini-3.8-flash",
+    default_thinking_level: "medium",
+    discovery: { status: "disabled", checked_at: null, error_category: null, model_count: null },
+    models: [
+      registry({ model_id: "gemini-3.8-flash", display_name: "Gemini 3.8 Flash" }),
+      registry({ model_id: "gemini-3.6-flash", display_name: "Gemini 3.6 Flash" }),
+      registry({
+        model_id: "gemini-2.5-flash",
+        display_name: "Gemini 2.5 Flash",
+        family: "gemini-2.5",
+        thinking: {
+          control: "budget",
+          levels: ["auto", "minimal", "low", "medium", "high"],
+          default: "medium",
+        },
+      }),
+      registry({
+        model_id: "gemini-3.7-flash",
+        display_name: "Gemini 3.7 Flash",
+        free_tier: "unknown",
+        selectable: false,
+        exclusion_reason: "eligibility_unknown",
+      }),
+      registry({
+        model_id: "gemini-4-argon",
+        display_name: "Gemini 4 Argon",
+        free_tier: "paid_only",
+        selectable: false,
+        exclusion_reason: "paid_tier",
+      }),
+      registry({
+        model_id: "gemini-2.0-flash",
+        display_name: "Gemini 2.0 Flash",
+        family: "gemini-2",
+        status: "shutdown",
+        selectable: false,
+        exclusion_reason: "shutdown",
+        thinking: { control: "none", levels: ["auto"], default: "auto" },
+      }),
+    ],
+    unregistered: [],
+  };
+}
+
 export const backend: MockBackend = {
   config: { ...defaultConfig },
   token: TOKEN,
   sessions: [],
   runs: {},
   requests: [],
+  catalog: defaultCatalog(),
+  rejectNextCreate: null,
 };
 
 export function resetBackend(): void {
@@ -68,6 +152,9 @@ export function resetBackend(): void {
   backend.sessions = [];
   backend.runs = {};
   backend.requests = [];
+  backend.catalog = defaultCatalog();
+  backend.rejectNextCreate = null;
+  backend.delayNextCreateMs = undefined;
 }
 
 export function seedSession(
@@ -94,6 +181,10 @@ export function makeSummary(
     created_at: "2026-10-14T10:00:05Z",
     started_at: "2026-10-14T10:00:06Z",
     finished_at: "2026-10-14T10:00:40Z",
+    research_depth: "standard",
+    evidence_policy: "balanced",
+    model_id: null, // pre-4E.3 row: "not recorded", never back-filled
+    thinking_level: null,
     ...overrides,
   };
 }
@@ -125,6 +216,12 @@ export function makeDetail(
     ],
     diagnostics: {
       outcome: { status: "COMPLETED", warnings: [] },
+      run_config: {
+        model_id: null,
+        thinking_level: null,
+        research_depth: "standard",
+        evidence_policy: "balanced",
+      },
       deadline: { configured_seconds: 180, exceeded: false },
       totals: {
         input_tokens: 1200,
@@ -140,6 +237,8 @@ export function makeDetail(
         estimated_calls: 0,
         unavailable_calls: 0,
         coverage_ratio: 1,
+        thinking_tokens: null,
+        thinking_reported_calls: 0,
       },
       counts: {
         searches: 1,
@@ -160,6 +259,10 @@ export function makeDetail(
     },
     created_at: "2026-10-14T10:00:05Z",
     events_url: `/api/runs/${overrides.id}/events`,
+    research_depth: "standard",
+    evidence_policy: "balanced",
+    model_id: null,
+    thinking_level: null,
     ...overrides,
   };
 }
@@ -374,6 +477,14 @@ export const handlers = [
     return HttpResponse.json(backend.config);
   }),
 
+  http.get("/api/models", ({ request }) => {
+    backend.requests.push({ method: "GET", path: "/api/models", headers: request.headers });
+    if (!authed(request)) {
+      return errorBody("unauthorized", "missing or invalid bearer token", 401);
+    }
+    return HttpResponse.json(backend.catalog);
+  }),
+
   http.get("/api/sessions", ({ request }) => {
     backend.requests.push({ method: "GET", path: "/api/sessions", headers: request.headers });
     if (!authed(request)) {
@@ -416,6 +527,33 @@ export const handlers = [
     return HttpResponse.json({ session, runs });
   }),
 
+  http.patch("/api/sessions/:id", async ({ params, request }) => {
+    backend.requests.push({
+      method: "PATCH",
+      path: `/api/sessions/${params.id}`,
+      headers: request.headers,
+    });
+    if (!authed(request)) {
+      return errorBody("unauthorized", "missing or invalid bearer token", 401);
+    }
+    const session = backend.sessions.find((s) => s.id === params.id);
+    if (!session) return errorBody("not_found", "session not found", 404);
+    const body = (await request.json()) as { title?: string };
+    backend.requests[backend.requests.length - 1].body = body;
+    // Mirrors the backend's SessionRename validation (1-120 chars,
+    // trimmed, control characters stripped; title is required).
+    const title =
+      typeof body.title === "string"
+        ? body.title.trim().replace(/[\u0000-\u001f\u007f]/g, "")
+        : "";
+    if (!title || title.length > 120) {
+      return errorBody("validation", "title must be 1-120 characters", 422);
+    }
+    session.title = title;
+    // renaming is metadata editing: updated_at is untouched
+    return HttpResponse.json(session);
+  }),
+
   http.delete("/api/sessions/:id", ({ params, request }) => {
     backend.requests.push({
       method: "DELETE",
@@ -445,12 +583,73 @@ export const handlers = [
     }
     const session = backend.sessions.find((s) => s.id === params.id);
     if (!session) return errorBody("not_found", "session not found", 404);
-    const body = (await request.json()) as { question?: string };
+    const body = (await request.json()) as {
+      question?: string;
+      research_depth?: string;
+      evidence_policy?: string;
+      model_id?: string | null;
+      thinking_level?: ThinkingLevel | null;
+    };
+    backend.requests[backend.requests.length - 1].body = body;
     const question = (body.question ?? "").trim();
     if (!question) {
       return errorBody("validation", "question must not be empty", 422);
     }
+    // Scripted failure (selection/idempotency errors, 4E.3)
+    if (backend.rejectNextCreate) {
+      const scripted = backend.rejectNextCreate;
+      backend.rejectNextCreate = null;
+      return errorBody(scripted.category, scripted.message, scripted.status);
+    }
+    if (backend.delayNextCreateMs) {
+      const delay = backend.delayNextCreateMs;
+      backend.delayNextCreateMs = undefined;
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    // Selection validated against the catalogue, mirroring the
+    // backend's registry checks (4E.3): null = configured default.
+    const depth = body.research_depth ?? "standard";
+    const evidence = body.evidence_policy ?? "balanced";
+    if (depth !== "quick" && depth !== "standard" && depth !== "deep") {
+      return errorBody("validation", "research_depth must be quick|standard|deep", 422);
+    }
+    if (evidence !== "balanced" && evidence !== "verified") {
+      return errorBody("validation", "evidence_policy must be balanced|verified", 422);
+    }
+    const modelId = body.model_id?.trim() || null;
+    const thinkingLevel = body.thinking_level ?? null;
+    if (modelId) {
+      const spec = backend.catalog.models.find((m) => m.model_id === modelId);
+      if (!spec) return errorBody("unknown_model", `'${modelId}' is not a known selectable model`, 400);
+      if (!spec.selectable) {
+        return errorBody(
+          "model_not_selectable",
+          `'${modelId}' is not selectable (free tier)`,
+          400,
+        );
+      }
+      if (
+        thinkingLevel != null &&
+        spec.thinking &&
+        spec.thinking.control !== "none" &&
+        !spec.thinking.levels.includes(thinkingLevel)
+      ) {
+        return errorBody(
+          "unsupported_thinking_level",
+          `'${thinkingLevel}' is not supported by '${modelId}'`,
+          400,
+        );
+      }
+    }
     const id = `run-${Object.keys(backend.runs).length + 1}`;
+    // Frozen at creation (4E.1/4E.3): stored on summary + detail and
+    // echoed in diagnostics.run_config, exactly like the backend.
+    const frozen = {
+      research_depth: depth,
+      evidence_policy: evidence,
+      model_id: modelId ?? backend.catalog.default_model_id,
+      thinking_level: thinkingLevel ?? backend.catalog.default_thinking_level,
+    };
     seedRun(
       {
         id,
@@ -458,6 +657,7 @@ export const handlers = [
         question,
         status: "queued",
         has_answer: false,
+        ...frozen,
       },
       {
         question,
@@ -465,9 +665,14 @@ export const handlers = [
         status: "queued",
         review_status: null,
         outcome_status: null,
+        ...frozen,
       },
       autoRunEvents(),
     );
+    const run = backend.runs[id];
+    if (run.detail.diagnostics) {
+      run.detail.diagnostics.run_config = { ...frozen };
+    }
     return HttpResponse.json(
       { run_id: id, status: "queued", events_url: `/api/runs/${id}/events` },
       { status: 202 },
