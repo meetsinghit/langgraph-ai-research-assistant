@@ -3,14 +3,14 @@
 > Updated after Phase 4E.3 (absorbed the old 4E.4 scope: browser
 > control of model + thinking, depth/evidence, session rename,
 > diagnostics/progress/errors UX, tests, docs). Phase 4E.1 was
-> committed as `9bf5a4b`, 4E.2 as `1342259`; the handoff checkpoint
-> for 4E.1 is `60407e3`.
+> committed as `9bf5a4b`, 4E.2 as `1342259`, 4E.3 as `f404c49`;
+> the handoff checkpoint for 4E.1 is `60407e3`.
 
 ## Git state
 
 - Branch: `main`
 - Chain: `93bbabc (4D.1) → e6b7ec3 (4D.2) → 70c97ca (4D.3) → 9bf5a4b (4E.1)
-  → 60407e3 (handoff) → 1342259 (4E.2) → <4E.3 commit>`
+  → 60407e3 (handoff) → 1342259 (4E.2) → f404c49 (4E.3) → <this handoff>`
 - Baseline for 4E.3: `1342259` — verified clean before starting.
 
 ## Current phase
@@ -175,7 +175,7 @@ scope until approved).
 
 ```powershell
 cd C:\Users\meet.a.singh\Downloads\OpenCode\AI_POC
-git log --oneline -3        # expect HEAD = 4E.3 commit on 1342259
+git log --oneline -3        # expect HEAD = 4E.3 handoff on f404c49
 .\ai_poc\Scripts\python.exe -m pytest -q   # optional sanity: 640 passed, 1 skipped
 ```
 
