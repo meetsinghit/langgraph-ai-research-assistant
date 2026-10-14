@@ -387,6 +387,12 @@ class RunManager:
                 {"configurable": {"thread_id": run_id}},
                 context=context,
             )
+            # WS-D (Phase 4E.2): after a crash+resume this collector
+            # only saw the RESUMED segment while the durable event
+            # channel spans the whole run — reconcile the earlier
+            # segments' tool calls from it so the persisted
+            # diagnostics agree with the progress timeline.
+            self._reconcile_prior_segments(channel, metrics)
             metrics.finish()
             snapshot = metrics.snapshot()
             outcome = str(snapshot["outcome"]["status"])
@@ -474,6 +480,49 @@ class RunManager:
             self._publish(run_id, event_type, event)
 
         return sink
+
+    def _reconcile_prior_segments(
+        self, channel: RunEventChannel, metrics: MetricsCollector
+    ) -> None:
+        """Re-attach earlier segments' tool calls after a crash+resume.
+
+        WS-D (Phase 4E.2): every execution segment publishes its own
+        ``run.started``; the durable event channel is NOT cleared on
+        resume, so the events before the LAST ``run.started`` belong
+        to earlier (crashed) segments whose in-process collector died
+        with them. Their ``tool.finished`` events — the only record
+        that survived — carry exactly the content-free fields the
+        snapshot needs (tool name, ok, error category, latency), so
+        the final counts match what the progress timeline showed
+        for the whole run. Runs without a resume are untouched
+        (single ``run.started`` = no prior segments).
+        """
+        events = channel.replay(0)
+        started_seqs = [
+            event.seq for event in events if event.type == "run.started"
+        ]
+        if len(started_seqs) <= 1:
+            return
+        # The current invocation published its run.started before the
+        # graph ran; everything durable before it is a prior segment.
+        cutoff = started_seqs[-1]
+        prior = [
+            event
+            for event in events
+            if event.seq < cutoff and event.type == "tool.finished"
+        ]
+        metrics.reconcile_prior_segments(
+            [
+                {
+                    "tool": event.payload.get("tool"),
+                    "ok": event.payload.get("ok"),
+                    "error_category": event.payload.get("error_category"),
+                    "latency_ms": event.payload.get("latency_ms"),
+                }
+                for event in prior
+            ],
+            segments=len(started_seqs),
+        )
 
     @staticmethod
     def _status_for(outcome: str) -> str:

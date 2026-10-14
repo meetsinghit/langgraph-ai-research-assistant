@@ -140,8 +140,12 @@ def test_tool_call_budget_and_iteration_budget():
 
     assert result["iteration"] == 2  # iteration budget hit
     assert len(result["findings"]) == 4  # 2 tool calls x 2 passes
-    assert len(fake_tools.search_calls) == 2  # 1 search per pass
-    assert len(fake_tools.fetch_calls) == 2  # 1 fetch per pass
+    # WS-C (Phase 4E.2): the second pass repeats the SAME query, so
+    # it is served from the per-run cache — the backend is searched
+    # once, both executed calls still count, and the saved work is
+    # visible as a cache hit.
+    assert len(fake_tools.search_calls) == 1  # 1 backend search total
+    assert len(fake_tools.fetch_calls) == 2  # 1 fetch per pass (never cached)
     assert "Partial evidence" in result["final_answer"]
 
 

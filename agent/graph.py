@@ -1042,9 +1042,24 @@ def _sensitive_values(settings: Settings) -> tuple[str, ...]:
     )
 
 
+def _search_query_key(query: str) -> str:
+    """Normalization key for the per-run search cache (4E.2 / WS-C).
+
+    Conservative on purpose: casefold + whitespace collapse only.
+    Two queries are "the same" iff they would be handed to the
+    search backend as the same string after trivial normalization —
+    operator or site: differences are PRESERVED (they change what
+    the backend returns).
+    """
+    return " ".join(str(query).casefold().split())
+
+
 def _policy_guarded_functions(
     functions: dict[str, Callable[..., Any]],
     discovered: _DiscoveredSources,
+    *,
+    search_cache: dict[str, Any] | None = None,
+    metrics: Any = None,
 ) -> dict[str, Callable[..., Any]]:
     """Wrap tool functions with the fetch-target policy (Phase 4C).
 
@@ -1053,13 +1068,36 @@ def _policy_guarded_functions(
     registry (category ``policy``). The wrappers pass results
     through UNMODIFIED — policy changes WHO may be called, never
     what the evidence says or how it is quoted.
+
+    Phase 4E.2 (WS-C): when a per-run ``search_cache`` is supplied,
+    a repeat of an already-successfully-searched query (the classic
+    follow-up-pass pattern) is served from the cache — no search-
+    backend hit, identical results, and a content-free metrics
+    counter records the saved work. Only successful, non-empty
+    results are cached, so failures and empty results stay
+    retryable (the query-recovery ladder is unaffected), and the
+    cached list is copied on both store and serve so no downstream
+    consumer can mutate the cache through a returned reference.
     """
     guarded = dict(functions)
     search = functions.get("web_search")
     if search is not None:
 
         def guarded_search(query: str, _inner: Any = search) -> Any:
+            key = _search_query_key(query)
+            if search_cache is not None and key in search_cache:
+                if metrics is not None:
+                    metrics.record_search_cache_hit()
+                return [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in search_cache[key]
+                ]
             results = _inner(query)
+            if search_cache is not None and isinstance(results, list) and results:
+                search_cache[key] = [
+                    dict(item) if isinstance(item, dict) else item
+                    for item in results
+                ]
             if isinstance(results, list):
                 for item in results:
                     if isinstance(item, dict):
@@ -1172,9 +1210,22 @@ def make_research_node(
                 if finding.get("source_url")
             ]
         )
+        # WS-C: the per-run search cache lives in the LIVE context
+        # (fresh per invocation, never checkpointed), created lazily
+        # on the first pass — so a follow-up pass that repeats an
+        # identical query is served from cache instead of re-hitting
+        # the search backend. Without a context there is no cache
+        # (direct unit invocation) — dedup degrades to old behavior.
+        if context is not None and context.search_cache is None:
+            context.search_cache = {}
         executor = ToolExecutor(
             _policy_guarded_functions(
-                budget_tools.tool_functions(), discovered
+                budget_tools.tool_functions(),
+                discovered,
+                search_cache=(
+                    context.search_cache if context is not None else None
+                ),
+                metrics=metrics,
             ),
             metrics=metrics,
             node="research",

@@ -196,7 +196,15 @@ export interface DiagnosticsSnapshot {
     tool_calls: number;
     retries: number;
     prompt_chars?: number;
+    /** Sum of per-call tool latency (search/fetch time). */
+    tool_latency_ms?: number;
   };
+  /**
+   * Execution segments: 1 = uninterrupted, >1 = the run crashed and
+   * was resumed (tool counters are reconciled across segments from
+   * the event log; token usage covers only the final segment).
+   */
+  segments?: number;
   token_usage?: {
     input_tokens: number;
     output_tokens: number;
@@ -205,6 +213,8 @@ export interface DiagnosticsSnapshot {
     unavailable_calls: number;
     coverage_ratio?: number | null;
     sources?: Record<string, number>;
+    /** "whole_run" (default) or "since_resume" after a crash+resume. */
+    scope?: string;
   };
   tokens_by_node?: Record<
     string,
@@ -228,6 +238,8 @@ export interface DiagnosticsSnapshot {
     search_success_rate?: number | null;
     fetch_success_rate?: number | null;
     failed_tool_calls: number;
+    /** web_search calls served from the per-run query cache. */
+    search_cache_hits?: number;
     tool_error_categories: Record<string, number>;
   };
   security?: {

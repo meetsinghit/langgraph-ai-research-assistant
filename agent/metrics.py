@@ -117,14 +117,21 @@ class ModelCallMetrics:
 
 @dataclass
 class ToolCallMetrics:
-    """One tool execution (name/outcome/size, not results)."""
+    """One tool execution (name/outcome/size, not results).
+
+    ``result_chars`` is ``None`` for calls RECONSTRUCTED from the
+    durable event log after a crash+resume (Phase 4E.2): their
+    outcome is known (the event recorded it) but their result size
+    never survived the crash — ``null`` in the report, deliberately
+    distinct from a measured zero.
+    """
 
     node: str
     iteration: int | None
     tool: str
     ok: bool
     latency_ms: float
-    result_chars: int
+    result_chars: int | None = 0
     error_category: str | None = None
 
 
@@ -185,6 +192,15 @@ class MetricsCollector:
         default_factory=list, init=False
     )
     _answer_redactions: int = field(default=0, init=False)
+    # -- WS-C / WS-D (Phase 4E.2) -----------------------------------
+    #: Successful web_search calls served from the per-run query
+    #: cache instead of re-hitting the search backend.
+    _search_cache_hits: int = field(default=0, init=False)
+    #: Execution segments this run had (1 = no interruption; >1 after
+    #: a crash+resume — the tool counters are reconciled across them
+    #: from the durable event log, but token usage only covers the
+    #: final segment, which the snapshot labels explicitly).
+    _segments: int = field(default=1, init=False)
 
     # -- lifecycle ------------------------------------------------
 
@@ -217,6 +233,8 @@ class MetricsCollector:
         self._quality = None
         self._injection_signals.clear()
         self._answer_redactions = 0
+        self._search_cache_hits = 0
+        self._segments = 1
 
     def set_iteration(self, iteration: int | None) -> None:
         """Current research iteration (context for later events)."""
@@ -356,6 +374,54 @@ class MetricsCollector:
             )
         )
 
+    def record_search_cache_hit(self) -> None:
+        """One web_search call was served from the per-run query
+        cache (Phase 4E.2 / WS-C) — no search-backend hit occurred.
+
+        The call itself is still recorded as a normal tool call (the
+        model DID invoke the tool, and the events/diagnostics parity
+        must hold); this counter is what makes the saved work
+        visible instead of silently inflating "searches".
+        """
+        self._search_cache_hits += 1
+
+    def reconcile_prior_segments(
+        self,
+        prior_tool_calls: list[dict[str, Any]],
+        *,
+        segments: int,
+    ) -> None:
+        """Re-attach tool calls recorded by earlier, crashed segments.
+
+        Phase 4E.2 (WS-D): after a crash+resume the collector only
+        covers the RESUMED segment, while the durable event channel
+        (and therefore the progress timeline) spans the whole run.
+        The application layer reads the earlier segments' tool
+        ``tool.finished`` events — the only record that survived the
+        crash — and hands their content-free fields here, so the
+        final snapshot's counts agree with what the progress view
+        showed. Reconstructed calls carry ``result_chars=None``:
+        their result size is genuinely unknown, never a fake zero.
+
+        Token usage of the crashed segments is NOT recoverable (the
+        collector lived in the dead process), so token totals stay
+        scoped to the final segment — the snapshot labels that
+        explicitly via ``token_usage.scope``.
+        """
+        for call in prior_tool_calls:
+            self._tool_calls.append(
+                ToolCallMetrics(
+                    node="research",
+                    iteration=None,
+                    tool=str(call.get("tool") or "unknown"),
+                    ok=bool(call.get("ok")),
+                    latency_ms=round(float(call.get("latency_ms") or 0.0), 3),
+                    result_chars=None,
+                    error_category=call.get("error_category"),
+                )
+            )
+        self._segments = max(1, int(segments))
+
     def record_node(self, node: str, latency_ms: float) -> None:
         self._nodes.append(
             NodeMetrics(
@@ -450,6 +516,12 @@ class MetricsCollector:
                 "configured_seconds": self._deadline_seconds,
                 "exceeded": self._deadline_exceeded,
             },
+            # Phase 4E.2 (WS-D): how many execution segments the run
+            # had (1 = uninterrupted). >1 means a crash+resume: tool
+            # counters were reconciled from the durable event log and
+            # cover the WHOLE run; token usage covers only the final
+            # segment (see token_usage.scope).
+            "segments": self._segments,
             "totals": {
                 "input_tokens": total_in,
                 "output_tokens": total_out,
@@ -459,10 +531,22 @@ class MetricsCollector:
                 "prompt_chars": sum(
                     call.prompt_chars for call in self._model_calls
                 ),
+                # Sum of per-call tool latency (WS-C): how much of
+                # the run was spent in search/fetch, separately from
+                # model thinking and orchestration overhead.
+                "tool_latency_ms": round(
+                    sum(call.latency_ms for call in self._tool_calls), 1
+                ),
             },
             "token_usage": {
                 "input_tokens": total_in,
                 "output_tokens": total_out,
+                # WS-D: after a crash+resume the crashed segments'
+                # token usage died with their collector — the totals
+                # here are honestly scoped, never back-filled.
+                "scope": (
+                    "whole_run" if self._segments <= 1 else "since_resume"
+                ),
                 "provider_reported_calls": len(provider_calls),
                 "estimated_calls": len(estimated_calls),
                 "unavailable_calls": unavailable_calls,
@@ -528,6 +612,11 @@ class MetricsCollector:
                 "failed_tool_calls": sum(
                     1 for c in self._tool_calls if not c.ok
                 ),
+                # WS-C: web_search calls served from the per-run query
+                # cache (a repeat of an already-searched query) —
+                # counted as executed calls above, broken out here so
+                # "searches" is never read as backend hits.
+                "search_cache_hits": self._search_cache_hits,
                 "tool_error_categories": _count_by(
                     c.error_category for c in self._tool_calls if not c.ok
                 ),

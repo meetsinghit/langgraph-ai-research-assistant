@@ -363,3 +363,120 @@ class TestTokenHonestyAndOutcome:
         assert snap["outcome"]["status"] == "UNSPECIFIED"
         assert snap["outcome"]["warnings"] == []
         assert snap["quality"] is None
+
+
+class TestSegmentsLatencyAndCache:
+    """Phase 4E.2 (WS-C/WS-D): search-cache hits, tool-latency total
+    and crash+resume segment reconciliation."""
+
+    def test_defaults_are_single_segment_with_zero_cache_hits(self) -> None:
+        snap = MetricsCollector().snapshot()
+        assert snap["segments"] == 1
+        assert snap["token_usage"]["scope"] == "whole_run"
+        assert snap["counts"]["search_cache_hits"] == 0
+        assert snap["totals"]["tool_latency_ms"] == 0.0
+
+    def test_tool_latency_ms_sums_tool_calls(self) -> None:
+        collector = MetricsCollector()
+        collector.record_tool_call(
+            "research", "web_search", ok=True, latency_ms=120.444,
+            result_chars=10,
+        )
+        collector.record_tool_call(
+            "research", "fetch_page", ok=False, latency_ms=800.0,
+            error_category="timeout",
+        )
+
+        totals = collector.snapshot()["totals"]
+        assert totals["tool_latency_ms"] == 920.4  # rounded, summed
+        assert totals["tool_calls"] == 2
+
+    def test_search_cache_hits_are_counted_separately(self) -> None:
+        collector = MetricsCollector()
+        collector.record_tool_call(
+            "research", "web_search", ok=True, latency_ms=1.0,
+            result_chars=10,
+        )
+        collector.record_search_cache_hit()
+        collector.record_search_cache_hit()
+
+        counts = collector.snapshot()["counts"]
+        # executed calls count as searches (events/diagnostics
+        # parity — the model DID call the tool); the cache counter
+        # is what makes the saved backend work visible on top
+        assert counts["searches"] == 1
+        assert counts["search_cache_hits"] == 2
+
+    def test_reconcile_prior_segments_restores_whole_run_counts(
+        self,
+    ) -> None:
+        collector = MetricsCollector()
+        collector.begin_run()
+        # the resumed segment itself executed one fetch
+        collector.record_tool_call(
+            "research", "fetch_page", ok=True, latency_ms=50.0,
+            result_chars=100,
+        )
+        # earlier (crashed) segment: one search, reconstructed from
+        # the durable tool.finished event
+        collector.reconcile_prior_segments(
+            [
+                {
+                    "tool": "web_search",
+                    "ok": True,
+                    "error_category": None,
+                    "latency_ms": 120,
+                }
+            ],
+            segments=2,
+        )
+
+        snap = collector.snapshot()
+        assert snap["segments"] == 2
+        assert snap["token_usage"]["scope"] == "since_resume"
+        counts = snap["counts"]
+        assert counts["searches"] == 1
+        assert counts["fetches"] == 1
+        assert counts["failed_tool_calls"] == 0
+        # the reconstructed call's result size is UNKNOWN, not zero
+        reconstructed = [
+            call
+            for call in snap["tool_calls"]
+            if call["tool"] == "web_search"
+        ]
+        assert len(reconstructed) == 1
+        assert reconstructed[0]["result_chars"] is None
+        assert reconstructed[0]["iteration"] is None
+
+    def test_reconcile_keeps_failed_outcomes_and_categories(self) -> None:
+        collector = MetricsCollector()
+        collector.reconcile_prior_segments(
+            [
+                {
+                    "tool": "fetch_page",
+                    "ok": False,
+                    "error_category": "timeout",
+                    "latency_ms": 30.0,
+                }
+            ],
+            segments=3,
+        )
+
+        snap = collector.snapshot()
+        assert snap["segments"] == 3
+        counts = snap["counts"]
+        assert counts["fetches"] == 1
+        assert counts["failed_fetches"] == 1
+        assert counts["failed_tool_calls"] == 1
+        assert counts["tool_error_categories"] == {"timeout": 1}
+
+    def test_begin_run_resets_segments_and_cache_hits(self) -> None:
+        collector = MetricsCollector()
+        collector.record_search_cache_hit()
+        collector.reconcile_prior_segments([], segments=2)
+
+        collector.begin_run()
+        snap = collector.snapshot()
+        assert snap["segments"] == 1
+        assert snap["token_usage"]["scope"] == "whole_run"
+        assert snap["counts"]["search_cache_hits"] == 0

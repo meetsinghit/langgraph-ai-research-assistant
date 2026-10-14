@@ -48,6 +48,14 @@ class RunContext:
 
     deadline: RunDeadline | None = None
     sink: ProgressSink | None = None
+    #: Per-run search-query cache (Phase 4E.2 / WS-C): maps a
+    #: normalized query to the last SUCCESSFUL result list, so a
+    #: follow-up pass that repeats an identical query is served
+    #: without re-hitting the search backend. Live-only like the
+    #: deadline: a resume starts a fresh context, so a resumed run
+    #: may legitimately search again. Created lazily by the research
+    #: node (``None`` = dedup disabled for this invocation).
+    search_cache: dict[str, Any] | None = None
 
     def emit(self, event: dict[str, Any]) -> None:
         """Publish a progress event; a broken sink can never fail a run."""

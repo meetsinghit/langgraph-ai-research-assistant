@@ -1,132 +1,114 @@
-# Session Handoff — Phase 4E.1 Complete, Awaiting Review
+# Session Handoff — Phase 4E.2 Complete, Awaiting Review
 
-> Written at session end before an imminent laptop restart (Oct 14,
-> 2026). No work was in flight: the working tree was clean and every
-> planned 4E.1 change is committed. This file is itself the only
-> post-4E.1 artifact (checkpoint commit — see Git state below).
+> Updated after Phase 4E.2 (WS-C/WS-D). Phase 4E.1 was approved and
+> committed as `9bf5a4b`; the handoff checkpoint for it is `60407e3`.
 
 ## Git state
 
 - Branch: `main`
-- HEAD: `9bf5a4b` — "Phase 4E.1: research trustworthiness - evidence
-  policy, grounding checks, explanation-depth gate, adaptive research
-  depth" (23 files, +1981/−79; new: `agent/depth.py`,
-  `tests/test_depth.py`)
-- Baseline for 4E.1: `70c97ca` (Phase 4D.3) — verified clean before
-  starting.
-- Chain: `93bbabc (4D.1) → e6b7ec3 (4D.2) → 70c97ca (4D.3) → 9bf5a4b (4E.1)`
-- Working tree: clean at checkpoint time except this handoff file
-  (committed as a WIP checkpoint).
+- Chain: `93bbabc (4D.1) → e6b7ec3 (4D.2) → 70c97ca (4D.3) → 9bf5a4b (4E.1)
+  → 60407e3 (handoff) → <4E.2 commit>
+- Baseline for 4E.2: `60407e3` — verified clean before starting.
 
 ## Current phase
 
-Phase 4E.1 (Research Trustworthiness + Adaptive Research Depth: WS-A,
-WS-B, WS-G, and the related WS-F fixtures) is **implemented, gated,
-documented, and committed**. It is **awaiting user review**. Phase
-4E.2 (search/latency + diagnostics: WS-C/WS-D) and 4E.3 (frontend UX:
-WS-E) are **explicitly NOT started** — out of scope until the user
-approves.
+Phase 4E.2 (Search/latency + diagnostics reconciliation: WS-C, WS-D) is
+**implemented, gated, documented, and committed** — awaiting user
+review. Phase 4E.3 (frontend UX: WS-E — depth/policy selector, title
+rename, error-message UX) and 4E.4 are **NOT started** (explicitly out
+of scope until approved).
 
-## Completed in Phase 4E.1
+## Completed in Phase 4E.2
 
-- **WS-A evidence policy**: per-run `evidence_policy`
-  (`balanced` default / `verified`) enforced in
-  `agent/citations.validate_citations()` — verified deterministically
-  fails snippet-only and citation-less answers (with findings present)
-  → review downgrade → labeled incomplete result; balanced keeps
-  discovered sources usable with honest UNVERIFIED labeling. Advisory
-  lexical claim-to-source grounding (`GroundingCheck`) reported to the
-  reviewer, never auto-fails. Retrieved-but-uncited sources reported.
-- **WS-B explanation depth**: `agent/completeness.check_explanation_depth()`
-  flags requested topics covered only by generic-category definitions
-  ("X is a core capability for…") when a page was retrieved and the
-  question is explanation-intent; produces the `EXPLANATION DEPTH:
-  SUPERFICIAL` note, fails the review gate, and feeds follow-up
-  research. Fixes the ws4 conditional-routing false approval.
-- **WS-G adaptive depth**: new `agent/depth.py` — `quick` / `standard` /
-  `deep` resolve to explicit `DepthPolicy` budgets from configurable
-  `QUICK_*` / `DEEP_*` settings (`agent/config.py`); standard uses the
-  historical settings unchanged; the global deadline
-  (`MAX_TOTAL_EXECUTION_SECONDS`) remains the hard ceiling. Depth
-  drives plan-query cap, passes, tool/fetch quotas, retrieved
-  threshold, evidence chars, and synthesis/review structure guidance
-  (word targets are ranges, never gates). Depth and evidence policy are
-  independent axes, plain state strings (checkpointed, resume-safe).
-- **Plumbing**: `RunCreate`/run-detail/summary schemas (Literal-validated,
-  422 on unknown values), SQLite additive migration
-  (`Database._MIGRATIONS`: `runs.research_depth`, `runs.evidence_policy`),
-  repository/runs wiring, CLI `--depth` / `--evidence-policy`
-  (backward compatible), persisted as run metadata.
-- **Evals/tests**: harness carries per-case depth/policy and
-  depth-aware budget checks; 7 new fixtures (superficial-keyword-answer,
-  verified-snippet-citation, verified-retrieved-citation,
-  balanced-snippet-allowed, quick-mode-secops, deep-mode-budget,
-  citation-mismatch-grounding); benchmark 23 → 30; new unit tests
-  (`tests/test_depth.py`, extended citations/completeness/app-api tests).
-- **Docs**: README (new "Research depth & evidence quality (Phase 4E.1)"
-  section, config table, CLI list, eval interpretation), `.env.example`
-  (QUICK_*/DEEP_* knobs), `docs/OPERATIONS.md` limitation note.
+### WS-C — search efficiency & latency
+- **Per-run identical-query dedup**: `RunContext.search_cache` (new
+  live-only field, fresh per invocation like the deadline, never
+  checkpointed). `_policy_guarded_functions` wraps `web_search` to
+  serve cached results on a normalized-identical repeat query
+  (casefold + whitespace collapse only — `site:`/operators preserved).
+  Only successful non-empty results are cached (failures stay
+  retryable; the query-recovery ladder is unaffected); results are
+  copied on store and serve (no aliasing); quotas/budgets still count
+  the executed call (bounded); fetches are never cached (force-verify
+  retry semantics). Saved work is surfaced as
+  `counts.search_cache_hits` via `MetricsCollector.record_search_cache_hit()`.
+- **`totals.tool_latency_ms`**: combined search+fetch wall time for
+  latency visibility ("Tool time" row in the diagnostics panel).
+
+### WS-D — diagnostics reconciliation (root cause found & fixed)
+- **Root cause**: on crash+resume, `RunManager._execute` builds a
+  FRESH `MetricsCollector` while the durable event channel keeps the
+  pre-crash events → progress (events) counted the whole run but
+  diagnostics (metrics) only the resumed segment (the SecOps-session
+  discrepancy). Token usage of crashed segments is unrecoverable
+  (collector died in-process; not in events; only partially in
+  checkpoint state) — so it is honestly LABELED, never fabricated.
+- **Fix**: `MetricsCollector.reconcile_prior_segments()` +
+  `RunManager._reconcile_prior_segments()` re-attach earlier
+  segments' tool calls reconstructed from durable `tool.finished`
+  events at finish (cutoff = last `run.started`); reconstructed
+  calls carry `result_chars=None` (unknown ≠ zero).
+- **Snapshot contract additions**: `segments` (1 = uninterrupted),
+  `token_usage.scope` (`whole_run` | `since_resume`),
+  `counts.search_cache_hits`, `totals.tool_latency_ms`.
+- **Definition alignment**: timeline counts fetches by EXACT tool
+  name only; diagnostics annotates "Web searches: N (M failed ·
+  K cached)" / "Pages fetched: N (M failed)"; a resumed run states
+  both scopes (whole-run retrieval counters vs since-resume tokens).
 
 ## Gate results at commit time (all green)
 
-- Python: **568 passed, 1 skipped** (baseline 521 → +47)
-- Offline quality benchmark: **30/30** (was 23)
+- Python: **585 passed, 1 skipped** (4E.1 baseline 568 → +17)
+- Offline quality benchmark: **30/30** (unchanged)
 - Offline security benchmark: **25/25** (unchanged)
-- Frontend: typecheck pass, **82/82**, build pass
-- Real-browser E2E: **18/18** (run because the API schema changed)
+- Frontend: typecheck ✓, **84/84** (baseline 82 → +2), build ✓
+- Real-browser E2E: **18/18** (run because the frontend changed)
 - No live Gemini calls; no dependency changes.
 
 ## Key decisions (for the reviewer)
 
-1. **Evidence policy is backend-enforced** in `validate_citations`,
-   not prompt-only; balanced ≠ strict — snippets stay usable when
-   labeled.
-2. **Grounding is advisory only** (lexical overlap can false-flag
-   honest paraphrase); semantic judgement stays with the reviewer.
-3. **Explanation-depth check is deliberately narrow**: question
-   vocabulary stripped, generic-category copula pattern, requires
-   retrieved evidence + explanation-intent question — so honest
-   UNVERIFIED answers and legitimate short definitions ("What is
-   SecOps?") are never forced into extra research.
-4. **Benchmark expectation change (needs sign-off)**:
-   `ws4-routing-superficial` flipped `approved → needs_more_research`.
-   This is the requested WS-B fix (a strengthening — the gate now
-   catches what only the semantic rubric caught); the 3 tests
-   documenting the old false approval were rewritten to assert the
-   gate fires and that `reviewer_false_approvals` is empty (a new one
-   is now a regression). Rubric assertions kept.
-5. **Depth budgets are explicit config** (`QUICK_*`/`DEEP_*`), never
-   exceeding the global deadline; no length-based gates in either
-   direction (no verbosity reward, no short-answer penalty).
+1. **Dedup has no kill-switch setting**: identical-query repeats are
+   semantically the same results within one run's minutes-long window;
+   no new env knob (documented in README). Dedup degrades to old
+   behavior when no RunContext exists (direct unit invocation).
+2. **Cache hits still count** as executed tool calls in
+   `counts.searches` and in the progress events (events/diagnostics
+   parity is the anchor); `search_cache_hits` disambiguates backend
+   hits. Quotas still consume them — bounded either way.
+3. **One documented behavior change**: `test_tool_call_budget_and_iteration_budget`
+   previously asserted 2 backend searches when both passes repeat the
+   same query; now the second pass is a cache hit (1 backend search).
+   This IS the WS-C feature — assertion updated, not weakened (added
+   cache-hit + fetch assertions).
+4. **Token scope honesty**: after a resume, token totals cover the
+   final segment only (`token_usage.scope: since_resume` + UI note)
+   rather than merging partially-recoverable numbers from state —
+   mixing scopes would be dishonest-by-ambiguity.
+5. **No new eval fixtures**: the dedup changes traces (pass-2 repeat
+   searches now cached) but no expectations; benchmark stays 30/30.
 
-## Errors / flakes encountered (not code regressions)
+## Errors / flakes encountered
 
-- A DNS outage mid-session (`getaddrinfo failed`) failed two
-  network-dependent `tests/test_tools.py` cases once; a PowerShell
-  launcher self-test flaked once under full-suite load. All passed on
-  retry and in the final clean full run (568 passed). If a post-restart
-  run shows these failing, suspect environment, not the commit.
+- None in the final runs. (Mid-development, two of my own new tests
+  failed due to scripted-model cross-node call indexing; fixed by
+  scripting aligned response sequences — no product bug.)
 
 ## Pending / next steps
 
-1. **User reviews commit `9bf5a4b`** (especially the ws4 expectation
-   change and the new fixtures).
-2. On approval, begin **Phase 4E.2** (WS-C search/latency work, WS-D
-   diagnostics reconciliation — e.g. the "1 page verified · 2 fetch
-   failed" vs "1 page fetched · 0 failed tool calls" discrepancy noted
-   in the SecOps session; investigate definitions before changing
-   metrics).
-3. Phase 4E.3 (WS-E) afterwards: frontend depth/policy selector, title
-   rename, error-message UX.
-4. Still permanently pending: Docker runtime validation (not installed),
-   live-Gemini-dependent verification (needs explicit user approval).
+1. **User reviews the 4E.2 commit** (especially the dedup semantics
+   and the reconcile-from-events design).
+2. On approval, **Phase 4E.3** (WS-E): frontend depth/evidence-policy
+   selector, session title rename, error-message UX.
+3. Still permanently pending: Docker runtime validation (not
+   installed), live-Gemini-dependent verification (needs explicit
+   user approval).
 
 ## Resume command sequence (after restart)
 
 ```powershell
 cd C:\Users\meet.a.singh\Downloads\OpenCode\AI_POC
-git log --oneline -2        # expect HEAD = handoff commit on top of 9bf5a4b
-.\ai_poc\Scripts\python.exe -m pytest -q   # optional sanity: 568 passed, 1 skipped
+git log --oneline -3        # expect HEAD = 4E.2 commit on 60407e3
+.\ai_poc\Scripts\python.exe -m pytest -q   # optional sanity: 585 passed, 1 skipped
 ```
 
-Do not start Phase 4E.2 until the user confirms review of 4E.1.
+Do not start Phase 4E.3 until the user confirms review of 4E.2.

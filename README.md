@@ -379,6 +379,56 @@ each run actually used.
   so honest UNVERIFIED answers and legitimate short definitions
   ("What is SecOps?") are never forced into extra research.
 
+## Search efficiency & honest diagnostics (Phase 4E.2)
+
+Two fixes for what live runs exposed: follow-up passes wasting
+time re-searching identical queries, and a diagnostics panel that
+could contradict the progress view after a crash+resume.
+
+- **Per-run search dedup** (WS-C): a repeat of an already
+  *successfully* searched query — the classic follow-up-pass
+  pattern — is served from a per-run query cache instead of
+  re-hitting the search backend (casefold + whitespace
+  normalization only; `site:`/operator differences are preserved
+  because they change what the backend returns). The cache is
+  live-only (a `RunContext` field, like the deadline): fresh per
+  invocation, never checkpointed, so one run can never serve
+  another's queries and a resumed run may legitimately search
+  again. Only successful, non-empty results are cached — failures
+  stay retryable (the query-recovery ladder is unaffected) —
+  cached results are copied on store and serve, and the executed
+  call still counts against every quota (bounded), still emits
+  its progress events, and still counts in `counts.searches`;
+  the saved backend work is surfaced separately as
+  `counts.search_cache_hits` (rendered as "N searches (K
+  cached)" in the diagnostics panel). Fetches are never cached
+  (force-verify must be able to retry a failed fetch).
+- **Diagnostics/progress reconciliation** (WS-D): after a
+  crash+resume the metrics collector only covers the RESUMED
+  segment while the durable event channel (and therefore the
+  progress timeline) spans the whole run — the two views could
+  legitimately disagree ("2 fetch failed" in progress vs "0
+  failed tool calls" in diagnostics). At finish, the run manager
+  re-attaches the earlier segments' tool calls from their durable
+  `tool.finished` events — the only record that survived the
+  crash — so the persisted counters match what the progress view
+  showed. Reconstructed calls carry `result_chars: null` (their
+  size is unknown, never a fake zero). The snapshot states the
+  scope explicitly: `segments` (1 = uninterrupted) and
+  `token_usage.scope` — `whole_run`, or `since_resume` because a
+  crashed segment's token usage died with its in-process
+  collector and is honestly labeled, never fabricated. The
+  diagnostics panel annotates both: retrieval counters "cover the
+  whole run (reconciled from the durable event log)", token usage
+  "covers the resumed segment only".
+- **Definition alignment**: "Web searches"/"Pages fetched" are
+  ATTEMPTS (failures included, now broken out inline as "N (M
+  failed · K cached)"), progress "pages verified" = successes,
+  and the timeline counts only exact tool names (`fetch_page` is
+  never inferred from "anything else"). `totals.tool_latency_ms`
+  adds combined search+fetch wall time ("Tool time") so latency
+  can be read separately from model time.
+
 ## Reliability (Phase 4B)
 
 Five bounded-recovery mechanisms added after the Phase 3 live run

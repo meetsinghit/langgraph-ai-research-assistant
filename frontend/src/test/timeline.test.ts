@@ -63,6 +63,27 @@ describe("deriveTimeline", () => {
     }
   });
 
+  it("counts only exact tool names as searches and fetches (4E.2)", () => {
+    const result = deriveTimeline(
+      [
+        e(1, "stage.started", { node: "research" }),
+        // a failed fetch is still a fetch attempt
+        e(2, "tool.finished", { tool: "fetch_page", ok: false, latency_ms: 5 }),
+        // an unknown/future tool must not be miscounted as a fetch
+        e(3, "tool.finished", { tool: "other_tool", ok: true, latency_ms: 5 }),
+        e(4, "tool.finished", { tool: "web_search", ok: false, latency_ms: 5 }),
+      ],
+      "running",
+    );
+    const search = result.steps.find((s) => s.id === "search");
+    const fetchStep = result.steps.find((s) => s.id === "fetch");
+    expect(search?.detail).toMatch(/1 search/);
+    expect(search?.detail).toMatch(/1 failed/);
+    expect(fetchStep?.detail).toMatch(/1 fetch failed/);
+    // only ONE fetch attempt — the unknown tool was not counted
+    expect(fetchStep?.detail).not.toMatch(/2 fetch/);
+  });
+
   it("renders a completed terminal state with review info", () => {
     const result = deriveTimeline(
       [

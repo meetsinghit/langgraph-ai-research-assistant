@@ -74,6 +74,30 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
 
   const refusalEntries = Object.entries(security?.tool_refusals ?? {});
 
+  // Retrieval counters: annotate failures and cache hits inline so
+  // this panel and the live progress line use the SAME definitions
+  // (WS-D: "searches" = executed web_search calls, including ones
+  // served from the per-run cache; "fetches" = fetch attempts,
+  // including failures — both now say so).
+  const failedSearches = counts?.failed_searches ?? 0;
+  const cacheHits = counts?.search_cache_hits ?? 0;
+  const failedFetches = counts?.failed_fetches ?? 0;
+  const searchNotes: string[] = [];
+  if (failedSearches > 0) {
+    searchNotes.push(`${formatNumber(failedSearches)} failed`);
+  }
+  if (cacheHits > 0) {
+    searchNotes.push(`${formatNumber(cacheHits)} cached`);
+  }
+  const fetchNotes: string[] = [];
+  if (failedFetches > 0) {
+    fetchNotes.push(`${formatNumber(failedFetches)} failed`);
+  }
+  const annotated = (value: string, notes: string[]) =>
+    notes.length > 0 ? `${value} (${notes.join(" · ")})` : value;
+  const segments = diagnostics?.segments ?? 1;
+  const resumed = segments > 1;
+
   return (
     <div aria-label="Run diagnostics">
       <Section title="Outcome">
@@ -132,6 +156,13 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
                   : "—"
             }
           />
+          {totals?.tool_latency_ms != null && totals.tool_latency_ms > 0 && (
+            <Row
+              label="Tool time"
+              value={formatDuration(totals.tool_latency_ms / 1000)}
+              hint="Combined search + fetch wall time, part of the run duration"
+            />
+          )}
         </dl>
       </Section>
 
@@ -154,6 +185,12 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
                 {coverageParts.join(" · ")}
               </p>
             )}
+            {usage?.scope === "since_resume" && (
+              <p className="pt-1 text-[11px] text-ink-muted">
+                Since the last resume — usage before the interruption
+                was not recoverable.
+              </p>
+            )}
           </dl>
         ) : (
           <p className="py-1 text-xs text-ink-muted">
@@ -165,8 +202,16 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
       <Section title="Retrieval">
         {counts ? (
           <dl>
-            <Row label="Web searches" value={formatNumber(counts.searches)} />
-            <Row label="Pages fetched" value={formatNumber(counts.fetches)} />
+            <Row
+              label="Web searches"
+              value={annotated(formatNumber(counts.searches), searchNotes)}
+              hint="web_search calls executed (failed attempts and cached repeats included, broken out)"
+            />
+            <Row
+              label="Pages fetched"
+              value={annotated(formatNumber(counts.fetches), fetchNotes)}
+              hint="fetch attempts (failures included)"
+            />
             <Row
               label="Failed tool calls"
               value={formatNumber(counts.failed_tool_calls)}
@@ -175,6 +220,15 @@ export function DiagnosticsTab({ run }: { run: RunDetailOut }) {
         ) : (
           <p className="py-1 text-xs text-ink-muted">
             Retrieval counters are available once the run finishes.
+          </p>
+        )}
+        {resumed && (
+          <p className="pt-1 text-[11px] text-ink-muted">
+            This run was resumed ({segments} segments): retrieval
+            counters above cover the whole run — they are reconciled
+            from the durable event log. Token usage covers the
+            resumed segment only; usage before the interruption was
+            not recoverable.
           </p>
         )}
       </Section>

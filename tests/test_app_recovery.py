@@ -221,6 +221,20 @@ def test_crash_recovery_across_separate_app_instances(tmp_path: Path):
         assert types.count("run.finished") == 1
         assert "status.changed" in types
 
+        # WS-D (Phase 4E.2): the persisted diagnostics are reconciled
+        # across both segments — the resumed collector itself saw NO
+        # tool calls (research ran pre-crash), so without the event-
+        # log reconciliation these would read 0 and contradict the
+        # progress timeline, which shows the pre-crash search.
+        diagnostics = detail["diagnostics"]
+        assert diagnostics["segments"] == 2
+        counts = diagnostics["counts"]
+        assert counts["searches"] == 1, counts  # pre-crash search
+        assert counts["failed_searches"] == 0
+        # token usage of the crashed segment died with its collector —
+        # honestly scoped, never fabricated
+        assert diagnostics["token_usage"]["scope"] == "since_resume"
+
 
 def _record(models: list, model):
     models.append(model)

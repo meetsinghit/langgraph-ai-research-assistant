@@ -148,6 +148,58 @@ describe("diagnostics panel", () => {
     expect(screen.getByText(/synthesiz/)).toBeInTheDocument();
   });
 
+  it("annotates failed/cached retrieval counts, tool time and resumed segments", async () => {
+    seedSession({ id: "g-s1", title: "Reconciled session", run_count: 1 });
+    const detail = makeDetail({ id: "g-r1", session_id: "g-s1" });
+    detail.diagnostics = {
+      ...detail.diagnostics!,
+      segments: 2,
+      totals: { ...detail.diagnostics!.totals!, tool_latency_ms: 4200 },
+      token_usage: {
+        ...detail.diagnostics!.token_usage!,
+        scope: "since_resume",
+      },
+      counts: {
+        ...detail.diagnostics!.counts!,
+        searches: 3,
+        fetches: 2,
+        failed_searches: 1,
+        failed_fetches: 1,
+        search_cache_hits: 2,
+        failed_tool_calls: 2,
+      },
+    };
+    seedRun(
+      {
+        id: "g-r1",
+        session_id: "g-s1",
+        question: "Reconciled question",
+        status: "completed",
+      },
+      detail,
+      [
+        { seq: 1, type: "run.finished", outcome: "COMPLETED", review_status: "approved" },
+        { seq: 2, type: "status.changed", status: "completed" },
+      ],
+    );
+    const user = await connectApp();
+    await user.click(await screen.findByText("Reconciled session"));
+    await user.click(await screen.findByRole("tab", { name: "Diagnostics" }));
+
+    // WS-D: the same definitions as the progress line — searches and
+    // fetches are ATTEMPTS, with failures (and cache hits) broken out
+    expect(screen.getByText("3 (1 failed · 2 cached)")).toBeInTheDocument();
+    expect(screen.getByText("2 (1 failed)")).toBeInTheDocument();
+    // WS-C: combined search+fetch wall time
+    expect(screen.getByText("Tool time")).toBeInTheDocument();
+    expect(screen.getByText("4.2 s")).toBeInTheDocument();
+    // WS-D: a resumed run states both scopes explicitly
+    expect(screen.getByText(/resumed \(2 segments\)/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/usage before the interruption/i)).toHaveLength(
+      2,
+    );
+  });
+
   it("handles missing usage metadata without fabricating numbers", async () => {
     seedSession({ id: "f-s1", title: "No usage session", run_count: 1 });
     const detail = makeDetail({

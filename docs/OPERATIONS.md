@@ -211,6 +211,11 @@ docker compose -f docker/docker-compose.yml down -v     # DELETES data
   (`research_depth`, `evidence_policy`), but the browser UI has no
   selector yet — browser runs use the defaults (`standard`,
   `balanced`).
+- After a crash + resume, retrieval counters in the diagnostics
+  panel are reconciled from the durable event log and cover the
+  whole run; token usage covers only the resumed segment (the
+  panel says so explicitly — pre-interruption usage died with the
+  interrupted process and is never fabricated).
 - Docker packaging is statically reviewed but not runtime-tested.
 - Windows launchers use Windows PowerShell 5.1+; Linux/macOS users
   run `python -m app.main` and `cd frontend && npm run dev` directly.

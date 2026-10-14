@@ -89,10 +89,13 @@ export function deriveTimeline(
         break;
       case "tool.finished": {
         activeTools.delete(event.tool);
+        // Count by EXACT tool name so a future/non-search tool is
+        // never misreported as a search or a fetch (the backend's
+        // counts.searches/fetches are also per-tool-name).
         if (event.tool === "web_search") {
           searches += 1;
           if (!event.ok) searchFails += 1;
-        } else {
+        } else if (event.tool === "fetch_page") {
           fetches += 1;
           if (!event.ok) fetchFails += 1;
         }
