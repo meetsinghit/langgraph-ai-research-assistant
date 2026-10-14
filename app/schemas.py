@@ -12,6 +12,12 @@ from pydantic import BaseModel, Field, field_validator
 
 QuestionMax = 2000
 
+#: Per-run research depth and evidence policy (Phase 4E.1). The
+#: Literal types are the API-level validation — an unknown value is
+#: a 422, never a silent downgrade.
+ResearchDepthLiteral = Literal["quick", "standard", "deep"]
+EvidencePolicyLiteral = Literal["balanced", "verified"]
+
 
 def _clean_question(value: str) -> str:
     value = value.strip()
@@ -36,6 +42,12 @@ class SessionCreate(BaseModel):
 
 class RunCreate(BaseModel):
     question: str = Field(min_length=1, max_length=QuestionMax)
+    #: research depth for this run (persisted as run metadata so
+    #: historical answers retain their original settings)
+    research_depth: ResearchDepthLiteral = "standard"
+    #: evidence policy for this run (backend-enforced; see
+    #: agent.citations.validate_citations)
+    evidence_policy: EvidencePolicyLiteral = "balanced"
 
     @field_validator("question")
     @classmethod
@@ -60,6 +72,9 @@ class RunSummaryOut(BaseModel):
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None
+    #: run metadata (Phase 4E.1): the settings this run USED
+    research_depth: str = "standard"
+    evidence_policy: str = "balanced"
 
 
 class SessionDetailOut(BaseModel):
@@ -92,6 +107,10 @@ class RunDetailOut(BaseModel):
     total_execution_seconds: float = 0.0
     sources: list[SourceOut] = Field(default_factory=list)
     diagnostics: dict[str, Any] | None = None
+    #: run metadata (Phase 4E.1): depth and evidence policy this
+    #: run used — persisted so history keeps its original settings
+    research_depth: str = "standard"
+    evidence_policy: str = "balanced"
     created_at: str
     started_at: str | None = None
     finished_at: str | None = None

@@ -85,10 +85,18 @@ from agent.citations import (
 )
 from agent.completeness import (
     check_completeness,
+    check_explanation_depth,
     format_completeness_report,
+    format_explanation_report,
 )
 from agent.config import Settings
 from agent.deadline import RunDeadline
+from agent.depth import (
+    depth_policy,
+    resolve_evidence_policy,
+    review_depth_expectation,
+    synthesize_depth_guidance,
+)
 from agent.injection import (
     detect_injection_signals,
     redact_credentials,
@@ -432,6 +440,24 @@ def _incomplete_topics_note(missing: list[str]) -> str:
         "requested these topics, but the draft does not address them: "
         + ", ".join(missing)
         + "."
+    )
+
+
+def _superficial_topics_note(shallow: list[str]) -> str:
+    """Deterministic label for topics that are named but not explained.
+
+    Phase 4E.1 (WS-B): lexical coverage alone must not read as a
+    complete explanation. The label names the gap (never the source
+    text), and ``strip_marked_notes`` removes it — plus the other
+    ``> ⚠️`` notes — before the review node re-validates the draft,
+    so the application's own annotation can never fake coverage.
+    """
+    return (
+        "> ⚠️ **EXPLANATION DEPTH: SUPERFICIAL** — the question "
+        "explicitly requested these topics, but the draft only names "
+        "or defines them without explaining how they work: "
+        + ", ".join(shallow)
+        + ". Retrieved evidence was available to explain them."
     )
 
 
@@ -840,10 +866,17 @@ def make_plan_node(
 
     def plan_node(state: GraphState) -> dict[str, Any]:
         question = state["question"]
+        policy = depth_policy(settings, state.get("research_depth"))
         human = question
         conversation = _conversation_block(state)
         if conversation:
             human = f"{human}\n\n{conversation}"
+        human = (
+            f"{human}\n\nResearch depth: {policy.label} — plan at most "
+            f"{policy.plan_query_cap} search quer"
+            f"{'y' if policy.plan_query_cap == 1 else 'ies'} for this "
+            "depth (fewer when the question is simple)."
+        )
         messages = [
             SystemMessage(content=_PLAN_SYSTEM),
             HumanMessage(content=human),
@@ -880,7 +913,7 @@ def make_plan_node(
                     for query in plan.queries
                     if query and query.strip()
                 ]
-        update: dict[str, Any] = {"research_plan": queries[: settings.max_plan_queries]}
+        update: dict[str, Any] = {"research_plan": queries[: policy.plan_query_cap]}
         logger.info("plan created: %d query(ies)", len(update["research_plan"]))
         return update
 
@@ -1087,12 +1120,17 @@ def make_research_node(
     """
     executable = tools.tool_functions()
     all_tools = tools.langchain_tools()
-    max_calls = settings.max_tool_calls_per_research
-    search_quota = max(1, max_calls // 2)
-    fetch_quota = max(0, max_calls - search_quota)
-    verify_required = settings.min_retrieved_sources > 0
 
     def research_node(state: GraphState) -> dict[str, Any]:
+        # Per-run depth budgets (WS-G): quotas are resolved from the
+        # run's research_depth on EVERY pass (state-resolved, so a
+        # resume keeps its original depth) instead of being frozen at
+        # graph-build time. Standard uses the historical settings.
+        policy = depth_policy(settings, state.get("research_depth"))
+        max_calls = policy.max_tool_calls
+        search_quota = max(1, max_calls // 2)
+        fetch_quota = max(0, max_calls - search_quota)
+        verify_required = policy.min_retrieved_sources > 0
         context = get_run_context()
         deadline = context.deadline if context is not None else None
         if deadline is not None and deadline.expired():
@@ -1203,9 +1241,7 @@ def make_research_node(
         messages: list[BaseMessage] = [
             SystemMessage(content=_RESEARCH_SYSTEM),
             HumanMessage(
-                content=_research_prompt(
-                    state, settings.max_evidence_chars
-                )
+                content=_research_prompt(state, policy.max_evidence_chars)
             ),
         ]
         findings: list[Finding] = []
@@ -1258,7 +1294,7 @@ def make_research_node(
             new_findings = to_findings(
                 result,
                 query=question,
-                max_chars=settings.max_evidence_chars,
+                max_chars=policy.max_evidence_chars,
             )
             findings.extend(new_findings)
             for finding in new_findings:
@@ -1301,7 +1337,7 @@ def make_research_node(
             if not verify_required:
                 return
             while (
-                len(retrieved_urls()) < settings.min_retrieved_sources
+                len(retrieved_urls()) < policy.min_retrieved_sources
                 and executed_calls < max_calls
             ):
                 if (
@@ -1563,12 +1599,16 @@ def make_synthesize_node(
         findings = state.get("findings") or []
         if not findings:
             return {"final_answer": "No findings were collected during research."}
+        policy = depth_policy(settings, state.get("research_depth"))
+        evidence_policy = resolve_evidence_policy(
+            state.get("evidence_policy")
+        )
         verified, retrieved_count = _verification(
-            findings, settings.min_retrieved_sources
+            findings, policy.min_retrieved_sources
         )
         prompt_parts = [
             f"Question: {state['question']}",
-            _verification_line(findings, settings.min_retrieved_sources),
+            _verification_line(findings, policy.min_retrieved_sources),
         ]
         conversation = _conversation_block(state)
         if conversation:
@@ -1576,8 +1616,27 @@ def make_synthesize_node(
         official_block = _official_sources_block(findings, state["question"])
         if official_block:
             prompt_parts.append(official_block)
+        if evidence_policy == "verified":
+            prompt_parts.append(
+                "Evidence policy: VERIFIED — every factual claim must "
+                "be grounded in [retrieved] sources (pages fetched and "
+                "inspected). Do NOT cite [snippet] sources at all: "
+                "they may guide what to say, but cannot support a "
+                "claim. If retrieved evidence is insufficient, shorten "
+                "the answer and say exactly what could not be "
+                "verified — never invent support."
+            )
+        else:
+            prompt_parts.append(
+                "Evidence policy: BALANCED — prefer [retrieved] "
+                "sources for every claim. A [snippet] citation is "
+                "allowed only as clearly-labeled, unverified support: "
+                "mark claims that rest only on snippets as unverified. "
+                "Never present a snippet source as verified."
+            )
+        prompt_parts.append(synthesize_depth_guidance(policy))
         prompt_parts.append(
-            f"Findings:\n{_evidence_blocks(findings, settings.max_evidence_chars)}"
+            f"Findings:\n{_evidence_blocks(findings, policy.max_evidence_chars)}"
         )
         messages = [
             SystemMessage(content=_SYNTHESIZE_SYSTEM),
@@ -1620,7 +1679,12 @@ def make_synthesize_node(
         # any deterministic notes are prepended, so the checks never
         # see the application's own annotations.
         completeness = check_completeness(state["question"], answer)
-        citation_report = validate_citations(answer, findings, state["question"])
+        explanation = check_explanation_depth(
+            state["question"], answer, findings
+        )
+        citation_report = validate_citations(
+            answer, findings, state["question"], policy=evidence_policy
+        )
         notes: list[str] = []
         if not verified:
             # Deterministic honesty: verification did not complete,
@@ -1630,11 +1694,11 @@ def make_synthesize_node(
                 "synthesized answer is UNVERIFIED: %d of %d required "
                 "source page(s) fetched",
                 retrieved_count,
-                settings.min_retrieved_sources,
+                policy.min_retrieved_sources,
             )
             notes.append(
                 _unverified_banner(
-                    retrieved_count, settings.min_retrieved_sources
+                    retrieved_count, policy.min_retrieved_sources
                 )
             )
         if not completeness.ok:
@@ -1646,6 +1710,16 @@ def make_synthesize_node(
                 ", ".join(completeness.missing),
             )
             notes.append(_incomplete_topics_note(list(completeness.missing)))
+        if not explanation.ok:
+            # Deterministic explanation depth (WS-B): a requested
+            # topic that is only named/defined while retrieved
+            # evidence was available — labeled, and the review gate
+            # sends research back to actually explain it.
+            logger.warning(
+                "drafted answer only names requested topic(s): %s",
+                ", ".join(explanation.shallow),
+            )
+            notes.append(_superficial_topics_note(list(explanation.shallow)))
         if not citation_report.ok:
             logger.warning(
                 "drafted answer failed citation validation: %s",
@@ -1670,15 +1744,22 @@ def make_synthesize_node(
             notes.append(_official_incomplete_note(official_status))
         if notes:
             answer = "\n\n".join(notes) + "\n\n" + answer
-        if len(findings) < settings.min_findings:
+        if len(findings) < policy.min_findings:
             answer = (
                 f"{answer}\n\n[Partial evidence: only {len(findings)} "
                 f"finding(s) collected; the quality threshold is "
-                f"{settings.min_findings}.]"
+                f"{policy.min_findings}.]"
             )
+        # Shallow terms join the missing ones so the NEXT research
+        # pass (if the review gate sends one back) is told to target
+        # topics that were named but never explained.
+        missing_topics: list[str] = list(completeness.missing)
+        for term in explanation.shallow:
+            if term not in missing_topics:
+                missing_topics.append(term)
         update: dict[str, Any] = {
             "final_answer": answer,
-            "missing_topics": list(completeness.missing),
+            "missing_topics": missing_topics,
         }
         delta_in, delta_out = _usage_delta(response)
         update["tokens_in"] = state.get("tokens_in", 0) + delta_in
@@ -1755,12 +1836,21 @@ def make_review_node(
 
     def review_node(state: GraphState) -> dict[str, Any]:
         findings = state.get("findings") or []
+        policy = depth_policy(settings, state.get("research_depth"))
+        evidence_policy = resolve_evidence_policy(
+            state.get("evidence_policy")
+        )
         # Validate the model's draft body, not the answer with our
         # own deterministic notes prepended (those mention the
         # missing topics and would mask a failing coverage check).
         answer = strip_marked_notes(state.get("final_answer", ""))
-        report = validate_citations(answer, findings, state["question"])
+        report = validate_citations(
+            answer, findings, state["question"], policy=evidence_policy
+        )
         completeness = check_completeness(state["question"], answer)
+        explanation = check_explanation_depth(
+            state["question"], answer, findings
+        )
         official_status = official_source_status(
             findings, state["question"]
         )
@@ -1769,11 +1859,13 @@ def make_review_node(
             HumanMessage(
                 content=(
                     f"Question: {state['question']}\n\n"
-                    f"{_verification_line(findings, settings.min_retrieved_sources)}\n\n"
+                    f"{_verification_line(findings, policy.min_retrieved_sources)}\n\n"
                     f"Official-source status: {_official_status_line(official_status)}\n\n"
                     f"{format_citation_report(report)}\n\n"
                     f"{format_completeness_report(completeness)}\n\n"
-                    f"Findings:\n{_evidence_blocks(findings, settings.max_evidence_chars)}\n\n"
+                    f"{format_explanation_report(explanation)}\n\n"
+                    f"{review_depth_expectation(policy)}\n\n"
+                    f"Findings:\n{_evidence_blocks(findings, policy.max_evidence_chars)}\n\n"
                     f"Draft answer: {answer}"
                 )
             ),
@@ -1833,6 +1925,11 @@ def make_review_node(
             failed_checks.append("citation validation")
         if not completeness.ok:
             failed_checks.append("topic coverage")
+        if not explanation.ok:
+            # WS-B: an approved verdict can never wave through a
+            # topic that is merely named while retrieved evidence
+            # was available to explain it.
+            failed_checks.append("explanation depth")
         if official_status in (
             OfficialSourceStatus.OFFICIAL_DISCOVERED_ONLY,
             OfficialSourceStatus.NO_OFFICIAL_SOURCE,
@@ -2289,8 +2386,12 @@ def build_research_graph(
         "research",
         lambda state: route_after_research(
             state,
-            min_findings=settings.min_findings,
-            max_iterations=settings.max_research_iterations,
+            min_findings=depth_policy(
+                settings, state.get("research_depth")
+            ).min_findings,
+            max_iterations=depth_policy(
+                settings, state.get("research_depth")
+            ).max_iterations,
         ),
         {
             ROUTE_RESEARCH: "research",
@@ -2301,7 +2402,10 @@ def build_research_graph(
     builder.add_conditional_edges(
         "review",
         lambda state: route_after_review(
-            state, max_iterations=settings.max_research_iterations
+            state,
+            max_iterations=depth_policy(
+                settings, state.get("research_depth")
+            ).max_iterations,
         ),
         {ROUTE_RESEARCH: "research", ROUTE_FINALIZE: "finalize"},
     )

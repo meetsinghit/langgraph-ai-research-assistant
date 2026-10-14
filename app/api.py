@@ -60,6 +60,8 @@ def _run_summary(row: dict[str, Any]) -> RunSummaryOut:
         created_at=row["created_at"],
         started_at=row.get("started_at"),
         finished_at=row.get("finished_at"),
+        research_depth=row.get("research_depth") or "standard",
+        evidence_policy=row.get("evidence_policy") or "balanced",
     )
 
 
@@ -106,6 +108,8 @@ def _run_detail(request: Request, row: dict[str, Any]) -> RunDetailOut:
         ),
         sources=sources,
         diagnostics=diagnostics,
+        research_depth=row.get("research_depth") or "standard",
+        evidence_policy=row.get("evidence_policy") or "balanced",
         created_at=row["created_at"],
         started_at=row.get("started_at"),
         finished_at=row.get("finished_at"),
@@ -237,6 +241,8 @@ def create_run(
             session_id=session_id,
             question=body.question,
             idempotency_key=idempotency_key,
+            research_depth=body.research_depth,
+            evidence_policy=body.evidence_policy,
         )
     except NotFoundError:
         return _error("not_found", "session not found", 404)

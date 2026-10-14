@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS runs (
     estimated_cost_usd      REAL NOT NULL DEFAULT 0,
     total_execution_seconds REAL NOT NULL DEFAULT 0,
     metrics_json            TEXT,
+    research_depth          TEXT NOT NULL DEFAULT 'standard',
+    evidence_policy         TEXT NOT NULL DEFAULT 'balanced',
     created_at              TEXT NOT NULL,
     started_at              TEXT,
     finished_at             TEXT
@@ -98,6 +100,24 @@ class Database:
         self._initialized = False
         self.initialize()
 
+    #: Additive column migrations for databases created before a
+    #: field existed (Phase 4E.1 run metadata). CREATE TABLE IF
+    #: NOT EXISTS never alters an existing table, so pre-4E.1
+    #: databases get the new columns here — existing rows keep the
+    #: documented defaults.
+    _MIGRATIONS: tuple[tuple[str, str], ...] = (
+        (
+            "research_depth",
+            "ALTER TABLE runs ADD COLUMN research_depth "
+            "TEXT NOT NULL DEFAULT 'standard'",
+        ),
+        (
+            "evidence_policy",
+            "ALTER TABLE runs ADD COLUMN evidence_policy "
+            "TEXT NOT NULL DEFAULT 'balanced'",
+        ),
+    )
+
     def initialize(self) -> None:
         """Create the schema once (idempotent, concurrency-safe)."""
         with self._init_lock:
@@ -105,6 +125,15 @@ class Database:
                 return
             connection = self._connect()
             connection.executescript(_SCHEMA)
+            existing = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(runs)"
+                )
+            }
+            for column, statement in self._MIGRATIONS:
+                if column not in existing:
+                    connection.execute(statement)
             connection.commit()
             self._initialized = True
 

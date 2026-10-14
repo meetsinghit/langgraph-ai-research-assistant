@@ -4,8 +4,11 @@ Keyword coverage only — these tests never claim coverage proves
 correctness; that semantic judgement stays with the LLM reviewer.
 """
 from agent.completeness import (
+    ExplanationReport,
     check_completeness,
+    check_explanation_depth,
     format_completeness_report,
+    format_explanation_report,
 )
 
 
@@ -119,3 +122,135 @@ def test_report_disclaims_correctness():
         check_completeness("Explain conditional routing", "Conditional routing explained.")
     )
     assert "PASS" in passing
+
+
+# --- explanation depth (Phase 4E.1, WS-B) -------------------------
+#
+# Lexical heuristic tests: "named but never explained". These never
+# claim the explanation is CORRECT — semantic adequacy stays with
+# the reviewer.
+
+_RETRIEVED = [
+    {
+        "text": "Conditional routing branches execution along "
+        "edges guarded by predicate functions that read the state.",
+        "source_url": "https://wiki.example.org/routing",
+        "evidence": "retrieved",
+    }
+]
+_WS4_QUESTION = (
+    "Explain LangGraph state management and conditional routing "
+    "using official documentation."
+)
+_WS4_ANSWER = (
+    "LangGraph state management persists state through "
+    "checkpointers that snapshot the state at each node. "
+    "Conditional routing is a core LangGraph capability for "
+    "directing flow. See [S1] and [S2]."
+)
+
+
+def test_named_only_topic_is_flagged_as_shallow():
+    """The WS4 failure: one topic explained, one merely classified."""
+    report = check_explanation_depth(
+        _WS4_QUESTION, _WS4_ANSWER, _RETRIEVED
+    )
+    assert report.shallow == ("conditional", "routing")
+    assert not report.ok
+
+
+def test_substantive_explanations_are_not_flagged():
+    answer = (
+        "LangGraph state management persists state through "
+        "checkpointers that snapshot the state at each node. "
+        "Conditional routing branches execution along edges "
+        "guarded by predicate functions that read the state, "
+        "per [S1]."
+    )
+    report = check_explanation_depth(_WS4_QUESTION, answer, _RETRIEVED)
+    assert report.shallow == ()
+    assert report.ok
+
+
+def test_check_is_skipped_without_retrieved_evidence():
+    """Honest UNVERIFIED answers (snippets only) keep the existing
+    verification governance — depth is never used to pile on."""
+    snippets = [
+        {
+            "text": "snippet",
+            "source_url": "https://wiki.example.org/routing",
+            "evidence": "snippet",
+        }
+    ]
+    report = check_explanation_depth(
+        _WS4_QUESTION, _WS4_ANSWER, snippets
+    )
+    assert report.shallow == ()
+    # ... and with no findings at all
+    assert check_explanation_depth(_WS4_QUESTION, _WS4_ANSWER).ok
+
+
+def test_check_is_skipped_without_explanation_intent():
+    """A resource request answered with a pointer to the right
+    source is complete — it is not an explanation demand."""
+    report = check_explanation_depth(
+        "LangGraph official documentation",
+        "LangGraph docs, per [S1].",
+        _RETRIEVED,
+    )
+    assert report.shallow == ()
+
+
+def test_simple_definition_questions_with_substantive_answers_pass():
+    """Legitimate short answers to 'What is X?' are preserved."""
+    findings = [
+        {
+            "text": "SecOps integrates security and IT operations "
+            "teams and workflows.",
+            "source_url": "https://secops.example.com/overview",
+            "evidence": "retrieved",
+        }
+    ]
+    answer = (
+        "SecOps (security operations) integrates security and IT "
+        "operations teams so threats are detected and responded to "
+        "faster, per [S1]."
+    )
+    report = check_explanation_depth("What is SecOps?", answer, findings)
+    assert report.shallow == ()
+
+
+def test_echoing_the_question_is_not_explanation():
+    """A sentence made of question vocabulary + a generic category
+    noun is naming-only, even when the topic word itself looks like
+    a verb ('routing')."""
+    answer = "Conditional routing is a core capability for routing."
+    report = check_explanation_depth(
+        _WS4_QUESTION, answer, _RETRIEVED
+    )
+    assert "routing" in report.shallow
+
+
+def test_disclaimer_sentences_never_count_as_explanations():
+    answer = (
+        "LangGraph state management persists state through "
+        "checkpointers that snapshot the state at each node. "
+        "Conditional routing details were not available in the "
+        "retrieved sources."
+    )
+    report = check_explanation_depth(_WS4_QUESTION, answer, _RETRIEVED)
+    # covered-only-by-a-disclaimer terms belong to check_completeness
+    # (missing), not to this check (shallow)
+    assert report.shallow == ()
+
+
+def test_explanation_report_formatting_states_limits():
+    report = check_explanation_depth(
+        _WS4_QUESTION, _WS4_ANSWER, _RETRIEVED
+    )
+    text = format_explanation_report(report)
+    assert "LEXICAL" in text
+    assert "does NOT judge whether any explanation is correct" in text
+    assert "FAIL" in text
+    assert "conditional, routing" in text
+    assert "PASS" in format_explanation_report(ExplanationReport(()))

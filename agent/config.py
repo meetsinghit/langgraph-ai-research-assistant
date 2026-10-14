@@ -121,6 +121,32 @@ class Settings(BaseSettings):
     # partitioning and no unverified-answer label.
     min_retrieved_sources: int = Field(default=1, ge=0)
 
+    # --- Research depth budgets (Phase 4E.1, WS-G) ---------------------
+    # Per-depth overrides resolved by agent.depth.depth_policy(). The
+    # standard depth uses the historical fields above unchanged; quick
+    # and deep read these EXPLICIT knobs. Every value is bounded by
+    # max_total_execution_seconds (the unchanged global deadline) —
+    # depth never extends the hard safety ceiling, and a deep run that
+    # cannot finish in time ends TIMED_OUT like any other run.
+    #
+    # Quick Answer: minimal sufficient retrieval, one research pass.
+    quick_max_plan_queries: int = Field(default=2, ge=1)
+    quick_max_research_iterations: int = Field(default=1, ge=1)
+    quick_max_tool_calls_per_research: int = Field(default=3, ge=1)
+    quick_min_findings: int = Field(default=2, ge=1)
+    quick_min_retrieved_sources: int = Field(default=1, ge=0)
+    # Deep Research: broader planning, more passes, more independent
+    # retrieved sources. Larger budgets are deliberate and visible
+    # here rather than hidden in prompts.
+    deep_max_plan_queries: int = Field(default=6, ge=1)
+    deep_max_research_iterations: int = Field(default=5, ge=1)
+    deep_max_tool_calls_per_research: int = Field(default=8, ge=1)
+    deep_min_findings: int = Field(default=6, ge=1)
+    deep_min_retrieved_sources: int = Field(default=3, ge=0)
+    # Per-source evidence cap for deep runs (deep analysis reads
+    # more of each page; still bounded to stop token blow-up).
+    deep_max_evidence_chars: int = Field(default=8000, ge=500)
+
     # Optional path to a CA bundle (PEM) used to VERIFY server
     # certificates when fetching pages — e.g. an enterprise
     # TLS-inspection root that is not in certifi's store. When set,

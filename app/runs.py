@@ -41,6 +41,7 @@ from typing import Any
 from agent.citations import assign_source_ids
 from agent.config import Settings
 from agent.deadline import RunDeadline
+from agent.depth import resolve_depth, resolve_evidence_policy
 from agent.graph import build_research_graph
 from agent.llm import build_chat_model
 from agent.metrics import MetricsCollector, categorize_error
@@ -286,8 +287,16 @@ class RunManager:
         session_id: str,
         question: str,
         idempotency_key: str | None = None,
+        research_depth: str = "standard",
+        evidence_policy: str = "balanced",
     ) -> dict[str, Any]:
-        """Create a run (idempotently) and schedule its execution."""
+        """Create a run (idempotently) and schedule its execution.
+
+        ``research_depth`` / ``evidence_policy`` (Phase 4E.1) are
+        normalized here as defense in depth (the API already
+        validates them as Literals) and persisted as run metadata so
+        history keeps the settings each run actually used.
+        """
         if self._repo.get_session(session_id) is None:
             raise NotFoundError(f"session {session_id} not found")
         if idempotency_key:
@@ -303,6 +312,10 @@ class RunManager:
                 question=question,
                 conversation_context=context,
                 idempotency_key=idempotency_key or None,
+                research_depth=resolve_depth(research_depth),
+                evidence_policy=resolve_evidence_policy(
+                    evidence_policy
+                ),
             )
         except sqlite3.IntegrityError:
             # Concurrent double-POST with the same key: the unique
@@ -361,6 +374,13 @@ class RunManager:
                 payload = {
                     "question": row["question"],
                     "conversation_context": row["conversation_context"] or "",
+                    # Phase 4E.1 run metadata travels in the input so
+                    # it lands in graph state (and therefore in the
+                    # checkpoint); a RESUME re-reads it from state.
+                    "research_depth": row.get("research_depth")
+                    or "standard",
+                    "evidence_policy": row.get("evidence_policy")
+                    or "balanced",
                 }
             state: dict[str, Any] = graph.invoke(
                 payload,

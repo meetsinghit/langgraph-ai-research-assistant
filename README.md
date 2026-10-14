@@ -52,6 +52,7 @@ python main.py "What is LangGraph?"
 | `MAX_REDIRECTS` / `MAX_PAGE_BYTES` | fetch safety limits | `5` / `1000000` |
 | `MAX_EVIDENCE_CHARS` | per-source text budget injected into model prompts (snippet + page, truncated with an explicit marker beyond it) — keeps prompt size and input tokens bounded regardless of page size; findings retain the bounded text | `6000` |
 | `MAX_TOOL_RESULT_CHARS` | per-result cap on **model-visible tool output**: oversized fetched pages are reduced to query-relevant sections (explicit marker) before entering the transcript ToolMessage — a raw page would otherwise be re-sent to the provider on the next research invocation | `8000` |
+| `QUICK_*` / `DEEP_*` | per-depth budget overrides (Phase 4E.1, selected per run via `--depth` / `research_depth`): plan queries, research passes, tool calls, findings, retrieved pages (`QUICK_MAX_TOOL_CALLS_PER_RESEARCH=3`, `DEEP_MAX_RESEARCH_ITERATIONS=5`, `DEEP_MIN_RETRIEVED_SOURCES=3`, …). `standard` uses the historical rows above unchanged; all of it stays under `MAX_TOTAL_EXECUTION_SECONDS` | see `.env.example` |
 
 ## Running
 
@@ -65,10 +66,24 @@ python main.py "What is LangGraph?"
   deadline status; sizes and counts only — never content). Written
   even when an unhandled exception aborts the run (recorded as
   `FAILED` with a category, never the error text)
+- `python main.py "question" --depth quick` — research depth for
+  this run (4E.1; default `standard`): `quick` = minimal sufficient
+  retrieval and a short direct answer, `standard` = the default
+  developed answer, `deep` = broader explicit budgets (more passes,
+  more independently retrieved sources) and a longer structured
+  answer. Depth changes budgets and structure — never the quality
+  gates, and never the global execution deadline
+- `python main.py "question" --evidence-policy verified` —
+  citation evidence policy for this run (4E.1; default `balanced`):
+  `verified` requires every factual claim to rest on a retrieved
+  (fetched-and-inspected) page and deterministically fails
+  citation validation on snippet-only or absent citations, so a
+  thin-evidence run ends clearly labeled rather than overstated;
+  `balanced` permits clearly-labeled snippet-only support
 - `python main.py --verify-connection` — opt-in live smoke test
   (exactly one minimal request to the configured provider)
 - `python -m pytest` — full mocked suite (no network, no API keys)
-- `python -m evals` — offline evaluation benchmark (23 scripted
+- `python -m evals` — offline evaluation benchmark (30 scripted
   cases, no network, no API keys; see below)
 - `python -m evals.compare baseline.json candidate.json` — diff two
   metrics/eval reports (token, latency, retrieval and quality
@@ -106,7 +121,7 @@ erasure (see [docs/SECURITY.md §10](docs/SECURITY.md)).
 | `POST /api/sessions` · `GET /api/sessions` | create / list sessions |
 | `GET /api/sessions/{id}` | session + its runs (summary rows) |
 | `DELETE /api/sessions/{id}` | delete a session, its runs, sources, events and checkpoints (cascade) |
-| `POST /api/sessions/{id}/runs` | start a run; optional `Idempotency-Key` header replays the same run instead of starting a duplicate (409 on key reuse with a different question) |
+| `POST /api/sessions/{id}/runs` | start a run; optional `research_depth` (`quick` / `standard` / `deep`, default `standard`) and `evidence_policy` (`balanced` / `verified`, default `balanced`) — 4E.1 per-run settings, persisted as run metadata and visible on `GET /api/runs/{id}`; optional `Idempotency-Key` header replays the same run instead of starting a duplicate (409 on key reuse with a different question) |
 | `GET /api/runs/{id}` | run detail: status, answer, review, sources, outcome, content-free diagnostics |
 | `POST /api/runs/{id}/cancel` | cooperative cancel (202); terminal runs → 409 |
 | `POST /api/runs/{id}/resume` | continue an interrupted run from its checkpoint (202), see below |
@@ -316,6 +331,54 @@ other nodes are deadline-guarded and degrade to a controlled
   bounded provider retries, and controlled errors for provider
   failures.
 
+## Research depth & evidence quality (Phase 4E.1)
+
+Two independent per-run axes, both plain strings in graph state
+(checkpointed, so a resume keeps its original settings), both
+enforced in backend code — not by prompting — and both persisted
+as run metadata on the runs table so history keeps the settings
+each run actually used.
+
+- **Research depth** (`--depth` / `research_depth`), WS-G:
+  `quick` (minimal sufficient retrieval, short direct answer,
+  ~150-300-word target), `standard` (the default, ~500-900), and
+  `deep` (broader explicit budgets — more plan queries, passes,
+  tool calls and independently retrieved pages — with a longer
+  structured answer, ~1,200-2,500). Each depth resolves to an
+  explicit `DepthPolicy` from *configurable* settings
+  (`QUICK_*` / `DEEP_*` in `.env`); `standard` uses the historical
+  settings unchanged. Word targets are synthesis/reviewer
+  **guidance, never gates**: no length-based pass/fail in either
+  direction, padding is explicitly forbidden, and thin evidence
+  makes the answer shorter and more qualified, not longer. The
+  global execution deadline is the unchanged hard ceiling — depth
+  never extends it.
+- **Evidence policy** (`--evidence-policy` / `evidence_policy`),
+  WS-A: `balanced` (default) permits clearly-labeled snippet-only
+  citations (discovered sources stay usable for discovery, with
+  the honest UNVERIFIED labeling carrying their weakness);
+  `verified` deterministically fails citation validation when a
+  claim rests only on a search snippet — or on nothing at all —
+  so insufficient retrieval ends as a clearly-labeled incomplete
+  result instead of an overstated one. Snippets are never silently
+  promoted to verified, and no fabricated `[S#]`/URL is accepted
+  in either policy.
+- **Claim-to-source grounding** (advisory, WS-A): a lexical
+  overlap check reports citations whose citing sentence shares no
+  vocabulary with the cited page (paraphrase can cause it, so it
+  never auto-fails — semantic judgement stays with the reviewer),
+  and retrieved-but-uncited sources are reported so the answer
+  prefers them over snippet-only ones.
+- **Explanation depth** (WS-B): a deterministic lexical check
+  catches the Workstream-4 failure mode — a requested topic that
+  is merely *named* ("X is a core capability for…") while
+  retrieved evidence existed to explain it. Such drafts are
+  marked (`EXPLANATION DEPTH: SUPERFICIAL`), fail the review
+  gate, and feed follow-up research. The check runs only for
+  explanation-intent questions with at least one retrieved page,
+  so honest UNVERIFIED answers and legitimate short definitions
+  ("What is SecOps?") are never forced into extra research.
+
 ## Reliability (Phase 4B)
 
 Five bounded-recovery mechanisms added after the Phase 3 live run
@@ -426,7 +489,7 @@ The report keeps **two independent verdicts per case**:
 
 | Verdict | What it measures |
 | --- | --- |
-| `deterministic_pass` | The run met its fixture expectations: workflow completed, tool budgets respected, deterministic gates (citation provenance, topic coverage, official-source retrieval) produced the expected decisions, expected markers present, expected `review_status`. |
+| `deterministic_pass` | The run met its fixture expectations: workflow completed, tool budgets respected, deterministic gates (citation provenance + evidence policy, topic coverage, explanation depth, official-source retrieval) produced the expected decisions, expected markers present, expected `review_status`. |
 | `semantic` | Whether the draft actually *explains* each requested topic, scored against human-authored substantive markers per topic (disclaimer-aware: naming a topic inside "were not available" does not count). Also records `reviewer_false_approval`. |
 
 **How to interpret the numbers**
@@ -437,10 +500,13 @@ The report keeps **two independent verdicts per case**:
 - `summary.reviewer_false_approvals` lists cases the reviewer
   approved that the semantic rubric scores inadequate — the
   false-approval failure mode observed live in Phase 3
-  (Workstream 4). The `ws4-routing-superficial` case reproduces
-  it: every deterministic gate passes, the reviewer approves,
-  and only the rubric flags that conditional routing is merely
-  *named*, not explained.
+  (Workstream 4). The `ws4-routing-superficial` case reproduced
+  it through Phase 4D: every deterministic gate passed, the
+  reviewer approved, and only the rubric flagged that conditional
+  routing was merely *named*, not explained. Since Phase 4E.1 the
+  deterministic explanation-depth gate catches it (see below),
+  the approval is downgraded, and this list is empty — the
+  benchmark asserts that, so a new false approval is a regression.
 - Semantic scores are **diagnostics, not proofs**: keyword/URL
   matching never establishes factual correctness, and citation
   checks only establish provenance. An optional LLM-as-judge
@@ -449,12 +515,18 @@ The report keeps **two independent verdicts per case**:
 - The topic-coverage checker is deliberately lexical: it only
   verifies requested terms appear outside known unavailability
   disclaimers. It cannot distinguish an explanation from a
-  mention, and **no escalating regex rules were added** to try —
-  regex "superficiality" arms-races into overfitting and would
-  blur routing enforcement with quality scoring. Instead, the
-  review prompt now demands mechanism-level answers, the
-  semantic rubric measures them, and the deterministic gates
-  keep enforcing only what they can verify honestly.
+  mention. Phase 4E.1 added a second, deliberately narrow lexical
+  check for the one superficiality pattern that is honestly
+  detectable without semantics — a requested term covered ONLY by
+  generic-category definitions ("X is a core capability for…",
+  with the question's own vocabulary stripped and no explanatory
+  marker present), and only for explanation-intent questions when
+  at least one page was actually retrieved. It never judges
+  correctness, never fires on honest UNVERIFIED answers, and its
+  result is a labeled note plus a review-gate failure — not a
+  claim that the explanation is wrong. The review prompt still
+  demands mechanism-level answers and the semantic rubric still
+  measures them.
 
 ## Observability & token accounting
 
@@ -606,6 +678,7 @@ AI_POC/
 │   ├── config.py            typed settings (pydantic-settings)
 │   ├── state.py             GraphState + reducers
 │   ├── routing.py           deterministic conditional routing
+│   ├── depth.py             research depth + evidence policy (4E.1)
 │   ├── logging_config.py    JSON-lines logging + redaction
 │   ├── llm.py               provider factory + error taxonomy/retries
 │   ├── tools.py             web_search / fetch_page + SSRF protection,
@@ -621,7 +694,7 @@ AI_POC/
 │                            checkpoints.db, app_token.txt — sensitive,
 │                            deletion ≠ secure erasure
 ├── evals/
-│   ├── cases.py             ~23-case benchmark (fixtures + expectations + rubrics)
+│   ├── cases.py             30-case benchmark (fixtures + expectations + rubrics)
 │   ├── security_cases.py    25-case adversarial suite (+ security_summary)
 │   ├── semantic.py          fixture rubric scorer + opt-in LLM judge
 │   ├── harness.py           offline runner + JSON report

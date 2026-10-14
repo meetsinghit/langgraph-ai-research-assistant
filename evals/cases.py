@@ -127,6 +127,14 @@ class CaseExpectations:
     #: to unknown (non-existent) sources — asserts that the
     #: citation gate DETECTED fabricated references.
     min_unknown_citations: int | None = None
+    #: when set, at least this many cited sources must show
+    #: LOW lexical claim-to-source overlap (the advisory
+    #: grounding check found no shared vocabulary between
+    #: the citing sentence and the cited source's text).
+    min_low_overlap_citations: int | None = None
+    #: when set, at least this many distinct source PAGES
+    #: must have been fetched (retrieved evidence).
+    min_retrieved_sources: int | None = None
     #: tool names that must NOT appear among executed calls
     #: (spoofed names in structured or text form).
     forbidden_tools: tuple[str, ...] = ()
@@ -157,6 +165,13 @@ class EvalCase:
     settings_overrides: dict[str, Any] = field(
         default_factory=dict
     )
+    #: per-run research depth ("quick" | "standard" | "deep",
+    #: Phase 4E.1 WS-G) — resolved by agent.depth against the
+    #: case's settings.
+    research_depth: str = "standard"
+    #: per-run evidence policy ("balanced" | "verified",
+    #: Phase 4E.1 WS-A).
+    evidence_policy: str = "balanced"
     # --- evaluation ---
     expected: CaseExpectations = field(
         default_factory=CaseExpectations
@@ -193,9 +208,13 @@ def _result(title: str, url: str, snippet: str = "snippet") -> dict:
 
 #: The Phase 4A live-failure reproduction (Workstream 4):
 #: state management explained, conditional routing merely
-#: NAMED — every deterministic gate passes and the scripted
-#: reviewer approves, but the semantic rubric scores
-#: conditional routing INADEQUATE.
+#: NAMED. Originally EVERY deterministic gate passed and the
+#: scripted reviewer approved (only the semantic rubric
+#: flagged it); since Phase 4E.1 (WS-B) the deterministic
+#: explanation-depth check catches the named-only topic and
+#: the gate downgrades the approval — the rubric still
+#: scores conditional routing INADEQUATE, and the two now
+#: agree.
 _WS4_STEPS = (
     ResearchStep(
         kind="tool_call",
@@ -483,9 +502,15 @@ def benchmark_cases() -> tuple[EvalCase, ...]:
         )
     )
 
-    # 7 — Workstream 4: routing merely NAMED. Every
-    # deterministic gate passes, the scripted reviewer
-    # approves, and only the semantic rubric flags it.
+    # 7 — Workstream 4: routing merely NAMED. Phase 4E.1
+    # (WS-B): the deterministic explanation-depth gate now
+    # downgrades the scripted approval to
+    # needs_more_research (named-only topic while a page was
+    # retrieved), and the semantic rubric independently
+    # scores conditional routing inadequate. This case's
+    # expectation changed FROM "approved" WITH the fix — it
+    # documents that superficial keyword answers are no
+    # longer approved, not a weakened assertion.
     cases.append(
         EvalCase(
             case_id="ws4-routing-superficial",
@@ -513,8 +538,11 @@ def benchmark_cases() -> tuple[EvalCase, ...]:
             research_steps=_WS4_STEPS,
             drafts=(_WS4_DRAFT,),
             expected=CaseExpectations(
-                review_status="approved",
-                markers=["checkpointer"],
+                review_status="needs_more_research",
+                markers=[
+                    "checkpointer",
+                    "EXPLANATION DEPTH: SUPERFICIAL",
+                ],
                 official_status="verified_official",
             ),
             rubric=(
@@ -965,6 +993,244 @@ def benchmark_cases() -> tuple[EvalCase, ...]:
             expected=CaseExpectations(
                 review_status="approved",
                 markers=["LangGraph builds graphs"],
+            ),
+        )
+    )
+
+    # --- Phase 4E.1 fixtures (WS-A / WS-B / WS-G) ---
+    secops = "https://secops.example.com/overview"
+    cicd = "https://cicd.example.com/pipeline-guide"
+    earnings = "https://odd.example.com/unrelated-earnings"
+
+    # 24 — WS-B, generalizable second instance of the WS4
+    # failure mode: a LONG, keyword-complete, confidently
+    # worded answer that only classifies the subject ("is a
+    # core capability / a fundamental approach / a standard
+    # feature") never explains the mechanism. Verbosity and
+    # correct keywords must not be rewarded: the deterministic
+    # explanation-depth gate fails it while the rubric scores
+    # it inadequate.
+    cases.append(
+        EvalCase(
+            case_id="superficial-keyword-answer",
+            category="general technical research",
+            question="How does a CI/CD pipeline work?",
+            search_results=(_result("Pipeline guide", cicd),),
+            pages={
+                cicd: (
+                    "The pipeline builds, tests and deploys "
+                    "every commit through staged environments."
+                )
+            },
+            research_steps=_WS4_STEPS,
+            drafts=(
+                "A CI/CD pipeline is a core capability for "
+                "delivering software reliably. A CI/CD pipeline "
+                "is a fundamental approach in modern software "
+                "practice. A CI/CD pipeline is a standard "
+                "feature of mature engineering organizations. "
+                "Teams everywhere rely on this important part "
+                "of their day-to-day operations. See [S1].",
+            ),
+            expected=CaseExpectations(
+                review_status="needs_more_research",
+                markers=["EXPLANATION DEPTH: SUPERFICIAL"],
+            ),
+            rubric=(
+                TopicRubric(
+                    "CI/CD pipeline", ("build", "test", "deploy")
+                ),
+            ),
+        )
+    )
+
+    # 25 — WS-A: VERIFIED evidence policy. Every fetch failed,
+    # the only support is a search snippet, and the draft cites
+    # it: under the verified policy a snippet can NEVER
+    # independently support a claim, so deterministic citation
+    # validation fails and the run is routed back / labeled.
+    cases.append(
+        EvalCase(
+            case_id="verified-snippet-citation",
+            category="citation provenance cases",
+            question="Explain LangGraph.",
+            search_results=(_result("Page", wiki_a),),
+            fail_fetch_urls=frozenset({wiki_a}),
+            research_steps=_WS4_STEPS,
+            evidence_policy="verified",
+            drafts="LangGraph builds graphs, per [S1].",
+            expected=CaseExpectations(
+                review_status="needs_more_research",
+                markers=["CITATION QUALITY"],
+            ),
+        )
+    )
+
+    # 26 — WS-A: the VERIFIED policy succeeds when the cited
+    # page was actually retrieved — strictness must not mean
+    # suppression of good answers.
+    cases.append(
+        EvalCase(
+            case_id="verified-retrieved-citation",
+            category="citation provenance cases",
+            question="Explain LangGraph.",
+            search_results=(_result("Page", wiki_a),),
+            pages={wiki_a: "LangGraph builds graphs."},
+            research_steps=_WS4_STEPS,
+            evidence_policy="verified",
+            drafts="LangGraph builds graphs, per [S1].",
+            expected=CaseExpectations(
+                review_status="approved",
+                require_citations_ok=True,
+            ),
+        )
+    )
+
+    # 27 — WS-A: the BALANCED (default) policy still permits
+    # clearly-labeled snippet-only support: discovered sources
+    # are useful for discovery/context and are NOT suppressed —
+    # the honest UNVERIFIED label carries the weakness.
+    cases.append(
+        EvalCase(
+            case_id="balanced-snippet-allowed",
+            category="citation provenance cases",
+            question="Explain LangGraph.",
+            search_results=(_result("Page", wiki_a),),
+            fail_fetch_urls=frozenset({wiki_a}),
+            research_steps=_WS4_STEPS,
+            evidence_policy="balanced",
+            drafts="LangGraph builds graphs, per [S1].",
+            expected=CaseExpectations(
+                review_status="approved",
+                unverified_marker=True,
+            ),
+        )
+    )
+
+    # 28 — WS-G: QUICK depth on a simple definition question.
+    # Guards BOTH directions: the run stays approved/cheap, and
+    # a legitimate short substantive answer to "What is X?" is
+    # never forced into extra research or verbosity by the new
+    # explanation-depth gate.
+    cases.append(
+        EvalCase(
+            case_id="quick-mode-secops",
+            category="general technical research",
+            question="What is SecOps?",
+            search_results=(_result("SecOps overview", secops),),
+            pages={
+                secops: (
+                    "SecOps integrates security and IT "
+                    "operations teams and workflows to improve "
+                    "threat detection and response."
+                )
+            },
+            research_steps=_WS4_STEPS,
+            research_depth="quick",
+            drafts=(
+                "SecOps (security operations) integrates "
+                "security and IT operations teams so threats "
+                "are detected and responded to faster, per [S1].",
+            ),
+            expected=CaseExpectations(
+                review_status="approved",
+                require_citations_ok=True,
+            ),
+            rubric=(
+                TopicRubric(
+                    "SecOps", ("integrat", "security", "operations")
+                ),
+            ),
+        )
+    )
+
+    # 29 — WS-G: DEEP depth applies its own EXPLICIT budgets
+    # (more passes, higher fetch quota, 3 required retrieved
+    # pages instead of 1) — the run gathers more independently
+    # retrieved evidence per pass than any standard case, while
+    # staying inside the unchanged global deadline.
+    cases.append(
+        EvalCase(
+            case_id="deep-mode-budget",
+            category="multi-topic research questions",
+            question=(
+                "Explain LangGraph streaming and checkpointing."
+            ),
+            search_results=(
+                _result("Streaming docs", wiki_a),
+                _result("Checkpoint docs", wiki_b),
+                _result("Persistence guide", deepwiki),
+            ),
+            pages={
+                wiki_a: (
+                    "Streaming emits response tokens as each "
+                    "superstep completes."
+                ),
+                wiki_b: (
+                    "Checkpoints persist state at every "
+                    "superstep."
+                ),
+                deepwiki: (
+                    "Checkpointers store execution state so an "
+                    "interrupted run can resume."
+                ),
+            },
+            research_steps=_WS4_STEPS,
+            research_depth="deep",
+            drafts=(
+                "LangGraph streaming emits response tokens as "
+                "each superstep completes, so applications can "
+                "display output before the run finishes [S1]. "
+                "Checkpointing persists state at every "
+                "superstep [S2], which lets an interrupted run "
+                "resume from its last saved state [S3].",
+            ),
+            expected=CaseExpectations(
+                review_status="approved",
+                markers=["streaming", "Checkpointing"],
+                require_citations_ok=True,
+                min_retrieved_sources=3,
+            ),
+            rubric=(
+                TopicRubric(
+                    "streaming", ("emit", "token", "superstep")
+                ),
+                TopicRubric(
+                    "checkpointing", ("persist", "resume")
+                ),
+            ),
+        )
+    )
+
+    # 30 — WS-A: advisory claim-to-source grounding. The cited
+    # page was retrieved and the citation is valid, but the
+    # claiming sentence shares NO vocabulary with that page —
+    # the deterministic lexical check reports low overlap for
+    # the reviewer (it never auto-fails: paraphrase is honest
+    # sometimes, so semantic judgement stays with the model).
+    cases.append(
+        EvalCase(
+            case_id="citation-mismatch-grounding",
+            category="citation provenance cases",
+            question="What is SecOps?",
+            search_results=(_result("Unrelated page", earnings),),
+            pages={
+                earnings: (
+                    "The quarterly earnings report showed "
+                    "revenue growth across all segments this "
+                    "year."
+                )
+            },
+            research_steps=_WS4_STEPS,
+            drafts=(
+                "SecOps integrates security and operations "
+                "teams to improve incident response times, "
+                "per [S1].",
+            ),
+            expected=CaseExpectations(
+                review_status="approved",
+                require_citations_ok=True,
+                min_low_overlap_citations=1,
             ),
         )
     )

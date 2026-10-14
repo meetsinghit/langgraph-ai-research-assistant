@@ -69,6 +69,15 @@ class GraphState(TypedDict, total=False):
     """
 
     question: str
+    #: Research depth for this run ("quick" | "standard" | "deep",
+    #: Phase 4E.1 WS-G) — stamped by the caller (API/CLI/evals) and
+    #: defaulted by agent.depth.resolve_depth; checkpointed with the
+    #: run so a resume keeps its original depth.
+    research_depth: str
+    #: Evidence policy for this run ("balanced" | "verified",
+    #: Phase 4E.1 WS-A) — enforced in deterministic citation
+    #: validation, not by prompting. Checkpointed like the depth.
+    evidence_policy: str
     research_plan: Annotated[list[str], append_items]
     findings: Annotated[list[Finding], append_items]
     #: deduplicated: the same URL discovered by several searches is

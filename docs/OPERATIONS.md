@@ -206,6 +206,11 @@ docker compose -f docker/docker-compose.yml down -v     # DELETES data
   checkpoint semantics); the UI says so before you resume.
 - Cancel is cooperative: it takes effect at the next graph boundary
   (an in-flight provider call finishes first).
+- Research depth and evidence policy (Phase 4E.1) are selectable
+  per run via the CLI (`--depth`, `--evidence-policy`) and the API
+  (`research_depth`, `evidence_policy`), but the browser UI has no
+  selector yet — browser runs use the defaults (`standard`,
+  `balanced`).
 - Docker packaging is statically reviewed but not runtime-tested.
 - Windows launchers use Windows PowerShell 5.1+; Linux/macOS users
   run `python -m app.main` and `cd frontend && npm run dev` directly.

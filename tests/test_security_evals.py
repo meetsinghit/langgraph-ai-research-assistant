@@ -56,11 +56,14 @@ def test_every_case_has_complete_security_metadata():
 
 
 def test_security_cases_are_not_benchmark_cases():
-    """Same EvalCase shape, disjoint ids — the benchmark stays 23."""
+    """Same EvalCase shape, disjoint ids — the benchmark catalog
+    (23 as of Phase 4D; 30 since the Phase 4E.1 WS-A/WS-B/WS-G
+    fixtures) never contains an adversarial case, and vice versa."""
     security_ids = {case.case_id for case in security_cases()}
     benchmark_ids = {case.case_id for case in benchmark_cases()}
     assert not (security_ids & benchmark_ids)
-    assert len(benchmark_ids) == 23
+    assert len(benchmark_ids) >= 23
+    assert len(benchmark_ids) == 30
 
 
 def test_deterministic_defense_cases_outnumber_behavioral_ones():

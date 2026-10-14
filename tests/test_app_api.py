@@ -427,3 +427,132 @@ def test_cancel_running_run_is_cooperative_and_reported(tmp_path: Path):
         again = client.post(f"/api/runs/{run_id}/cancel", headers=AUTH)
         assert again.status_code == 409
     app.state.manager.shutdown()
+
+
+# -- research depth & evidence policy metadata (Phase 4E.1) --------
+
+
+def test_run_metadata_defaults_to_standard_and_balanced(tmp_path: Path):
+    app, _, _ = build_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = _new_session(client)
+        run_id = client.post(
+            f"/api/sessions/{session_id}/runs",
+            json={"question": "question"},
+            headers=AUTH,
+        ).json()["run_id"]
+        app.state.manager.wait_idle()
+        _wait_status(client, run_id, "completed")
+        detail = client.get(f"/api/runs/{run_id}", headers=AUTH).json()
+        assert detail["research_depth"] == "standard"
+        assert detail["evidence_policy"] == "balanced"
+        summary = client.get(
+            f"/api/sessions/{session_id}", headers=AUTH
+        ).json()
+        assert summary["runs"][0]["research_depth"] == "standard"
+        assert summary["runs"][0]["evidence_policy"] == "balanced"
+    app.state.manager.shutdown()
+
+
+def test_run_metadata_deep_and_verified_roundtrip(tmp_path: Path):
+    """Depth and policy travel through the authenticated API, are
+    persisted as run metadata and are visible on the historical run."""
+    app, _, _ = build_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = _new_session(client)
+        run_id = client.post(
+            f"/api/sessions/{session_id}/runs",
+            json={
+                "question": "question",
+                "research_depth": "deep",
+                "evidence_policy": "verified",
+            },
+            headers=AUTH,
+        ).json()["run_id"]
+        app.state.manager.wait_idle()
+        _wait_status(client, run_id, "completed")
+        detail = client.get(f"/api/runs/{run_id}", headers=AUTH).json()
+        assert detail["research_depth"] == "deep"
+        assert detail["evidence_policy"] == "verified"
+        # the backend ENFORCED the verified policy: the scripted
+        # draft cites nothing, so citation validation failed and the
+        # reviewer's scripted approval was downgraded
+        assert detail["review_status"] == "needs_more_research"
+        # ... and the graph state carried the run's settings
+        row = app.state.repo.get_run(run_id)
+        assert row["research_depth"] == "deep"
+        assert row["evidence_policy"] == "verified"
+    app.state.manager.shutdown()
+
+
+def test_invalid_depth_or_policy_is_rejected(tmp_path: Path):
+    """Literal-validated: an unknown value is a 422, never a silent
+    downgrade to some default."""
+    app, _, _ = build_app(tmp_path)
+    with TestClient(app) as client:
+        session_id = _new_session(client)
+        for payload in (
+            {"question": "q", "research_depth": "extreme"},
+            {"question": "q", "evidence_policy": "strict"},
+        ):
+            response = client.post(
+                f"/api/sessions/{session_id}/runs",
+                json=payload,
+                headers=AUTH,
+            )
+            assert response.status_code == 422, response.text
+    app.state.manager.shutdown()
+
+
+def test_pre_4e1_database_gains_the_run_metadata_columns(
+    tmp_path: Path,
+):
+    """Databases created before Phase 4E.1 get additive migrations;
+    existing rows keep the documented defaults."""
+    import sqlite3
+
+    from app.db import Database
+
+    path = tmp_path / "legacy.db"
+    legacy = sqlite3.connect(path)
+    # the pre-4E.1 runs table, exactly as Phase 4D created it
+    legacy.execute(
+        "CREATE TABLE runs ("
+        "id TEXT PRIMARY KEY, "
+        "session_id TEXT NOT NULL REFERENCES sessions(id) "
+        "ON DELETE CASCADE, "
+        "idempotency_key TEXT, parent_run_id TEXT, "
+        "question TEXT NOT NULL, "
+        "conversation_context TEXT NOT NULL DEFAULT '', "
+        "status TEXT NOT NULL, answer TEXT, review_status TEXT, "
+        "outcome_status TEXT, outcome_warnings TEXT NOT NULL "
+        "DEFAULT '[]', error_category TEXT, "
+        "iterations INTEGER NOT NULL DEFAULT 0, "
+        "tokens_in INTEGER NOT NULL DEFAULT 0, "
+        "tokens_out INTEGER NOT NULL DEFAULT 0, "
+        "estimated_cost_usd REAL NOT NULL DEFAULT 0, "
+        "total_execution_seconds REAL NOT NULL DEFAULT 0, "
+        "metrics_json TEXT, created_at TEXT NOT NULL, "
+        "started_at TEXT, finished_at TEXT)"
+    )
+    legacy.execute(
+        "INSERT INTO runs (id, session_id, question, status, "
+        "created_at) VALUES ('r1', 's1', 'old question', "
+        "'completed', '2026-01-01')"
+    )
+    legacy.commit()
+    legacy.close()
+
+    db = Database(path)
+    with db.cursor() as cursor:
+        columns = {
+            row[1] for row in cursor.execute("PRAGMA table_info(runs)")
+        }
+        assert "research_depth" in columns
+        assert "evidence_policy" in columns
+        row = cursor.execute(
+            "SELECT research_depth, evidence_policy FROM runs "
+            "WHERE id = 'r1'"
+        ).fetchone()
+    assert row["research_depth"] == "standard"
+    assert row["evidence_policy"] == "balanced"

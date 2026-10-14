@@ -466,3 +466,151 @@ def test_current_official_and_reference_domains_are_first_party():
     question = "LangGraph official documentation"
     assert is_first_party(DOCS_CURRENT, question)
     assert is_first_party(REFERENCE_CURRENT, question)
+
+
+# --- evidence policy (Phase 4E.1, WS-A) ---------------------------
+
+
+def test_balanced_policy_is_the_default_and_permits_snippets():
+    findings = [_finding("https://example.com/a", "snippet")]
+    answer = "Claims here, per https://example.com/a."
+    report = validate_citations(answer, findings, "question")
+    assert report.policy == "balanced"
+    assert report.ok
+    assert report.snippet_only == ["https://example.com/a"]
+
+
+def test_balanced_policy_never_fails_a_citationless_answer():
+    """Balance keeps discovered sources usable; the reviewer judges
+    unsupported claims semantically. Only the VERIFIED policy turns
+    "no citations at all" into a deterministic failure."""
+    findings = [_finding("https://example.com/a", "retrieved")]
+    report = validate_citations("No citations at all.", findings, "q")
+    assert report.ok
+    assert report.has_citations is False
+
+
+def test_verified_policy_fails_snippet_only_citations():
+    findings = [_finding("https://example.com/a", "snippet")]
+    answer = "Claims here, per https://example.com/a."
+    report = validate_citations(
+        answer, findings, "question", policy="verified"
+    )
+    assert report.policy == "verified"
+    assert not report.ok
+    assert any(
+        "search-result snippets" in reason for reason in report.reasons
+    )
+    assert any(
+        "verified evidence policy" in reason for reason in report.reasons
+    )
+
+
+def test_verified_policy_requires_citations_when_findings_exist():
+    findings = [_finding("https://example.com/a", "retrieved")]
+    report = validate_citations(
+        "An answer with no sources.", findings, "question",
+        policy="verified",
+    )
+    assert not report.ok
+    assert any("cites no sources" in r for r in report.reasons)
+
+
+def test_verified_policy_passes_when_a_retrieved_page_is_cited():
+    findings = [_finding("https://example.com/a", "retrieved")]
+    answer = "Claims here, per https://example.com/a."
+    report = validate_citations(
+        answer, findings, "question", policy="verified"
+    )
+    assert report.ok
+    assert report.retrieved == ["https://example.com/a"]
+
+
+def test_unknown_policy_string_is_normalized_to_balanced():
+    findings = [_finding("https://example.com/a", "snippet")]
+    report = validate_citations(
+        "https://example.com/a", findings, "q", policy="whatever"
+    )
+    assert report.policy == "balanced"
+    assert report.ok
+
+
+def test_verified_policy_reason_appears_in_the_note():
+    findings = [_finding("https://example.com/a", "snippet")]
+    report = validate_citations(
+        "Per https://example.com/a.", findings, "q", policy="verified"
+    )
+    note = citation_note(report)
+    assert "CITATION QUALITY" in note
+    assert "verified evidence policy" in note
+
+
+# --- claim-to-source grounding (advisory) --------------------------
+
+
+def test_grounding_supported_when_sentence_shares_the_sources_vocabulary():
+    findings = [
+        _finding(
+            "https://example.com/a",
+            "retrieved",
+            "The checkpointer persists state at every superstep.",
+        )
+    ]
+    answer = (
+        "LangGraph persists state through a checkpointer, "
+        "per [S1]."
+    )
+    report = validate_citations(answer, findings, "question")
+    assert report.ok
+    assert report.grounding[0].status == "supported"
+    assert report.grounding[0].shared_terms >= 1
+    assert report.low_overlap == []
+
+
+def test_grounding_flags_a_citation_whose_source_is_unrelated():
+    findings = [
+        _finding(
+            "https://example.com/a",
+            "retrieved",
+            "Quarterly earnings showed revenue growth across segments.",
+        )
+    ]
+    answer = "SecOps integrates security and operations teams, per [S1]."
+    report = validate_citations(answer, findings, "question")
+    # advisory only: provenance is fine, overlap is the signal
+    assert report.ok
+    assert report.low_overlap == ["[S1]"]
+    assert report.grounding[0].status == "low_overlap"
+
+
+def test_grounding_reports_missing_source_text():
+    findings = [
+        {"text": "", "source_url": "https://example.com/a",
+         "evidence": "retrieved"}
+    ]
+    answer = "A claim, per [S1]."
+    report = validate_citations(answer, findings, "question")
+    assert report.grounding[0].status == "no_source_text"
+
+
+def test_retrieved_sources_never_cited_are_reported():
+    findings = [
+        _finding("https://example.com/used", "retrieved"),
+        _finding("https://example.com/unused", "retrieved"),
+    ]
+    answer = "Only one source, per https://example.com/used."
+    report = validate_citations(answer, findings, "question")
+    assert report.ok
+    assert report.retrieved_uncited == ("[S2]",)
+
+
+def test_format_report_states_policy_and_grounding_caveats():
+    findings = [_finding("https://example.com/a", "snippet")]
+    report = validate_citations(
+        "Per https://example.com/a.", findings, "q", policy="verified"
+    )
+    text = format_citation_report(report)
+    assert "- evidence policy: verified" in text
+    assert "LEXICAL, advisory" in text
+    assert "retrieved source(s) gathered but never cited" in text
+    assert "does NOT verify that the cited sources factually" in text

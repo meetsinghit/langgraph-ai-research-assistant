@@ -27,6 +27,7 @@ __all__ = [
     "CURRENT_OFFICIAL_DOC_DOMAINS",
     "Citation",
     "CitationReport",
+    "GroundingCheck",
     "OfficialSourceStatus",
     "SourceRef",
     "assign_source_ids",
@@ -339,6 +340,115 @@ class Citation:
 
 
 @dataclass(frozen=True)
+class GroundingCheck:
+    """Advisory claim-to-source lexical support for ONE citation.
+
+    DETERMINISTIC and LEXICAL: does the sentence citing this source
+    share informative vocabulary with the text actually recorded for
+    that source? ``low_overlap`` suggests the claim may not be drawn
+    from the cited page (paraphrase can also cause it), so it is
+    reported to the reviewer and NEVER auto-fails a run — provenance
+    is deterministic, semantic support is the reviewer's judgement.
+    Counts only; the answer's sentence text is never copied here.
+    """
+
+    token: str
+    status: str  # "supported" | "low_overlap" | "no_source_text"
+    shared_terms: int = 0
+
+
+#: Sentence boundary for locating the sentence around a citation.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+
+#: Informative-vocabulary stopwords for grounding overlap (function
+#: words carry no claim content). Deliberately small: false
+#: "low_overlap" advisories are cheap (the reviewer decides), missed
+#: ones are not.
+_GROUNDING_STOPWORDS = frozenset(
+    {
+        "about", "after", "also", "among", "and", "are", "because",
+        "been", "before", "being", "between", "both", "but", "can",
+        "could", "did", "does", "each", "for", "from", "had", "has",
+        "have", "his", "her", "how", "into", "its", "may", "more",
+        "most", "not", "only", "other", "our", "over", "said", "same",
+        "she", "should", "some", "such", "than", "that", "the", "their",
+        "them", "then", "there", "these", "they", "this", "those",
+        "through", "under", "until", "very", "was", "were", "what",
+        "when", "where", "which", "while", "who", "will", "with",
+        "would", "you", "your",
+        # citation discourse: never evidence of claim support
+        "per", "see", "cite", "cited", "source", "sources", "page",
+        "pages", "according", "above", "below", "listed", "refer",
+    }
+)
+
+
+def _grounding_tokens(text: str) -> set[str]:
+    """Lowercased informative tokens, lightly stemmed, for overlap."""
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9']{3,}", (text or "").lower()):
+        token = token.strip("'")
+        if token in _GROUNDING_STOPWORDS:
+            continue
+        for suffix in ("ing", "ed", "es", "s"):
+            if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                token = token[: -len(suffix)]
+                break
+        tokens.add(token)
+    return tokens
+
+
+def _grounding_checks(
+    answer: str, findings: list[Finding], refs: dict[str, SourceRef]
+) -> tuple[GroundingCheck, ...]:
+    """Per-citation lexical support against that source's own text."""
+    texts: dict[str, list[str]] = {}
+    for finding in findings:
+        url = finding.get("source_url")
+        if not url:
+            continue
+        texts.setdefault(_normalize_url(url), []).append(
+            str(finding.get("text") or "")
+        )
+    sentences = _SENTENCE_SPLIT_RE.split(answer or "")
+    checks: list[GroundingCheck] = []
+    seen: set[str] = set()
+    for sid, ref in refs.items():
+        key = _normalize_url(ref.url)
+        source_tokens: set[str] = set()
+        for text in texts.get(key, []):
+            source_tokens |= _grounding_tokens(text)
+        token = f"[{sid}]"
+        cite_sentences = [
+            sentence for sentence in sentences if token in sentence
+        ]
+        if not cite_sentences:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        if not source_tokens:
+            checks.append(
+                GroundingCheck(token=token, status="no_source_text")
+            )
+            continue
+        shared: set[str] = set()
+        for sentence in cite_sentences:
+            shared |= _grounding_tokens(sentence) & source_tokens
+        if shared:
+            checks.append(
+                GroundingCheck(
+                    token=token, status="supported", shared_terms=len(shared)
+                )
+            )
+        else:
+            checks.append(
+                GroundingCheck(token=token, status="low_overlap")
+            )
+    return tuple(checks)
+
+
+@dataclass(frozen=True)
 class CitationReport:
     """Result of deterministic citation-provenance validation."""
 
@@ -348,6 +458,12 @@ class CitationReport:
     official_cited: tuple[str, ...]
     malformed: tuple[str, ...]
     reasons: tuple[str, ...]
+    #: evidence policy this validation ran under ("balanced" | "verified")
+    policy: str = "balanced"
+    #: advisory lexical claim-to-source support per cited source
+    grounding: tuple[GroundingCheck, ...] = ()
+    #: [S#] identifiers of RETRIEVED sources the answer never cites
+    retrieved_uncited: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -369,6 +485,14 @@ class CitationReport:
     def unknown(self) -> list[str]:
         return [c.token for c in self.citations if c.status == "unknown"]
 
+    @property
+    def low_overlap(self) -> list[str]:
+        return [
+            check.token
+            for check in self.grounding
+            if check.status == "low_overlap"
+        ]
+
 
 def _source_index(findings: list[Finding]) -> dict[str, str]:
     """Normalized source URL -> strongest recorded evidence class."""
@@ -388,7 +512,11 @@ def _source_index(findings: list[Finding]) -> dict[str, str]:
 
 
 def validate_citations(
-    answer: str, findings: list[Finding], question: str
+    answer: str,
+    findings: list[Finding],
+    question: str,
+    *,
+    policy: str = "balanced",
 ) -> CitationReport:
     """Compare the citations in ``answer`` with recorded sources.
 
@@ -410,7 +538,24 @@ def validate_citations(
       retrieved first-party source was gathered, the check fails
       unless the answer cites at least one of those retrieved
       official sources
+
+    Evidence policy (Phase 4E.1, WS-A) — enforced HERE, in code:
+
+    - ``balanced`` (default): snippet-only citations are permitted
+      but reported as snippet-only (the reviewer and the UI present
+      them as weaker evidence)
+    - ``verified``: snippet-only citations FAIL (a search excerpt
+      cannot independently support a factual claim), and an answer
+      that cites nothing at all while findings exist FAILS — if
+      retrieval was insufficient the run ends labeled/incomplete
+      rather than inventing support
+
+    Additionally, advisory claim-to-source lexical overlap
+    (:class:`GroundingCheck`) and the identifiers of retrieved
+    sources never cited are reported for the reviewer — both are
+    informational, never auto-fail conditions.
     """
+    policy = policy if policy in ("balanced", "verified") else "balanced"
     index = _source_index(findings)
     refs = {ref.sid: ref for ref in assign_source_ids(findings)}
     citations: list[Citation] = []
@@ -488,6 +633,37 @@ def validate_citations(
             "the question asks for official documentation and retrieved "
             "official source(s) exist, but the answer cites none of them"
         )
+    # --- evidence policy (WS-A): deterministic, not prompt-level ---
+    if policy == "verified":
+        snippet_count = sum(1 for c in citations if c.status == "snippet")
+        if snippet_count:
+            reasons.append(
+                f"{snippet_count} cited source(s) rest only on "
+                "search-result snippets, which cannot independently "
+                "support factual claims under the verified evidence "
+                "policy (retrieve the page or omit the claim)"
+            )
+        if not citations and refs:
+            reasons.append(
+                f"the answer cites no sources although {len(refs)} "
+                "source(s) were gathered (the verified evidence policy "
+                "requires retrieved-page grounding for every claim)"
+            )
+    # --- advisory signals for the reviewer (never auto-fail) ---
+    grounding = _grounding_checks(answer, findings, refs)
+    cited_ids = {
+        c.sid for c in citations if c.sid and c.status != "unknown"
+    }
+    cited_urls = {
+        _normalize_url(c.url) for c in citations if c.url
+    }
+    retrieved_uncited = tuple(
+        f"[{ref.sid}]"
+        for ref in refs.values()
+        if ref.evidence == "retrieved"
+        and ref.sid not in cited_ids
+        and _normalize_url(ref.url) not in cited_urls
+    )
     return CitationReport(
         citations=tuple(citations),
         official_required=official_required,
@@ -495,6 +671,9 @@ def validate_citations(
         official_cited=official_cited,
         malformed=malformed_tokens,
         reasons=tuple(reasons),
+        policy=policy,
+        grounding=grounding,
+        retrieved_uncited=retrieved_uncited,
     )
 
 
@@ -514,11 +693,21 @@ def _listing(urls: tuple[str, ...] | list[str]) -> str:
 def format_citation_report(report: CitationReport) -> str:
     """LLM-readable report for the review prompt (with the
     provenance-vs-semantics disclaimer required for honesty)."""
+    supported = sum(
+        1 for check in report.grounding if check.status == "supported"
+    )
+    low_overlap = sum(
+        1 for check in report.grounding if check.status == "low_overlap"
+    )
+    no_text = sum(
+        1 for check in report.grounding if check.status == "no_source_text"
+    )
     return "\n".join(
         [
             "Citation validation (deterministic URL/provenance matching "
             "only — it does NOT verify that the cited sources factually "
             "support the claims):",
+            f"- evidence policy: {report.policy}",
             (
                 f"- cited URL(s): {len(report.citations)} "
                 f"({len(report.retrieved)} retrieved, "
@@ -529,8 +718,32 @@ def format_citation_report(report: CitationReport) -> str:
             f"- snippet-only (unverified) citations: {_listing(report.snippet_only)}",
             f"- unknown citations (not among recorded sources): {_listing(report.unknown)}",
             (
+                f"- retrieved source(s) gathered but never cited: "
+                f"{_listing(report.retrieved_uncited)} "
+                "(prefer citing these over snippet-only sources)"
+            ),
+            (
                 f"- malformed citations (provenance label glued inside "
                 f"the URL): {_listing(report.malformed)}"
+            ),
+            (
+                f"- claim-to-source grounding (LEXICAL, advisory — "
+                f"low overlap can be honest paraphrase; judge support "
+                f"semantically): {supported} supported, "
+                f"{low_overlap} low-overlap"
+                + (f", {no_text} with no recorded source text")
+                + (
+                    "; low-overlap citation(s): "
+                    + _listing(
+                        tuple(
+                            check.token
+                            for check in report.grounding
+                            if check.status == "low_overlap"
+                        )
+                    )
+                    if low_overlap
+                    else ""
+                )
             ),
             (
                 f"- official documentation asked for: "

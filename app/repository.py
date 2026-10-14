@@ -112,6 +112,8 @@ class Repository:
         conversation_context: str,
         idempotency_key: str | None,
         parent_run_id: str | None = None,
+        research_depth: str = "standard",
+        evidence_policy: str = "balanced",
     ) -> dict[str, Any]:
         run_id = new_id()
         now = utcnow()
@@ -119,7 +121,8 @@ class Repository:
             cursor.execute(
                 "INSERT INTO runs (id, session_id, idempotency_key, "
                 "parent_run_id, question, conversation_context, status, "
-                "created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "research_depth, evidence_policy, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id,
                     session_id,
@@ -128,6 +131,8 @@ class Repository:
                     question,
                     conversation_context,
                     RUN_STATUS_QUEUED,
+                    research_depth,
+                    evidence_policy,
                     now,
                 ),
             )

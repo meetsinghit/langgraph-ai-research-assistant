@@ -42,6 +42,26 @@ def main(argv: list[str] | None = None) -> int:
             "counts, tool outcomes) to PATH"
         ),
     )
+    parser.add_argument(
+        "--depth",
+        choices=("quick", "standard", "deep"),
+        default="standard",
+        help=(
+            "research depth for this run (default: standard) — "
+            "quick = minimal sufficient retrieval, deep = broader "
+            "explicit budgets; see docs/OPERATIONS.md"
+        ),
+    )
+    parser.add_argument(
+        "--evidence-policy",
+        choices=("balanced", "verified"),
+        default="balanced",
+        help=(
+            "citation evidence policy (default: balanced) — "
+            "verified requires every factual claim to rest on a "
+            "retrieved page and fails citation validation otherwise"
+        ),
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
@@ -68,12 +88,17 @@ def main(argv: list[str] | None = None) -> int:
     metrics = MetricsCollector()
     graph = build_research_graph(settings, model, tools, metrics=metrics)
 
-    state: dict[str, Any] = {"question": args.question}
+    state: dict[str, Any] = {
+        "question": args.question,
+        "research_depth": args.depth,
+        "evidence_policy": args.evidence_policy,
+    }
+    run_input = dict(state)
     # stamp the wall-clock start BEFORE the run so the metrics
     # report measures the actual execution, not snapshot latency
     metrics.begin_run()
     try:
-        for step in graph.stream({"question": args.question}):
+        for step in graph.stream(run_input):
             for node, updates in step.items():
                 logger.info("node %s completed", node)
                 for key, value in (updates or {}).items():
@@ -124,6 +149,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"- {url} [discovered]")
     print()
     print(f"iterations: {state.get('iteration', 0)}")
+    print(
+        f"research depth: {args.depth} | evidence policy: "
+        f"{args.evidence_policy}"
+    )
     print(
         f"tokens: {state.get('tokens_in', 0)} in / "
         f"{state.get('tokens_out', 0)} out"

@@ -34,8 +34,12 @@ from agent.citations import (
     requests_official_sources,
     validate_citations,
 )
-from agent.completeness import check_completeness
+from agent.completeness import (
+    check_completeness,
+    check_explanation_depth,
+)
 from agent.config import Settings
+from agent.depth import depth_policy, resolve_evidence_policy
 from agent.graph import (
     ResearchPlan,
     ReviewStatus,
@@ -206,11 +210,19 @@ def _deterministic_metrics(
     answer = result.get("final_answer") or ""
     draft = strip_marked_notes(answer)
     citation_report = validate_citations(
-        draft, findings, case.question
+        draft,
+        findings,
+        case.question,
+        policy=resolve_evidence_policy(case.evidence_policy),
     )
     completeness = check_completeness(case.question, draft)
+    explanation = check_explanation_depth(
+        case.question, draft, findings
+    )
     official = official_source_status(findings, case.question)
     snapshot = metrics.snapshot()
+    case_settings = _case_settings(case)
+    policy = depth_policy(case_settings, case.research_depth)
 
     # budget compliance: tool calls per research pass
     per_iteration: dict[int, int] = {}
@@ -250,6 +262,8 @@ def _deterministic_metrics(
             if hasattr(result.get("review_status"), "value")
             else result.get("review_status")
         ),
+        "research_depth": policy.depth,
+        "evidence_policy": citation_report.policy,
         "iterations": result.get("iteration", 0),
         "searches": len(fake_tools.search_calls),
         "fetches": len(fake_tools.fetch_calls),
@@ -265,7 +279,10 @@ def _deterministic_metrics(
         "citations_ok": citation_report.ok,
         "unknown_citations": len(citation_report.unknown),
         "malformed_citations": len(citation_report.malformed),
+        "low_overlap_citations": len(citation_report.low_overlap),
         "missing_topics": list(completeness.missing),
+        "shallow_topics": list(explanation.shallow),
+        "answer_words": len(draft.split()),
         "markers_present": {
             marker: marker in answer
             for marker in case.expected.markers
@@ -276,8 +293,7 @@ def _deterministic_metrics(
         ),
         "max_tool_calls_per_pass": max_calls_per_pass,
         "budget_compliant": (
-            max_calls_per_pass
-            <= _case_settings(case).max_tool_calls_per_research
+            max_calls_per_pass <= policy.max_tool_calls
         ),
         "tokens_in": result.get("tokens_in", 0),
         "tokens_out": result.get("tokens_out", 0),
@@ -340,7 +356,13 @@ def run_case(
     # stamp the wall-clock start BEFORE the run so
     # total_execution_seconds measures the actual run
     metrics.begin_run()
-    result = graph.invoke({"question": case.question})
+    result = graph.invoke(
+        {
+            "question": case.question,
+            "research_depth": case.research_depth,
+            "evidence_policy": case.evidence_policy,
+        }
+    )
     # stamp finished_at / total_execution_seconds in the report
     metrics.finish()
 
@@ -441,6 +463,24 @@ def run_case(
             "unknown citations: expected at least "
             f"{expected.min_unknown_citations}, got "
             f"{deterministic['unknown_citations']}"
+        )
+    if expected.min_low_overlap_citations is not None and (
+        deterministic["low_overlap_citations"]
+        < expected.min_low_overlap_citations
+    ):
+        failures.append(
+            "low-overlap citations: expected at least "
+            f"{expected.min_low_overlap_citations}, got "
+            f"{deterministic['low_overlap_citations']}"
+        )
+    if expected.min_retrieved_sources is not None and (
+        deterministic["retrieved_sources"]
+        < expected.min_retrieved_sources
+    ):
+        failures.append(
+            "retrieved sources: expected at least "
+            f"{expected.min_retrieved_sources}, got "
+            f"{deterministic['retrieved_sources']}"
         )
     forbidden_executed = sorted(
         set(expected.forbidden_tools)

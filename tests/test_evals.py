@@ -159,13 +159,19 @@ class TestDeterministicScoring:
         ] is True
 
     def test_budget_respected_in_every_case(self) -> None:
+        from agent.depth import depth_policy
+
         for case in benchmark_cases():
             result = run_case(case)
             # each pass must stay within THAT case's configured
-            # tool-call budget (a fixture may lift its own quota —
-            # e.g. the two-search recovery scenario — but never
-            # silently exceed the shared default of 2)
-            limit = _case_settings(case).max_tool_calls_per_research
+            # tool-call budget — for the case's RESEARCH DEPTH (a
+            # deep fixture may lift its own quota explicitly, e.g.
+            # the two-search recovery scenario or the deep-mode
+            # budgets), but never silently exceed the shared
+            # default of 2
+            limit = depth_policy(
+                _case_settings(case), case.research_depth
+            ).max_tool_calls
             assert result.metrics["budget_compliant"], case.case_id
             assert (
                 result.metrics["max_tool_calls_per_pass"] <= limit
@@ -173,9 +179,15 @@ class TestDeterministicScoring:
 
 
 class TestWorkstream4:
-    """The live failure reproduction: a superficial answer that
-    every deterministic gate and the reviewer accept, but the
-    semantic rubric rejects."""
+    """The live failure reproduction: a superficial answer that used
+    to pass every deterministic gate and the reviewer — only the
+    semantic rubric rejected it.
+
+    Phase 4E.1 (WS-B) added the deterministic explanation-depth
+    check, which now catches the named-only topic. These tests
+    document the FIXED behaviour while keeping the rubric
+    assertions that prove the deterministic gate and the semantic
+    score agree on this case."""
 
     @pytest.fixture()
     def ws4_result(self):
@@ -186,11 +198,23 @@ class TestWorkstream4:
         )
         return run_case(case)
 
-    def test_deterministically_passes(self, ws4_result) -> None:
+    def test_deterministically_caught(self, ws4_result) -> None:
         assert ws4_result.deterministic_pass, (
             ws4_result.deterministic_failures
         )
-        assert ws4_result.metrics["review_status"] == "approved"
+        # the fix: the named-only "conditional routing" sentence
+        # can no longer be approved
+        assert ws4_result.metrics["review_status"] == (
+            "needs_more_research"
+        )
+        assert ws4_result.metrics["shallow_topics"] == [
+            "conditional",
+            "routing",
+        ]
+        assert ws4_result.metrics["markers_present"][
+            "EXPLANATION DEPTH: SUPERFICIAL"
+        ]
+        # provenance was never the problem here
         assert ws4_result.metrics["citations_ok"] is True
         assert (
             ws4_result.metrics["official_source_status"]
@@ -219,23 +243,21 @@ class TestWorkstream4:
         )
         assert stated["adequate"] is True
 
-    def test_reviewer_false_approval_recorded(
+    def test_no_reviewer_false_approval(
         self, ws4_result
     ) -> None:
         semantic = ws4_result.semantic
-        assert semantic["reviewer_approved"] is True
-        assert semantic["reviewer_false_approval"] is True
-        assert semantic["notes"] == [
-            "reviewer APPROVED a semantically inadequate answer"
-        ]
+        # the reviewer no longer approves the inadequate draft:
+        # the deterministic gate downgraded it before finalize
+        assert semantic["reviewer_approved"] is False
+        assert semantic["reviewer_false_approval"] is False
+        assert semantic["notes"] == []
 
-    def test_report_surfaces_the_false_approval(self) -> None:
+    def test_report_has_no_false_approvals(self) -> None:
         report = run_benchmark()
-        assert "ws4-routing-superficial" in report.false_approvals
+        assert report.false_approvals == []
         data = report.to_dict()
-        assert data["summary"]["reviewer_false_approvals"] == [
-            "ws4-routing-superficial"
-        ]
+        assert data["summary"]["reviewer_false_approvals"] == []
 
 
 class TestSemanticSeparation:
