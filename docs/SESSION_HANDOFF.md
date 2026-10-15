@@ -237,7 +237,7 @@ approved).
 ## Resume command sequence (after restart)
 
 ```powershell
-cd C:\Users\meet.a.singh\Downloads\OpenCode\AI_POC
+cd <project-root>
 git log --oneline -3        # expect HEAD = 4E.3 correction commit
 .\ai_poc\Scripts\python.exe -m pytest -q   # optional sanity: 656 passed, 1 skipped
 ```

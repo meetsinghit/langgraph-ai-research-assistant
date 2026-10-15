@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="440" viewBox="0 0 1440 440" role="img" aria-labelledby="t d">
+<title id="t">AI Research Assistant — Research, engineered.</title><desc id="d">A dark teal architectural hero illustrating a graph-driven research pipeline from question to evidence-grounded answer.</desc>
+<defs>
+ <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#081721"/><stop offset=".54" stop-color="#09131e"/><stop offset="1" stop-color="#101e2c"/></linearGradient>
+ <linearGradient id="a" x1="0" x2="1"><stop stop-color="#6cead2"/><stop offset="1" stop-color="#6eaafa"/></linearGradient>
+ <linearGradient id="glow" x1="0" x2="1"><stop stop-color="#1c8c8b" stop-opacity=".43"/><stop offset="1" stop-color="#3c64cf" stop-opacity=".08"/></linearGradient>
+ <radialGradient id="light"><stop stop-color="#256f80" stop-opacity=".36"/><stop offset="1" stop-color="#09131e" stop-opacity="0"/></radialGradient>
+ <pattern id="grid" width="36" height="36" patternUnits="userSpaceOnUse"><path d="M36 0H0V36" fill="none" stroke="#b3dfea" stroke-opacity=".045"/></pattern>
+ <filter id="shadow" x="-40%" y="-50%" width="180%" height="200%"><feDropShadow dx="0" dy="12" stdDeviation="10" flood-color="#000000" flood-opacity=".25"/></filter>
+</defs>
+<rect width="1440" height="440" rx="24" fill="url(#bg)"/><rect width="1440" height="440" rx="24" fill="url(#grid)"/><ellipse cx="1150" cy="205" rx="410" ry="290" fill="url(#light)"/>
+<path d="M0 429H1440" stroke="#3a586b" stroke-opacity=".5"/><rect x="54" y="46" width="40" height="40" rx="12" fill="#143c47" stroke="#3c8b89"/><path d="M66 66h16m-8-8v16" stroke="#83f4df" stroke-width="2.6" stroke-linecap="round"/><text x="109" y="72" font-family="Segoe UI,Arial,sans-serif" font-size="13" font-weight="700" letter-spacing="3.2" fill="#7de9d6">SYSTEM DESIGN / FIELD GUIDE</text>
+<text x="57" y="167" font-family="Segoe UI,Arial,sans-serif" font-size="65" font-weight="800" letter-spacing="-2.2" fill="#eef7fb">Research,</text><text x="57" y="238" font-family="Segoe UI,Arial,sans-serif" font-size="65" font-weight="800" letter-spacing="-2.2" fill="url(#a)">engineered.</text>
+<text x="60" y="282" font-family="Segoe UI,Arial,sans-serif" font-size="21" fill="#b7cbd5">AI Research Assistant</text><text x="60" y="316" font-family="Segoe UI,Arial,sans-serif" font-size="15" fill="#82a6b7">LangGraph  /  Gemini  /  FastAPI  /  React  /  SQLite</text>
+<rect x="58" y="354" width="139" height="32" rx="16" fill="#103936" stroke="#276a61"/><text x="80" y="375" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#8ee9d2" font-weight="700">EVIDENCE FIRST</text>
+<rect x="211" y="354" width="140" height="32" rx="16" fill="#142c43" stroke="#35516e"/><text x="231" y="375" font-family="Segoe UI,Arial,sans-serif" font-size="12" fill="#a3c8ed" font-weight="700">LOCAL BY DESIGN</text>
+<g font-family="Segoe UI,Arial,sans-serif" filter="url(#shadow)">
+ <rect x="700" y="75" width="174" height="66" rx="14" fill="#142b35" stroke="#397c82"/><text x="722" y="101" font-size="11" letter-spacing="1.6" fill="#75e0ce">01 / INPUT</text><text x="722" y="123" font-weight="700" font-size="17" fill="#f0f7fc">Question</text>
+ <rect x="965" y="75" width="174" height="66" rx="14" fill="#142b35" stroke="#397c82"/><text x="987" y="101" font-size="11" letter-spacing="1.6" fill="#75e0ce">02 / REASON</text><text x="987" y="123" font-weight="700" font-size="17" fill="#f0f7fc">Research graph</text>
+ <rect x="1230" y="75" width="172" height="66" rx="14" fill="#142b35" stroke="#397c82"/><text x="1252" y="101" font-size="11" letter-spacing="1.6" fill="#75e0ce">03 / RESULT</text><text x="1252" y="123" font-weight="700" font-size="16" fill="#f0f7fc">Cited answer</text>
+ <rect x="805" y="214" width="178" height="72" rx="14" fill="#101e30" stroke="#3c577f"/><text x="825" y="239" font-size="11" letter-spacing="1.5" fill="#91bcf2">RETRIEVAL</text><text x="825" y="263" font-size="17" font-weight="700" fill="#eaf4fe">Search + fetch</text>
+ <rect x="1104" y="214" width="178" height="72" rx="14" fill="#101e30" stroke="#3c577f"/><text x="1124" y="239" font-size="11" letter-spacing="1.5" fill="#91bcf2">VALIDATION</text><text x="1124" y="263" font-size="17" font-weight="700" fill="#eaf4fe">Verify + review</text>
+</g>
+<g stroke="url(#a)" stroke-width="2.7" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M874 108H956m-10-7 10 7-10 7"/><path d="M1139 108H1221m-10-7 10 7-10 7"/><path d="M1052 141v37q0 15-14 15H896v14m-7-9 7 9 7-9"/><path d="M983 251h112m-10-7 10 7-10 7"/><path d="M1193 214v-31q0-19 16-19h103v-16m-7 9 7-9 7 9"/></g>
+<path d="M787 163c33 23 56 27 100 30" stroke="#4a7689" stroke-opacity=".55" stroke-dasharray="4 7" fill="none"/>
+<text x="1056" y="362" font-family="Consolas,monospace" font-size="12" letter-spacing="1.6" fill="#688fa8">PLAN → SEARCH → VERIFY → SYNTHESIZE → REVIEW</text>
+</svg>
